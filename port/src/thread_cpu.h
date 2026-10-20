@@ -15,4 +15,7 @@ void NoteThreadRole(const char* role);
 // start address.
 void StartThreadCpuLog();
 
+// Every guest thread's place in the log (test aid).
+void LogGuestStacks();
+
 }  // namespace svr2011

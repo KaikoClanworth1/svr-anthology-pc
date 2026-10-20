@@ -89,6 +89,8 @@ void Attach(rex::memory::Memory* memory);
 // Hook entry points (guest render thread).
 // front_buffer: the texture object Swap shows (guest pointer).
 void OnPresent(uint32_t front_buffer);
+// The game's D3D device, from a device call's r3 (it moves when the game's heaps do).
+void NoteDevice(uint32_t device);
 void OnDrawIndexed(const PPCContext& ctx);
 void OnDrawUP(const PPCContext& args, uint32_t data);  // data: the space it returned
 void OnEndVertices();

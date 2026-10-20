@@ -3,7 +3,18 @@
 
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
+#include <rex/hook.h>
 #include <rex/logging.h>
+#include <rex/ppc.h>
+#include <rex/system/xmemory.h>
+
+#include "generated/default/svr2011_init.h"
+#include "thread_cpu.h"
+
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <thread>
 
 namespace svr2011 {
 
@@ -45,4 +56,63 @@ void ForceAnthologySettings() {
               GameDataFolder().string());
 }
 
+namespace {
+rex::memory::Memory* g_memory = nullptr;
+
+// Test aid: SVR2011_ANTHOLOGY_SKIP=A1,A2... - those changes left out.
+bool On(const char* id) {
+  const char* v = std::getenv("SVR2011_ANTHOLOGY_SKIP");
+  return !v || !std::strstr(v, id);
+}
+
+uint32_t Be32(const uint8_t* p) { return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3]; }
+void SetBe32(uint8_t* p, uint32_t v) {
+  p[0] = uint8_t(v >> 24); p[1] = uint8_t(v >> 16); p[2] = uint8_t(v >> 8); p[3] = uint8_t(v);
+}
+}  // namespace
+
+void InstallAnthology(rex::memory::Memory* memory) {
+  g_memory = memory;
+  if (kAnthology && memory && On("A2")) {
+    // A2 (Yumboy11's change): the game's memory table at 0x82DAC2FC ({size, id}
+    // pairs): part 2 0x20 -> 0x40.
+    uint8_t* p = memory->TranslateVirtual<uint8_t*>(0x82DAC304);
+    if (Be32(p) == 0x20 && Be32(p + 4) == 2) {
+      SetBe32(p, 0x40);
+      REXLOG_INFO("[svr2011] anthology A2: memory table part 2 0x40 (Yumboy11's size)");
+    }
+  }
+  // Test aid: SVR2011_ANTHOLOGY_STACKS=<seconds> - every guest thread's place in the log then.
+  if (const char* v = std::getenv("SVR2011_ANTHOLOGY_STACKS"); v && *v) {
+    const int s = std::atoi(v);
+    std::thread([s] {
+      std::this_thread::sleep_for(std::chrono::seconds(s));
+      LogGuestStacks();
+    }).detach();
+  }
+}
+
 }  // namespace svr2011
+
+#ifdef SVR2011_ANTHOLOGY
+// A1 (Yumboy11's change): the file system's directory memory 0x2C000 -> 0x4B000
+// bytes, for the Anthology's 379 pacs (the disc's 248 fit in the original; more
+// than about 372 overran it). sub_82578848 sets {512, 128, size, buffer, ...} up
+// and passes it here; the buffer is made anew at the larger size (the smaller one
+// it allocated stays unused).
+REX_EXTERN(__imp__sub_826A2A10);
+REX_HOOK_RAW(sub_826A2A10) {
+  using namespace svr2011;
+  if (g_memory && ctx.r3.u32 && On("A1")) {
+    uint8_t* p = g_memory->TranslateVirtual<uint8_t*>(ctx.r3.u32);
+    if (Be32(p + 8) == 0x2C000) {
+      if (const uint32_t buf = g_memory->SystemHeapAlloc(0x4B000)) {
+        SetBe32(p + 8, 0x4B000);
+        SetBe32(p + 12, buf);
+        REXLOG_INFO("[svr2011] anthology A1: file system directory memory 0x4B000 (Yumboy11's size)");
+      }
+    }
+  }
+  __imp__sub_826A2A10(ctx, base);
+}
+#endif

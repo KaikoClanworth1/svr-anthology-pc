@@ -291,6 +291,35 @@ std::string Line() {
 
 }  // namespace
 
+// Every guest thread's place (a waiting thread: its last kernel call): lr, ctr,
+// r3 and the stack's saved return addresses (test aid, anthology.cpp).
+void LogGuestStacks() {
+  auto* kernel = REX_KERNEL_STATE();
+  auto* memory = kernel ? kernel->memory() : nullptr;
+  if (!memory) return;
+  uint8_t* base = memory->virtual_membase();
+  const auto readable = [&](uint32_t a) {
+    auto* heap = memory->LookupHeap(a);
+    return heap && heap->QueryRangeAccess(a, a + 3) != rex::memory::PageAccess::kNoAccess;
+  };
+  for (auto& t : kernel->object_table()->GetObjectsByType<rex::system::XThread>()) {
+    if (!t || !t->is_guest_thread() || !t->thread_state() || !t->thread_state()->context() || !t->pcr_ptr()) continue;
+    const PPCContext* c = t->thread_state()->context();
+    const uint32_t hi = Rd32(base + t->pcr_ptr() + 0x70), lo = Rd32(base + t->pcr_ptr() + 0x74);
+    const auto in_stack = [&](uint32_t a) { return lo < hi && a >= lo && a + 4 <= hi && readable(a); };
+    std::string chain;
+    uint32_t sp = c->r1.u32;
+    for (int i = 0; i < 16 && in_stack(sp); ++i) {
+      const uint32_t prev = Rd32(base + sp);
+      if (prev <= sp || !in_stack(prev) || !in_stack(prev - 8)) break;
+      chain += fmt::format(" {:08X}", Rd32(base + prev - 8));
+      sp = prev;
+    }
+    REXLOG_INFO("stacks: thread {:08X} (g{:08X}): lr {:08X} ctr {:08X} r3 {:08X}, stack{}", t->thread_id(),
+                t->creation_params()->start_address, uint32_t(c->lr), c->ctr.u32, c->r3.u32, chain.empty() ? " -" : chain);
+  }
+}
+
 void StartThreadCpuLog() {
   static std::once_flag once;
   if (std::getenv("SVR2011_TEST_NO_THREAD_CPU")) return;  // (test: without it)

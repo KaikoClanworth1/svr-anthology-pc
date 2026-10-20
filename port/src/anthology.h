@@ -15,6 +15,9 @@
 namespace rex::filesystem {
 class VirtualFileSystem;
 }
+namespace rex::memory {
+class Memory;
+}
 
 namespace svr2011 {
 
@@ -35,6 +38,10 @@ void PatchAnthologyFiles(rex::filesystem::VirtualFileSystem* vfs, const std::fil
 // menu.pac as the game reads it (the patched copy when there is one).
 std::filesystem::path MenuPacFile();
 void SetAnthologyMenuPac(const std::filesystem::path& file);
+
+// The hooks that let the original disc program read the Anthology's data
+// (docs/ANTHOLOGY_CHANGES.md: each one is Yumboy11's change, redone here).
+void InstallAnthology(rex::memory::Memory* memory);
 
 // Online, texture packs: off in this build (after the settings are loaded).
 void ForceAnthologySettings();

@@ -260,7 +260,11 @@ const uint8_t* Physical(uint32_t address) { return g_memory->TranslatePhysical(a
 // virtual. The fetch constants in the device's register mirror hold true
 // physical addresses instead (Physical()).
 const uint8_t* ObjectData(uint32_t address) { return Virtual(address); }
-const uint8_t* Device() { return Virtual(guest::kDeviceAddress); }
+// The game's D3D device: where the disc's game makes it (guest_d3d.h), or where
+// its device calls say it is (NoteDevice) - the SvR Anthology's bigger heap 1
+// (anthology.cpp, A2) moves it.
+std::atomic<uint32_t> g_device{guest::kDeviceAddress};
+const uint8_t* Device() { return Virtual(g_device.load(std::memory_order_relaxed)); }
 uint32_t Reg(uint32_t reg) { return Be32(Device() + guest::RegisterOffset(reg)); }
 float RegFloat(uint32_t reg) { return BeFloat(Device() + guest::RegisterOffset(reg)); }
 
@@ -3997,6 +4001,12 @@ void OnPresent(uint32_t front_buffer) {
   }
   UpdateTitle(r);
   backend::DrainDebugMessages(r->device.get());
+}
+
+void NoteDevice(uint32_t device) {
+  if (device < 0x40000000 || device == g_device.load(std::memory_order_relaxed)) return;
+  g_device.store(device, std::memory_order_relaxed);
+  REXLOG_INFO("native renderer: the game's D3D device at {:08X}", device);
 }
 
 void OnDrawIndexed(const PPCContext& ctx) {

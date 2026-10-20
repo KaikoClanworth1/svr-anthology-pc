@@ -22,6 +22,7 @@ namespace nr = svr2011::native;
 // D3DDevice_DrawIndexedVertices(device, primitive, base, start, count)
 REX_EXTERN(__imp__sub_82921B58);
 REX_HOOK_RAW(sub_82921B58) {
+  nr::NoteDevice(ctx.r3.u32);  // (where the device is: native_renderer.cpp)
   if (nr::Enabled()) {
     const PPCContext args = ctx;  // the call clobbers argument registers
     __imp__sub_82921B58(ctx, base);
@@ -36,6 +37,7 @@ REX_HOOK_RAW(sub_82921B58) {
 // then writes the vertices to, before calling EndVertices.
 REX_EXTERN(__imp__sub_82921698);
 REX_HOOK_RAW(sub_82921698) {
+  nr::NoteDevice(ctx.r3.u32);  // (where the device is: native_renderer.cpp)
   if (nr::Enabled()) {
     const PPCContext args = ctx;
     __imp__sub_82921698(ctx, base);
@@ -48,6 +50,7 @@ REX_HOOK_RAW(sub_82921698) {
 // D3DDevice_EndVertices(device): the vertices of the last DrawVerticesUP are in.
 REX_EXTERN(__imp__sub_82921688);
 REX_HOOK_RAW(sub_82921688) {
+  nr::NoteDevice(ctx.r3.u32);  // (where the device is: native_renderer.cpp)
   __imp__sub_82921688(ctx, base);
   if (nr::Enabled()) nr::OnEndVertices();
 }
@@ -55,6 +58,7 @@ REX_HOOK_RAW(sub_82921688) {
 // D3DDevice_SetRenderTarget(device, index, surface)
 REX_EXTERN(__imp__sub_8291E618);
 REX_HOOK_RAW(sub_8291E618) {
+  nr::NoteDevice(ctx.r3.u32);  // (where the device is: native_renderer.cpp)
   if (nr::Enabled()) nr::OnSetRenderTarget(ctx.r4.u32, ctx.r5.u32);
   __imp__sub_8291E618(ctx, base);
 }
@@ -62,6 +66,7 @@ REX_HOOK_RAW(sub_8291E618) {
 // D3DDevice_Clear(device, flags, rects, ...)
 REX_EXTERN(__imp__sub_8291F168);
 REX_HOOK_RAW(sub_8291F168) {
+  nr::NoteDevice(ctx.r3.u32);  // (where the device is: native_renderer.cpp)
   svr2011::NoteThreadRole("render");  // (thread_cpu.h: the game's render thread)
   if (nr::Enabled()) {
     const PPCContext args = ctx;
@@ -75,6 +80,7 @@ REX_HOOK_RAW(sub_8291F168) {
 // D3DDevice_Resolve(device, flags, ..., destination texture in r8)
 REX_EXTERN(__imp__sub_82918A88);
 REX_HOOK_RAW(sub_82918A88) {
+  nr::NoteDevice(ctx.r3.u32);  // (where the device is: native_renderer.cpp)
   // Debug: SVR2011_LOG_RESOLVE_CALLS=1 - every call, in either renderer mode.
   static const bool log_calls = std::getenv("SVR2011_LOG_RESOLVE_CALLS") != nullptr;
   if (log_calls && ctx.r8.u32) {
@@ -110,6 +116,7 @@ REX_HOOK_RAW(sub_82921360) {
 // D3DDevice_SetStreamSource(device, stream, buffer, offset, stride)
 REX_EXTERN(__imp__sub_8291DD70);
 REX_HOOK_RAW(sub_8291DD70) {
+  nr::NoteDevice(ctx.r3.u32);  // (where the device is: native_renderer.cpp)
   if (nr::Enabled()) nr::OnSetStreamSource(ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32);
   __imp__sub_8291DD70(ctx, base);
 }
@@ -117,6 +124,7 @@ REX_HOOK_RAW(sub_8291DD70) {
 // D3DDevice_SetVertexShaderConstantF / SetPixelShaderConstantF(device, start, data, count)
 REX_EXTERN(__imp__sub_829208D8);
 REX_HOOK_RAW(sub_829208D8) {
+  nr::NoteDevice(ctx.r3.u32);  // (where the device is: native_renderer.cpp)
   const uint32_t start = ctx.r4.u32, count = ctx.r6.u32;
   __imp__sub_829208D8(ctx, base);
   if (nr::Enabled()) nr::OnSetShaderConstants(false, start, count);
@@ -124,6 +132,7 @@ REX_HOOK_RAW(sub_829208D8) {
 
 REX_EXTERN(__imp__sub_82920800);
 REX_HOOK_RAW(sub_82920800) {
+  nr::NoteDevice(ctx.r3.u32);  // (where the device is: native_renderer.cpp)
   const uint32_t start = ctx.r4.u32, count = ctx.r6.u32;
   __imp__sub_82920800(ctx, base);
   if (nr::Enabled()) nr::OnSetShaderConstants(true, start, count);

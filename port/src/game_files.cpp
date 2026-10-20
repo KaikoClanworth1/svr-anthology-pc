@@ -9,6 +9,7 @@
 #include "game_files.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -189,6 +190,13 @@ void PatchGameFiles(const std::filesystem::path& game_dir) {
 void PatchAnthologyFiles(rex::filesystem::VirtualFileSystem* vfs, const std::filesystem::path& user_data) {
   if (!kAnthology || !vfs) return;
   namespace fs = std::filesystem;
+  // Test aid: SVR2011_ANTHOLOGY_EXTRA=<folder> - that folder as GAME:\anthx (e.g. a pac list for
+  // SVR2011_TEST_PLIST=anthx, made outside the Anthology's folder).
+  if (const char* x = std::getenv("SVR2011_ANTHOLOGY_EXTRA"); x && *x) {
+    auto dev = std::make_unique<rex::filesystem::HostPathDevice>("\\ANTHOLOGYX", fs::u8path(x), true);
+    if (dev->Initialize() && vfs->RegisterDevice(std::move(dev)))
+      vfs->RegisterSymbolicLink("\\Device\\Harddisk0\\Partition1\\anthx", "\\ANTHOLOGYX");
+  }
   // The original game's files (size, FNV-1a 64): only those get the port's
   // changes; an Anthology file that differs is the Anthology's and is used as it is.
   struct Original {

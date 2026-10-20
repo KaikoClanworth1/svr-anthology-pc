@@ -642,6 +642,7 @@ void Svr2011App::OnPostLoadXexImage() {
   svr2011::StartupThread() = std::this_thread::get_id();
 
   // MY WWE -> OPTIONS -> GRAPHICS (menu_hooks.cpp, graphics_page.h).
+  svr2011::InstallAnthology(runtime()->memory());  // (the Anthology build's hooks: anthology.h)
   svr2011::InstallMenuHooks(runtime()->memory());
   svr2011::InstallPerfStats(runtime()->memory());  // (perf_stats.h: the overlay's numbers, perf_log_seconds)
   svr2011::InstallPadIcons(runtime()->memory());  // (pad_icons.h)
