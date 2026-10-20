@@ -558,7 +558,13 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
             refresh();
             break;
         case ID_INST_BROWSE:
-            if (pick_folder(L"Yumboy11's \"SVR Anthology 1.0 Installer\" folder", s_inst)) save_settings();
+            if (pick_folder(L"Yumboy11's \"SVR Anthology 1.0 Installer\" folder", s_inst)) {
+                /* (installed already: his game folder beside his installer) */
+                WCHAR out[MAX_PATH], why[300];
+                if (!s_game[0] && join(out, s_inst, ANTHOLOGY_GAME) && check_game(out, why, 300))
+                    wcscpy_s(s_game, MAX_PATH, out);
+                save_settings();
+            }
             refresh();
             break;
         case ID_INST_RUN: run_installer(); break;
