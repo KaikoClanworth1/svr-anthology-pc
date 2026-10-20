@@ -12,6 +12,14 @@
 
 #include <filesystem>
 
+// The game's own function `fn` (a hook's original): in this build Yumboy11's
+// version when the port redoes one of his changes in it (tools/anthology_redo.py).
+#ifdef SVR2011_ANTHOLOGY
+#define SVR2011_IMP(fn) anth_##fn
+#else
+#define SVR2011_IMP(fn) __imp__##fn
+#endif
+
 namespace rex::filesystem {
 class VirtualFileSystem;
 }

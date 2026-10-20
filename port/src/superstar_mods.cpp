@@ -2193,13 +2193,17 @@ REX_HOOK_RAW(sub_825FDCD8) {
 // the count, sub_828C4060(mgr, id, attire) the {name string id, unlock}
 // pair (unlock -1: always; sub_828C2240's "available" reads it).
 REX_EXTERN(__imp__sub_828C4140);
+#ifdef SVR2011_ANTHOLOGY
+REX_EXTERN(anth_sub_828C4140);
+REX_EXTERN(anth_sub_828C4060);
+#endif
 REX_HOOK_RAW(sub_828C4140) {
   if (const Mod* m = ModOf(ctx.r4.u32); m && m->attires > 1 && m->attire_pairs) {
     ctx.r3.u64 = m->attires;
     return;
   }
   const uint32_t id = ctx.r4.u32;
-  __imp__sub_828C4140(ctx, base);
+  SVR2011_IMP(sub_828C4140)(ctx, base);  // (anthology.h)
   if (g_attire_pairs.count(id)) {  // (attire mods: up to the last attire one of them gives)
     uint32_t n = ctx.r3.u32;
     for (const auto& a : g_attire_mods)
@@ -2218,7 +2222,7 @@ REX_HOOK_RAW(sub_828C4060) {
     ctx.r3.u64 = it->second + ctx.r5.u32 * 8;
     return;
   }
-  __imp__sub_828C4060(ctx, base);
+  SVR2011_IMP(sub_828C4060)(ctx, base);  // (anthology.h)
 }
 
 // ---- The select screen's model framing

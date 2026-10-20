@@ -14,7 +14,10 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <thread>
+
+#include <fmt/format.h>
 
 namespace svr2011 {
 
@@ -115,4 +118,25 @@ REX_HOOK_RAW(sub_826A2A10) {
   }
   __imp__sub_826A2A10(ctx, base);
 }
+// Test aid: SVR2011_ANTHOLOGY_TRACE=1 - sub_825C6DC8's arguments once (r4 +0..15, r5) and rule record 0
+// (*0x82EDE954 + 0, 32 bytes).
+REX_EXTERN(__imp__sub_825C6DC8);
+REX_HOOK_RAW(sub_825C6DC8) {
+  using namespace svr2011;
+  static const bool trace = std::getenv("SVR2011_ANTHOLOGY_TRACE") != nullptr;
+  static int told = 0;
+  if (trace && g_memory && told < 6 && ctx.r4.u32) {
+    ++told;
+    const uint8_t* a = g_memory->TranslateVirtual<uint8_t*>(ctx.r4.u32);
+    const uint32_t rules = Be32(g_memory->TranslateVirtual<uint8_t*>(0x82EDE954));
+    const uint8_t* r = g_memory->TranslateVirtual<uint8_t*>(rules);
+    std::string x, y;
+    for (int i = 0; i < 16; ++i) x += fmt::format(" {:02X}", a[i]);
+    for (int i = 0; i < 32; ++i) y += fmt::format(" {:02X}", r[i]);
+    REXLOG_INFO("[svr2011] anthology trace: sub_825C6DC8 r3 {:08X} r4 {:08X}:{} r5 {} lr {:08X}; rules {:08X}:{}", ctx.r3.u32,
+                ctx.r4.u32, x, ctx.r5.u32, uint32_t(ctx.lr), rules, y);
+  }
+  __imp__sub_825C6DC8(ctx, base);
+}
 #endif
+

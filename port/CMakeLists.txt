@@ -238,6 +238,18 @@ endif()
 option(SVR2011_ANTHOLOGY "Build the SvR Anthology version" ON)
 if(SVR2011_ANTHOLOGY)
     target_compile_definitions(svr2011 PRIVATE SVR2011_ANTHOLOGY=1)
+    # Yumboy11's changes inside the game's functions, made from this build's own recompiled code at
+    # build time (tools/anthology_redo.py; the generated code is not in the repository).
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    set(SVR2011_ANTHOLOGY_REDO ${CMAKE_CURRENT_BINARY_DIR}/anthology_redo.cpp)
+    file(GLOB SVR2011_GENERATED_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/generated/default/*_recomp.*.cpp)
+    add_custom_command(OUTPUT ${SVR2011_ANTHOLOGY_REDO}
+        COMMAND Python3::Interpreter ${CMAKE_CURRENT_SOURCE_DIR}/tools/anthology_redo.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/generated/default ${SVR2011_ANTHOLOGY_REDO}
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tools/anthology_redo.py ${SVR2011_GENERATED_SOURCES}
+        COMMENT "anthology_redo.cpp (Yumboy11's changes)" VERBATIM)
+    target_sources(svr2011 PRIVATE ${SVR2011_ANTHOLOGY_REDO})
+    target_include_directories(svr2011 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 if(NOT WIN32)
     # MSVC CRT functions the port uses (_dupenv_s ...).
