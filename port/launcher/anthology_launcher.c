@@ -13,6 +13,8 @@
  * Test aids (no window): --check <anthology folder> <out file>  - the folder check's result
  *                        --command <anthology folder> <out file> - the game's command line
  *                        --installer-check <installer folder> <out file>
+ *                        --original-xex <ISO or game folder> <dest folder> <out file>
+ *                            (the original default.xex into <dest>\Original, hash-checked)
  *                        --install-saves <his Saves and DLC folder> <dest folder> <out file>
  *                            (his saves into <dest>\Saves, his DLC packages into <dest>\DLC)
  */
@@ -26,6 +28,7 @@
 #include <stdlib.h>
 #include <wchar.h>
 
+#include "anthology_disc.h"
 #include "stfs.h"
 
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
@@ -417,6 +420,22 @@ static void play(void)
                            L"may remove it).\n\nStart the game anyway?",
                     WINDOW_TITLE, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
         return;
+    /* The program the game runs: the original disc's default.xex, from the player's own ISO (step 1), once. */
+    if (!join(m, s_dir, L"Original\\default.xex") || !anth_xex_ok(m)) {
+        WCHAR err[600];
+        if (!s_iso[0]) {
+            MessageBoxW(s_wnd, L"Choose your SvR 2011 ISO (or extracted game folder) in step 1 first: the game runs "
+                               L"the original disc's program from it.", WINDOW_TITLE, MB_ICONINFORMATION);
+            return;
+        }
+        set_text(ID_STATUS, L"Copying the original program (default.xex) from your SvR 2011 ISO...");
+        UpdateWindow(s_wnd);
+        if (!anth_copy_original_xex(s_iso, s_dir, err, 600)) {
+            MessageBoxW(s_wnd, err, WINDOW_TITLE, MB_ICONERROR);
+            set_text(ID_STATUS, L"");
+            return;
+        }
+    }
     set_toml(L"fullscreen", IsDlgButtonChecked(s_wnd, ID_FULLSCREEN) == BST_CHECKED ? "true" : "false");
     game_command(cmd, MAX_PATH * 2 + 40, exe, s_game);
     if (!CreateProcessW(exe, cmd, NULL, NULL, FALSE, 0, NULL, s_dir, &si, &pi)) {
@@ -628,6 +647,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR args, int show)
             int ok = check_installer(argv[2], why, 300);
             swprintf_s(cmd, MAX_PATH * 2 + 40, L"%s: %s", ok ? L"ok" : L"no", why);
             return write_result(argv[3], cmd) || !ok;
+        }
+        if (!wcscmp(argv[1], L"--original-xex") && argc >= 5) {
+            WCHAR err[600];
+            int ok = anth_copy_original_xex(argv[2], argv[3], err, 600);
+            return write_result(argv[4], ok ? L"ok" : err) || !ok;
         }
         if (!wcscmp(argv[1], L"--install-saves") && argc >= 5) {
             int saves, dlc, skipped, ok = install_saves_dlc(argv[2], argv[3], &saves, &dlc, &skipped);
