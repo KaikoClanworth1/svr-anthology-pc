@@ -23,6 +23,7 @@
 // - owned: DLC-flagged ids must be owned (sub_828C1288 / sub_82589198):
 //   mods are.
 // The select screen shows them in the EXTRA list (managers.cpp, the M tile).
+#include "anthology.h"
 #include "cae_mod_motions.h"
 #include "no_mods.h"
 #include "superstar_mods.h"
@@ -258,7 +259,7 @@ svrfmt::Bytes OwnRender(const fs::path& file, int size) {
 bool BuildRenders(const fs::path& out, uint32_t base, uint32_t slot, const fs::path& folder, bool generic = false) {
   svrfmt::Bytes d;
   svrfmt::Epac src;
-  if (!svrfmt::ReadFile((g_game / "pac" / "DLC_HD.pac").string(), d) || !svrfmt::EpacRead(d, src)) return false;
+  if (!svrfmt::ReadFile((svr2011::GameDataFolder() / "pac" / "DLC_HD.pac").string(), d) || !svrfmt::EpacRead(d, src)) return false;
   const svrfmt::Bytes big = OwnRender(folder / "render.dds", 512), small = OwnRender(folder / "render_small.dds", 256);
   // (render_full.dds, optional: SSFB's own full-body picture; else SSFB is render.dds too)
   const svrfmt::Bytes full = OwnRender(folder / "render_full.dds", 512);
@@ -1081,8 +1082,8 @@ void LoadAttireMods() {
     char stock[32];
     std::snprintf(stock, sizeof stock, "ch%03u.pac", p.a.id);
     if (!g_attire_own.count(p.a.id)) {
-      g_attire_own[p.a.id] = AttireMask(g_game / "pac" / "ch" / stock, p.a.id);
-      if (ExtraKinds(g_game / "pac" / "ch" / stock, p.a.id)) g_attire_gear.insert(p.a.id);
+      g_attire_own[p.a.id] = AttireMask(svr2011::GameDataFolder() / "pac" / "ch" / stock, p.a.id);
+      if (ExtraKinds(svr2011::GameDataFolder() / "pac" / "ch" / stock, p.a.id)) g_attire_gear.insert(p.a.id);
     }
     pending.push_back(std::move(p));
   }
@@ -1517,7 +1518,7 @@ size_t Signature(const svrfmt::Bytes& d) {
 
 // The originals from menuHD.pac (MENU, MENF, MENG, MENI, MENE: CHSI) and MODDED.
 void LoadBadges() {
-  FILE* f = std::fopen((g_game / "pac" / "menu" / "menuHD.pac").string().c_str(), "rb");
+  FILE* f = std::fopen((svr2011::GameDataFolder() / "pac" / "menu" / "menuHD.pac").string().c_str(), "rb");
   if (!f) return;
   svrfmt::Bytes toc(0x4000);
   if (std::fread(toc.data(), 1, toc.size(), f) != toc.size() || std::memcmp(toc.data(), "EPAC", 4)) {

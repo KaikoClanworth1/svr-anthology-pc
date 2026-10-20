@@ -11,11 +11,15 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <utility>
 #include <vector>
 
+#include <rex/filesystem/devices/host_path_device.h>
+#include <rex/filesystem/vfs.h>
 #include <rex/logging.h>
 
+#include "anthology.h"
 #include "dlc.h"
 
 namespace {
@@ -177,8 +181,75 @@ void PatchMenu(const std::filesystem::path& file) {
 namespace svr2011 {
 
 void PatchGameFiles(const std::filesystem::path& game_dir) {
+  if (kAnthology) return;  // (PatchAnthologyFiles: never the Anthology's own files)
   PatchOnlineStrings(game_dir / "pac" / "string.pac");
   PatchMenu(game_dir / "pac" / "menu" / "menu.pac");
+}
+
+void PatchAnthologyFiles(rex::filesystem::VirtualFileSystem* vfs, const std::filesystem::path& user_data) {
+  if (!kAnthology || !vfs) return;
+  namespace fs = std::filesystem;
+  // The original game's files (size, FNV-1a 64): only those get the port's
+  // changes; an Anthology file that differs is the Anthology's and is used as it is.
+  struct Original {
+    const char* rel;
+    uintmax_t size;
+    uint64_t fnv;
+  };
+  static constexpr Original kOriginals[] = {
+      {"pac/string.pac", 30156800, 0xebfd45bed15ff5c3ull},
+      {"pac/menu/menu.pac", 2537472, 0x5bbcd185be68f036ull},
+  };
+  const fs::path out = user_data / "Anthology";
+  std::vector<const Original*> linked;
+  for (const Original& o : kOriginals) {
+    const fs::path src = GameDataFolder() / fs::u8path(o.rel), dst = out / fs::u8path(o.rel);
+    std::error_code ec;
+    std::vector<uint8_t> d;
+    if (fs::file_size(src, ec) == o.size && !ec) {
+      std::ifstream in(src, std::ios::binary);
+      d.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (uint8_t b : d) h = (h ^ b) * 0x100000001b3ull;
+    if (d.size() != o.size || h != o.fnv) {
+      REXLOG_INFO("[svr2011] anthology: {} is the Anthology's own - used as it is", o.rel);
+      fs::remove(dst, ec);
+      continue;
+    }
+    // (a fresh copy each start: the patchers then take it to the current state)
+    fs::create_directories(dst.parent_path(), ec);
+    const fs::path tmp = dst.string() + ".tmp";
+    {
+      std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+      f.write(reinterpret_cast<const char*>(d.data()), std::streamsize(d.size()));
+      if (!f) continue;
+    }
+    fs::rename(tmp, dst, ec);
+    if (ec) continue;
+    if (fs::path(o.rel).filename() == "string.pac") {
+      PatchOnlineStrings(dst);
+    } else {
+      PatchMenu(dst);
+      SetAnthologyMenuPac(dst);
+    }
+    linked.push_back(&o);
+  }
+  if (linked.empty()) return;
+  // The copies over the game's files: a device of their own (made after they are written).
+  auto device = std::make_unique<rex::filesystem::HostPathDevice>("\\ANTHOLOGYPC", out, true);
+  if (!device->Initialize() || !vfs->RegisterDevice(std::move(device))) {
+    REXLOG_WARN("[svr2011] anthology: could not mount {}", out.string());
+    SetAnthologyMenuPac({});
+    return;
+  }
+  for (const Original* o : linked) {
+    std::string rel = o->rel;
+    for (char& c : rel)
+      if (c == '/') c = '\\';
+    vfs->RegisterSymbolicLink("\\Device\\Harddisk0\\Partition1\\" + rel, "\\ANTHOLOGYPC\\" + rel);
+    REXLOG_INFO("[svr2011] anthology: {} with the port's changes (a copy in {})", o->rel, out.string());
+  }
 }
 
 }  // namespace svr2011

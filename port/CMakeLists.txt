@@ -103,6 +103,7 @@ set(SVR2011_SOURCES
     src/small_rig.cpp
     src/pose_dump.cpp
     src/game_files.cpp
+    src/anthology.cpp
 )
 
 # Developer build: count calls into every function of the game's D3D library
@@ -232,6 +233,12 @@ if(TARGET rexgpu-xenos AND NOT ANDROID)
         DEPENDS rexgpu-xenos svr2011
         VERBATIM)
 endif()
+# SvR Anthology build (branch anthology): runs SVR Anthology by Yumboy11 from
+# its own folder; no mods, no online (src/anthology.h).
+option(SVR2011_ANTHOLOGY "Build the SvR Anthology version" ON)
+if(SVR2011_ANTHOLOGY)
+    target_compile_definitions(svr2011 PRIVATE SVR2011_ANTHOLOGY=1)
+endif()
 if(NOT WIN32)
     # MSVC CRT functions the port uses (_dupenv_s ...).
     target_compile_options(svr2011 PRIVATE -include ${CMAKE_CURRENT_SOURCE_DIR}/src/compat.h)
@@ -328,6 +335,16 @@ if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/launcher/svr2011_launcher.c")
     set_target_properties(svr2011_modmaker PROPERTIES OUTPUT_NAME "SvR2011 Mod Maker")
     add_executable(svr2011_launcher WIN32 launcher/svr2011_launcher.c launcher/apk_package.c launcher/report.c launcher/stfs.c launcher/caw_import.c launcher/verify.c launcher/movie_maker.c launcher/bink_encode.c launcher/bink_decode.c launcher/updater.c launcher/release_check.c launcher/unzip.c launcher/mods_tab.c launcher/backgrounds.c launcher/music_tab.c launcher/roster_tab.c launcher/texpacks_tab.c launcher/ui_theme.c launcher/setup_tab.c launcher/discover_tab.c launcher/launcher.rc src/utf8.manifest)
     set_target_properties(svr2011_launcher PROPERTIES OUTPUT_NAME "SvR2011 Launcher")
+    # The SvR Anthology launcher (branch anthology): SVR Anthology by Yumboy11 - his installer, then the game
+    # with --game_data_root; no mods, no online (launcher/anthology_launcher.c).
+    add_executable(svr2011_anthology_launcher WIN32 launcher/anthology_launcher.c launcher/launcher.rc src/utf8.manifest)
+    set_target_properties(svr2011_anthology_launcher PROPERTIES OUTPUT_NAME "SvR Anthology Launcher")
+    set_property(TARGET svr2011_anthology_launcher PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
+    target_link_options(svr2011_anthology_launcher PRIVATE -Wl,/NODEFAULTLIB:libucrt.lib -Wl,/DEFAULTLIB:ucrt.lib
+        -Wl,/ENTRY:wWinMainCRTStartup)
+    target_compile_definitions(svr2011_anthology_launcher PRIVATE
+        UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN SVR2011_RC_ANTHOLOGY)
+    target_link_libraries(svr2011_anthology_launcher PRIVATE comctl32 comdlg32 shell32 ole32)
     # The hybrid CRT: the VC++ part (vcruntime) built in, the Universal CRT from Windows (ucrtbase.dll /
     # api-ms-win-crt-*, part of Windows 10+; Windows 7/8.1 with update KB2999226). The launcher starts
     # without the VC++ runtime, tells a player who has none / an old one where to get it (setup_tab.c), and

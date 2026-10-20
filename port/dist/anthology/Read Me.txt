@@ -1,0 +1,52 @@
+SVR ANTHOLOGY by Yumboy11 - on the WWE SmackDown vs. Raw 2011 PC recomp
+==========================================================================
+
+SVR Anthology is made by Yumboy11. All credit for it goes to Yumboy11 and the
+people he thanks in his own Readme.txt (in his installer's folder):
+Brienj, Red Rooster, ryokudou, littlebase631, theviper12, xtremebrett,
+tekken57, ERI619, eatrawmeat391, jakeypearce, Mark/Rampage, Justyn,
+Sean O Connor, Wrestling Modders INC, RipZz, Obs Kenobs, WatchTheSmoke and
+everyone who sent textures, suggestions and feedback.
+
+SVR Anthology is freeware: never buy or sell it.
+
+This download contains NOTHING of SVR Anthology. It is the SvR 2011 PC recomp's
+game program and a small launcher that runs the Anthology you install yourself:
+
+  - your own, unmodified WWE SmackDown vs. Raw 2011 Xbox 360 ISO (or its
+    extracted game folder), and
+  - Yumboy11's own "SVR Anthology 1.0 Installer", downloaded from him.
+
+Yumboy11 allows his Anthology to be used with this recomp on exactly those
+terms: your own ISO, his own installer, and full credit to him.
+
+
+HOW TO SET IT UP
+----------------
+1. Extract this zip into a plain folder of its own, for example
+   C:\Games\SvR Anthology PC  (not inside the installer's folder or the
+   Anthology's folder, and not in Documents, Desktop or OneDrive).
+2. Start "SvR Anthology Launcher.exe".
+3. Step 1: choose your SvR 2011 ISO (or extracted folder).
+   Step 2: choose Yumboy11's "SVR Anthology 1.0 Installer" folder.
+   Step 3: "Run Yumboy11's installer". His installer opens in its own window;
+   answer it there. It makes two new folders NEXT TO ITSELF, in the
+   installer's folder:
+       WWE SmackDown vs Raw Anthology
+       WWE SmackDown vs Raw Anthology Saves and DLC
+   It needs a lot of free space on that drive (about 5 times the size of
+   SvR 2011; it tells you how much). To have the Anthology on another drive,
+   move the whole installer folder there BEFORE you run it - the launcher
+   never moves or changes anything there.
+   (Installed it already? Choose the "WWE SmackDown vs Raw Anthology" folder
+   with Browse.)
+4. Saves and DLC: follow Yumboy11's readme in his "Saves and DLC" folder.
+5. PLAY.
+
+This version has no mods, no Mod Maker and no online play: it runs the
+Anthology as Yumboy11 made it. The game's settings, saves and DLC are kept in
+this folder (svr2011.toml, Saves, DLC, UserData); the Anthology's folder is
+only read, never written.
+
+WWE SmackDown vs. Raw 2011 belongs to its owners. SVR Anthology belongs to
+Yumboy11.

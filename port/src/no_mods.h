@@ -8,9 +8,12 @@
 
 #include <cstdlib>
 
+#include "anthology.h"
+
 namespace svr2011 {
 
 inline bool NoMods() {
+  if (kAnthology) return true;  // (the SvR Anthology build has no mods: anthology.h)
   static const bool on = [] {
     const char* v = std::getenv("SVR2011_NO_MODS");
     return v && v[0] == '1';

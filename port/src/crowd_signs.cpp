@@ -22,6 +22,7 @@
 //    signs: the free slots of each match are drawn from the game's 16 and
 //    these;
 //  - the merged bank is handed to the match loader instead of the file's.
+#include "anthology.h"
 #include "crowd_signs.h"
 #include "no_mods.h"
 
@@ -97,7 +98,7 @@ void LoadPacks() {
 bool BuildBank(rex::memory::Memory* memory) {
   svrfmt::Bytes d;
   svrfmt::Epac e;
-  const fs::path pac = rex::filesystem::GetExecutableFolder() / "pac" / "audience.pac";
+  const fs::path pac = svr2011::GameDataFolder() / "pac" / "audience.pac";
   if (!svrfmt::ReadFile(pac.string(), d) || !svrfmt::EpacRead(d, e)) return false;
   const svrfmt::Bytes* bord = nullptr;
   for (const auto& g : e.groups)

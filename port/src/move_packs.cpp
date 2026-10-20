@@ -43,6 +43,7 @@
 // pacs by reading each one's own table (superstar_mods.cpp: sub_825953B0
 // instead of sub_82595428). Unchanged entries are streamed from the original
 // files; changed ones are re-compressed (real BPE).
+#include "anthology.h"
 #include "move_packs.h"
 #include "no_mods.h"
 #include "superstar_mods.h"
@@ -689,7 +690,7 @@ uint64_t Epk8Order(const std::string& name) {
 
 bool BuildEntryPac(const fs::path& game, const fs::path& overlay, const std::string& pac,
                    const std::map<std::string, Bytes>& add) {
-  const fs::path src = game / "pac" / PacPath(pac), dst = overlay / PacPath(pac);
+  const fs::path src = svr2011::GameDataFolder() / "pac" / PacPath(pac), dst = overlay / PacPath(pac);
   std::ifstream in(src, std::ios::binary);
   Bytes head(0x4000);
   if (!in || !in.read(reinterpret_cast<char*>(head.data()), 0x4000) ||
@@ -891,7 +892,7 @@ bool BuildMotionFile(const fs::path& src, const fs::path& dst, const std::string
 }
 
 bool BuildMotionPac(const fs::path& game, const fs::path& overlay, const std::string& pac, const MotionEntries& entries) {
-  return BuildMotionFile(game / "pac" / pac, overlay / pac, pac, entries);
+  return BuildMotionFile(svr2011::GameDataFolder() / "pac" / pac, overlay / pac, pac, entries);
 }
 
 // MOVS/WAZE as in the file (little-endian: u32 255, u32 record count, 128
@@ -1008,7 +1009,7 @@ bool BuildMiscFile(const fs::path& src, const fs::path& dst, const Packs& p) {
 }
 
 bool BuildMisc(const fs::path& game, const fs::path& overlay, const Packs& p) {
-  return BuildMiscFile(game / "pac" / "misc.pac", overlay / "misc.pac", p);
+  return BuildMiscFile(svr2011::GameDataFolder() / "pac" / "misc.pac", overlay / "misc.pac", p);
 }
 
 std::string Lower(std::string s) {
@@ -1285,7 +1286,7 @@ struct MergeLock {
 // pac/plist360(_4x3).h with the merged pacs named in the overlay.
 bool WriteList(const fs::path& game, const fs::path& overlay, const std::string& name, const std::set<std::string>& pacs,
                const std::vector<std::string>& extra = {}) {
-  std::ifstream in(game / "pac" / name, std::ios::binary);
+  std::ifstream in(svr2011::GameDataFolder() / "pac" / name, std::ios::binary);
   if (!in) return true;  // (the 4:3 list may not exist)
   std::ostringstream out;
   std::string line;
@@ -1471,7 +1472,7 @@ bool EntranceScriptExists(int n) {
   static const std::set<int> stock = [] {
     std::set<int> s;
     std::error_code ec;
-    for (const auto& e : fs::directory_iterator(rex::filesystem::GetExecutableFolder() / "pac" / "evt", ec)) {
+    for (const auto& e : fs::directory_iterator(svr2011::GameDataFolder() / "pac" / "evt", ec)) {
       std::ifstream in(e.path(), std::ios::binary);
       Bytes head(0x4000);
       if (!in.read(reinterpret_cast<char*>(head.data()), 0x4000) || std::memcmp(head.data(), "EPK8", 4)) continue;
@@ -1558,8 +1559,8 @@ void InstallMovePacks(rex::filesystem::VirtualFileSystem* vfs, const fs::path& d
     // (the game's own files too - in both reads, or the saved stamp never
     // matches the next start's and every start merges again)
     for (const char* f : {"m.pac", "misc.pac", "mpsp.pac", "plist360.h", "plist360_4x3.h"})
-      stamp += FileStamp(game / "pac" / f);
-    for (const auto& [pac, e] : packs.entries) stamp += FileStamp(game / "pac" / PacPath(pac));
+      stamp += FileStamp(svr2011::GameDataFolder() / "pac" / f);
+    for (const auto& [pac, e] : packs.entries) stamp += FileStamp(svr2011::GameDataFolder() / "pac" / PacPath(pac));
     if (!gm.empty()) stamp += "gimmick " + gm.string() + " " + FileStamp(gm);
   };
   read_packs(false);
@@ -1740,7 +1741,7 @@ namespace svr2011 {
 void LoadMoveTables(const fs::path& game) {
   const fs::path overlay = game / "Mods" / "PacOverlay" / "misc.pac";
   std::error_code ec;
-  const fs::path src = !svr2011::NoMods() && fs::exists(overlay, ec) ? overlay : game / "pac" / "misc.pac";
+  const fs::path src = !svr2011::NoMods() && fs::exists(overlay, ec) ? overlay : svr2011::GameDataFolder() / "pac" / "misc.pac";
   Bytes blob;
   if (!ReadEntry(src, "MOVS/WAZE", blob)) {
     REXLOG_WARN("[svr2011] move packs: no MOVS/WAZE in {} - no match fallback for removed moves", src.string());
@@ -1776,7 +1777,7 @@ void LoadMoveTables(const fs::path& game) {
   // what the stock game can play without packs: its own misc.pac's records with bits and EXH data
   std::vector<bool> stock_ok(65536, false);
   Bytes sw, sd;
-  if (ReadEntry(game / "pac" / "misc.pac", "MOVS/WAZE", sw)) {
+  if (ReadEntry(svr2011::GameDataFolder() / "pac" / "misc.pac", "MOVS/WAZE", sw)) {
     const Bytes w0 = svrfmt::Unpack(sw);
     if (w0.size() >= 272)
       for (uint32_t k = 0, n = Le32(w0.data() + 4); k < n && 272 + size_t(k + 1) * 160 <= w0.size(); ++k) {
@@ -1784,7 +1785,7 @@ void LoadMoveTables(const fs::path& game) {
         if (std::any_of(r, r + 16, [](uint8_t b) { return b != 0; })) stock_ok[Le16(r + 0x90)] = true;
       }
   }
-  if (ReadEntry(game / "pac" / "misc.pac", "WAZA/DATA", sd)) {
+  if (ReadEntry(svr2011::GameDataFolder() / "pac" / "misc.pac", "WAZA/DATA", sd)) {
     std::vector<svrfmt::PachEntry> kids, groups;
     if (svrfmt::PachRead(svrfmt::Unpack(sd), kids) && !kids.empty() && svrfmt::PachRead(svrfmt::Unpack(kids[0].data), groups))
       for (const auto& g : groups) {

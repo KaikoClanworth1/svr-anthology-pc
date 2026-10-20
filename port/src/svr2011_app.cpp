@@ -3,6 +3,7 @@
 #include "generated/default/svr2011_init.h"
 
 #include "svr2011_app.h"
+#include "anthology.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -232,6 +233,7 @@ void Svr2011App::OnConfigurePaths(rex::PathConfig& paths) {
   if (paths.game_data_root.empty()) {
     paths.game_data_root = exe_dir;
   }
+  svr2011::SetGameDataFolder(paths.game_data_root);  // (anthology.h: the disc files the port reads itself)
   paths.user_data_root = exe_dir / "UserData";
   // Tests: SVR2011_USER_DATA=<folder> keeps their saves away from the player's.
   if (std::string dir = Env("SVR2011_USER_DATA"); !dir.empty()) {
@@ -567,6 +569,9 @@ void Svr2011App::OnPostLoadXexImage() {
 
   // The port's text and menu changes to the installed disc files (once).
   svr2011::PatchGameFiles(rex::filesystem::GetExecutableFolder());
+  // The SvR Anthology build: no online, no texture packs; the port's changes in copies (anthology.h).
+  svr2011::ForceAnthologySettings();
+  svr2011::PatchAnthologyFiles(runtime()->file_system(), g_user_data);
 
   // The saves folder chosen in the settings (saves_folder; the launcher's
   // Saves tab sets it). Read here: the settings are loaded after
@@ -728,6 +733,32 @@ void Svr2011App::OnPostLoadXexImage() {
     std::ofstream(dump, std::ios::binary)
         .write(reinterpret_cast<const char*>(image), REX_IMAGE_SIZE);
   }
+}
+
+// The SvR Anthology build: the program this port is made from is the original
+// disc's default.xex (the player's own, from their ISO: Original\default.xex
+// beside the program) - the Anthology's own default.xex is a later build of the
+// game that this recompiled code can't run. Its data stays the Anthology's.
+void Svr2011App::OnLoadXexImage(std::string& xex_image) {
+  (void)xex_image;
+  if (!svr2011::kAnthology) return;
+  std::filesystem::path dir = rex::filesystem::GetExecutableFolder() / "Original";
+  if (std::string d = Env("SVR2011_ANTHOLOGY_XEX"); !d.empty()) dir = std::filesystem::u8path(d);
+  std::error_code ec;
+  if (std::filesystem::file_size(dir / "default.xex", ec) != 15020032) {
+    REXLOG_ERROR("[svr2011] anthology: no original default.xex in {} (the launcher copies it from your ISO)",
+                 dir.string());
+    return;
+  }
+  auto* fs = runtime()->file_system();
+  auto device = std::make_unique<rex::filesystem::HostPathDevice>("\\ORIGINALXEX", dir, true);
+  if (!device->Initialize() || !fs->RegisterDevice(std::move(device)) ||
+      !fs->RegisterSymbolicLink("\\Device\\Harddisk0\\Partition1\\default.xex", "\\ORIGINALXEX\\default.xex")) {
+    REXLOG_ERROR("[svr2011] anthology: could not mount {}", dir.string());
+    return;
+  }
+  REXLOG_INFO("[svr2011] anthology: the program from {} (the original disc's), the data from the Anthology",
+              (dir / "default.xex").string());
 }
 
 // The window closing (the app hard-exits after: no atexit) - the router's

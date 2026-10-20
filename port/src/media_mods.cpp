@@ -44,6 +44,7 @@
 //    it, and the game's "is the object still sounding" (sub_82BB69E8) says
 //    yes while it plays (else music players think it ended at once). Volume:
 //    the game's music / SFX / voice settings (*(0x82EC4C18)+36: floats).
+#include "anthology.h"
 #include "media_mods.h"
 #include "no_mods.h"
 
@@ -171,7 +172,7 @@ void BuildRenders(const std::vector<Pack>& packs) {
   if (big.empty() && bust.empty() && icon.empty()) return;
   svrfmt::Bytes d;
   svrfmt::Epac src;
-  if (!svrfmt::ReadFile((Game() / "pac" / "DLC_HD.pac").string(), d) || !svrfmt::EpacRead(d, src)) return;
+  if (!svrfmt::ReadFile((svr2011::GameDataFolder() / "pac" / "DLC_HD.pac").string(), d) || !svrfmt::EpacRead(d, src)) return;
   svrfmt::Epac e;
   e.header = src.header;
   e.trailer = src.trailer;

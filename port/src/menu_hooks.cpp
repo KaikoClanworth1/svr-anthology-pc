@@ -9,6 +9,7 @@
 //  - choosing an entry opens the port's page instead of the game's screen
 //    (graphics_page.h, achievements_page.h) or closes the game.
 
+#include "anthology.h"
 #include "frame_rate.h"
 #include "menu_hooks.h"
 
@@ -152,7 +153,7 @@ void ReadMenuLabels() {
     d = g_menu_table;
   }
   if (d.empty()) {
-    const auto file = rex::filesystem::GetExecutableFolder() / "pac" / "menu" / "menu.pac";
+    const auto file = svr2011::MenuPacFile();
     std::ifstream in(file, std::ios::binary);
     if (!in) return;
     d.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
