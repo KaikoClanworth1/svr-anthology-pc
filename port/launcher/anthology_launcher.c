@@ -13,6 +13,8 @@
  * Test aids (no window): --check <anthology folder> <out file>  - the folder check's result
  *                        --command <anthology folder> <out file> - the game's command line
  *                        --installer-check <installer folder> <out file>
+ *                        --install-saves <his Saves and DLC folder> <dest folder> <out file>
+ *                            (his saves into <dest>\Saves, his DLC packages into <dest>\DLC)
  */
 #define COBJMACROS
 #include <windows.h>
@@ -23,6 +25,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <wchar.h>
+
+#include "stfs.h"
 
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
@@ -318,6 +322,64 @@ static void installer_done(DWORD code)
 
 static void open_path(const WCHAR *p) { ShellExecuteW(s_wnd, L"open", p, NULL, NULL, SW_SHOWNORMAL); }
 
+/* Yumboy11's saves and DLC, from his "Saves and DLC" folder's "XENIA INSTALL ME" (360 packages): the saves
+ * (CON, his title 54511A11) become this game's save files in <dest>\Saves, the DLC packages (LIVE) are copied
+ * to <dest>\DLC (the game installs them at its next start). His folder is only read. */
+static int install_saves_dlc(const WCHAR *his, const WCHAR *dest, int *saves, int *dlc, int *skipped)
+{
+    WCHAR src[MAX_PATH], out_saves[MAX_PATH], out_dlc[MAX_PATH], pat[MAX_PATH], from[MAX_PATH], to[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    *saves = *dlc = *skipped = 0;
+    if (!join(src, his, L"XENIA INSTALL ME") || !dir_exists(src) || !join(out_saves, dest, L"Saves") ||
+        !join(out_dlc, dest, L"DLC"))
+        return 0;
+    *saves = stfs_import_saves(src, out_saves, skipped);
+    CreateDirectoryW(out_dlc, NULL);
+    if (!join(pat, src, L"*")) return 1;
+    h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 1;
+    do {
+        uint8_t head[0x348];
+        DWORD got = 0;
+        HANDLE fh;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY || !join(from, src, fd.cFileName) || !join(to, out_dlc, fd.cFileName))
+            continue;
+        fh = CreateFileW(from, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+        if (fh == INVALID_HANDLE_VALUE) continue;
+        ReadFile(fh, head, sizeof head, &got, NULL);
+        CloseHandle(fh);
+        /* (content type 2: marketplace content - his DLC packages) */
+        if (got < sizeof head || memcmp(head, "LIVE", 4) || head[0x344] || head[0x345] || head[0x346] || head[0x347] != 2)
+            continue;
+        if (CopyFileW(from, to, FALSE)) ++*dlc;
+        else ++*skipped;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return 1;
+}
+
+static void install_saves_dlc_ui(void)
+{
+    WCHAR parent[MAX_PATH], his[MAX_PATH], save[MAX_PATH], m[700];
+    int saves, dlc, skipped;
+    parent_of(parent, s_game);
+    if (!join(his, parent, ANTHOLOGY_SAVES) || !dir_exists(his)) return;
+    if (join(save, s_dir, L"Saves\\SaveData.dat") && file_exists(save) &&
+        MessageBoxW(s_wnd, L"This game has a save already (Saves\\SaveData.dat beside this launcher). Replace it with "
+                           L"Yumboy11's Anthology save? Your current save is lost.",
+                    WINDOW_TITLE, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
+        return;
+    if (!install_saves_dlc(his, s_dir, &saves, &dlc, &skipped)) {
+        MessageBoxW(s_wnd, L"His \"Saves and DLC\" folder has no \"XENIA INSTALL ME\" folder.", WINDOW_TITLE, MB_ICONWARNING);
+        return;
+    }
+    swprintf_s(m, 700, L"Yumboy11's saves and DLC are set up: %d save file(s) into Saves, %d DLC package(s) into DLC "
+                       L"(the game installs them when it starts)%s.",
+               saves, dlc, skipped ? L" - some files could not be read" : L"");
+    set_text(ID_STATUS, m);
+}
+
 static void open_saves_readme(void)
 {
     WCHAR saves[MAX_PATH], pat[MAX_PATH], p[MAX_PATH], parent[MAX_PATH];
@@ -428,10 +490,10 @@ static void build_window(void)
     y += 28;
     add(L"STATIC", L"", 0, L, y, W, 18, ID_GAME_STATUS, s_font);
     y += 30;
-    add(L"STATIC", L"4. Saves and DLC: follow Yumboy11's readme in his \"Saves and DLC\" folder", 0, L, y, W, 18, -1, s_bold);
+    add(L"STATIC", L"4. Yumboy11's saves and DLC (from his \"Saves and DLC\" folder)", 0, L, y, W, 18, -1, s_bold);
     y += 22;
-    add(L"BUTTON", L"His readme", BS_PUSHBUTTON, L, y, 130, 26, ID_SAVES_README, s_font);
-    add(L"BUTTON", L"His Saves and DLC folder", BS_PUSHBUTTON, L + 140, y, 190, 26, ID_SAVES_OPEN, s_font);
+    add(L"BUTTON", L"Install his saves and DLC", BS_PUSHBUTTON, L, y, 190, 26, ID_SAVES_OPEN, s_font);
+    add(L"BUTTON", L"His readme", BS_PUSHBUTTON, L + 200, y, 130, 26, ID_SAVES_README, s_font);
     add(L"BUTTON", L"This game's Saves and DLC folders", BS_PUSHBUTTON, L + 340, y, 240, 26, ID_OUR_FOLDERS, s_font);
     y += 42;
     add(L"BUTTON", L"Full screen", BS_AUTOCHECKBOX, L, y + 8, 140, 22, ID_FULLSCREEN, s_font);
@@ -486,12 +548,7 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
             refresh();
             break;
         case ID_SAVES_README: open_saves_readme(); break;
-        case ID_SAVES_OPEN: {
-            WCHAR parent[MAX_PATH], p[MAX_PATH];
-            parent_of(parent, s_game);
-            if (join(p, parent, ANTHOLOGY_SAVES)) open_path(p);
-            break;
-        }
+        case ID_SAVES_OPEN: install_saves_dlc_ui(); break;
         case ID_OUR_FOLDERS: {
             WCHAR p[MAX_PATH];
             if (join(p, s_dir, L"Saves")) { CreateDirectoryW(p, NULL); open_path(p); }
@@ -571,6 +628,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR args, int show)
             int ok = check_installer(argv[2], why, 300);
             swprintf_s(cmd, MAX_PATH * 2 + 40, L"%s: %s", ok ? L"ok" : L"no", why);
             return write_result(argv[3], cmd) || !ok;
+        }
+        if (!wcscmp(argv[1], L"--install-saves") && argc >= 5) {
+            int saves, dlc, skipped, ok = install_saves_dlc(argv[2], argv[3], &saves, &dlc, &skipped);
+            swprintf_s(cmd, MAX_PATH * 2 + 40, L"%s: %d saves, %d dlc, %d skipped", ok ? L"ok" : L"no", saves, dlc, skipped);
+            return write_result(argv[4], cmd) || !ok;
         }
         if (!wcscmp(argv[1], L"--command")) {
             join(exe, s_dir, GAME_EXE);

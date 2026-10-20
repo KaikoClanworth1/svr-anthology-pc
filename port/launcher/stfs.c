@@ -26,6 +26,15 @@
 #include <wchar.h>
 
 #define TITLE_ID 0x5451085Du
+/* (the SvR Anthology launcher: Yumboy11's saves are made for his program, title 54511A11) */
+static int title_ok(uint32_t t)
+{
+#ifdef SVR2011_RC_ANTHOLOGY
+    if (t == 0x54511A11u)
+        return 1;
+#endif
+    return t == TITLE_ID;
+}
 
 typedef struct {
     const uint8_t *d;
@@ -145,7 +154,7 @@ static int import_one(const WCHAR *path, const WCHAR *name, const WCHAR *dest, u
         free(d);
         return 0;
     }
-    if (size < 0x1000 || be32(d + 0x360) != TITLE_ID || be32(d + 0x344) != 1) {
+    if (size < 0x1000 || !title_ok(be32(d + 0x360)) || be32(d + 0x344) != 1) {
         free(d);
         return 0;
     }

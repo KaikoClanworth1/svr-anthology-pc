@@ -2,6 +2,8 @@
 
 #include "dlc.h"
 
+#include "anthology.h"
+
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -367,7 +369,8 @@ void InstallDlc(rex::system::KernelState* kernel_state, const std::filesystem::p
     uint32_t title = 0;
     if (!IsDlcPackage(e.path(), &title)) continue;
     const std::string name = e.path().filename().string();
-    if (title != game_title) {
+    // (the SvR Anthology build: Yumboy11's DLC packages are made for his program, title 54511A11)
+    if (title != game_title && !(svr2011::kAnthology && title == 0x54511A11u)) {
       REXLOG_WARN("DLC {}: for title {:08X}, not this game - skipped", name, title);
       continue;
     }
