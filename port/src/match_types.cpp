@@ -14,6 +14,7 @@
 // its rows by their parent node, +0x38). No file size limit applies.
 #include "match_diag.h"
 #include "match_types.h"
+#include "anthology.h"
 #include "mystery_opponent.h"
 #include "pad_types.h"
 
@@ -1017,6 +1018,7 @@ REX_HOOK_RAW(sub_82292D50) {
 REX_EXTERN(__imp__sub_82BAA6E8);
 REX_HOOK_RAW(sub_82BAA6E8) {
   const uint32_t table = ctx.r4.u32, size = ctx.r5.u32;
+  if (svr2011::kAnthology && table) svr2011::HideOnlineRows(base + table, size);  // (no online: anthology.h)
   std::vector<uint8_t> rows;
   if (g_memory && table) rows = WithRows(base + table, size);
   if (rows.empty()) {

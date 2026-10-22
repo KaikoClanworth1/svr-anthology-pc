@@ -25,7 +25,9 @@
 //                               "where: no menu"): the menu explorer
 //   title                       START until the main menu is up (skips the
 //                               intro movies and the title screen)
-//   menu <LABEL>                in the open menu, move to the entry named
+//   title a                     the same, START and A in turn (notices on
+//                               the way that want A: missing DLC, welcome)
+//   menu <LABEL>               in the open menu, move to the entry named
 //                               LABEL (as the log's "menu select" lines and
 //                               "menu group" list name them) and choose it
 //   until <text>                wait for a log line containing text

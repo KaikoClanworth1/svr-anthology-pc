@@ -220,8 +220,9 @@ void ScriptInputDriver::ParseLine(const std::string& line) {
     in >> step.ms;
     queue_.push_back(step);
     queue_.push_back(Step{.ms = 120});  // (lifted, then a pause)
-  } else if (verb == "title") {
+  } else if (verb == "title") {  // (title a: START and A in turn - notices on the way that want A)
     step.kind = Step::kTitle;
+    in >> step.arg;
     queue_.push_back(step);
   } else if (verb == "hotkey") {  // (hotkey <key> [ms]: the free camera's keys, at once - free_cam.h)
     std::string name;
@@ -456,7 +457,7 @@ bool ScriptInputDriver::RunSmart(Clock::time_point now, Step& out) {
       return false;
     }
     if (now >= m.next) {
-      Press(X_INPUT_GAMEPAD_START, now);
+      Press(current_.arg == "a" && (m.presses++ & 1) ? X_INPUT_GAMEPAD_A : X_INPUT_GAMEPAD_START, now);
       m.next = now + seconds(2);
     }
     return true;

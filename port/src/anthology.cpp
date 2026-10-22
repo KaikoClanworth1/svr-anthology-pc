@@ -74,6 +74,21 @@ void SetBe32(uint8_t* p, uint32_t v) {
 }
 }  // namespace
 
+void HideOnlineRows(uint8_t* table, uint32_t size) {
+  // (MFLO: +4 records, +8 shown, records of 0x74 bytes from +0x28: +0 label, +0x18 group, +0x41 bit 0 hidden)
+  if (!kAnthology || !table || size < 0x28 || Be32(table) != 1) return;
+  const uint32_t total = Be32(table + 4);
+  if (!total || total > 0x1000 || 0x28 + total * 0x74 > size) return;
+  uint32_t hidden = 0;
+  for (uint32_t i = 0; i < total; ++i) {
+    uint8_t* r = table + 0x28 + i * 0x74;
+    if (Be32(r + 0x18) == 1 && Be32(r) == 0xA02E && !(r[0x41] & 1)) r[0x41] |= 1, ++hidden;  // (main menu, Xbox LIVE)
+  }
+  if (!hidden) return;
+  SetBe32(table + 8, Be32(table + 8) - hidden);
+  REXLOG_INFO("[svr2011] anthology: the main menu's Xbox LIVE row hidden (no online in this build)");
+}
+
 void InstallAnthology(rex::memory::Memory* memory) {
   g_memory = memory;
   if (kAnthology && memory && On("A2")) {

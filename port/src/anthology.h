@@ -10,6 +10,7 @@
 // still the original game's (otherwise the Anthology's own is used as it is).
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
 
 // The game's own function `fn` (a hook's original): in this build Yumboy11's
@@ -50,6 +51,10 @@ void SetAnthologyMenuPac(const std::filesystem::path& file);
 // The hooks that let the original disc program read the Anthology's data
 // (docs/ANTHOLOGY_CHANGES.md: each one is Yumboy11's change, redone here).
 void InstallAnthology(rex::memory::Memory* memory);
+
+// The game's menu table as it is read (match_types.cpp, sub_82BAA6E8): the
+// main menu's Xbox LIVE row hidden - no online in this build.
+void HideOnlineRows(uint8_t* table, uint32_t size);
 
 // Online, texture packs: off in this build (after the settings are loaded).
 void ForceAnthologySettings();

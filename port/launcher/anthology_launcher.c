@@ -48,7 +48,7 @@ enum {
     ID_INST_EDIT, ID_INST_BROWSE, ID_INST_STATUS, ID_INST_RUN, ID_INST_NOTE,
     ID_GAME_EDIT, ID_GAME_BROWSE, ID_GAME_STATUS,
     ID_SAVES_OPEN, ID_SAVES_README, ID_OUR_FOLDERS,
-    ID_FULLSCREEN, ID_PLAY, ID_CREDITS, ID_README, ID_STATUS
+    ID_FULLSCREEN, ID_PLAY, ID_CREDITS, ID_README, ID_STATUS, ID_UNLOCK_ALL, ID_SKIP_INTROS, ID_SKIP_TRAINING
 };
 #define WM_INSTALLER_DONE (WM_APP + 1)
 
@@ -180,13 +180,14 @@ static void set_toml(const WCHAR *key, const char *value)
     free(out);
     free(data);
 }
-static int toml_true(const WCHAR *key)
+/* key = true in svr2011.toml; `def` when the file or the key isn't there. */
+static int toml_bool(const WCHAR *key, int def)
 {
     WCHAR path[MAX_PATH];
     char line[256], k[64];
-    int on = 0;
+    int on = def;
     FILE *f;
-    if (!join(path, s_dir, L"svr2011.toml") || _wfopen_s(&f, path, L"rb") || !f) return 0;
+    if (!join(path, s_dir, L"svr2011.toml") || _wfopen_s(&f, path, L"rb") || !f) return def;
     WideCharToMultiByte(CP_UTF8, 0, key, -1, k, sizeof k, NULL, NULL);
     while (fgets(line, sizeof line, f))
         if (!strncmp(line, k, strlen(k)) && (line[strlen(k)] == ' ' || line[strlen(k)] == '='))
@@ -437,6 +438,9 @@ static void play(void)
         }
     }
     set_toml(L"fullscreen", IsDlgButtonChecked(s_wnd, ID_FULLSCREEN) == BST_CHECKED ? "true" : "false");
+    set_toml(L"unlock_everything", IsDlgButtonChecked(s_wnd, ID_UNLOCK_ALL) == BST_CHECKED ? "true" : "false");
+    set_toml(L"skip_intros", IsDlgButtonChecked(s_wnd, ID_SKIP_INTROS) == BST_CHECKED ? "true" : "false");
+    set_toml(L"skip_training", IsDlgButtonChecked(s_wnd, ID_SKIP_TRAINING) == BST_CHECKED ? "true" : "false");
     game_command(cmd, MAX_PATH * 2 + 40, exe, s_game);
     if (!CreateProcessW(exe, cmd, NULL, NULL, FALSE, 0, NULL, s_dir, &si, &pi)) {
         swprintf_s(m, 600, L"Could not start the game (Windows error %lu).", GetLastError());
@@ -514,14 +518,23 @@ static void build_window(void)
     add(L"BUTTON", L"Install his saves and DLC", BS_PUSHBUTTON, L, y, 190, 26, ID_SAVES_OPEN, s_font);
     add(L"BUTTON", L"His readme", BS_PUSHBUTTON, L + 200, y, 130, 26, ID_SAVES_README, s_font);
     add(L"BUTTON", L"This game's Saves and DLC folders", BS_PUSHBUTTON, L + 340, y, 240, 26, ID_OUR_FOLDERS, s_font);
-    y += 42;
+    y += 38;
+    /* the 2.1.5 launcher's game options (game settings, not mods) */
+    add(L"BUTTON", L"Everything unlocked from the start (DLC stays)", BS_AUTOCHECKBOX, L, y, 330, 22, ID_UNLOCK_ALL,
+        s_font);
+    add(L"BUTTON", L"Skip intros", BS_AUTOCHECKBOX, L + 340, y, 110, 22, ID_SKIP_INTROS, s_font);
+    add(L"BUTTON", L"Skip practice ring", BS_AUTOCHECKBOX, L + 460, y, 160, 22, ID_SKIP_TRAINING, s_font);
+    y += 32;
     add(L"BUTTON", L"Full screen", BS_AUTOCHECKBOX, L, y + 8, 140, 22, ID_FULLSCREEN, s_font);
     add(L"BUTTON", L"PLAY", BS_DEFPUSHBUTTON, L + W - 220, y, 220, 40, ID_PLAY, s_big);
     add(L"BUTTON", L"Credits", BS_PUSHBUTTON, L + 160, y + 6, 100, 28, ID_CREDITS, s_font);
     add(L"BUTTON", L"Yumboy11's Readme", BS_PUSHBUTTON, L + 270, y + 6, 160, 28, ID_README, s_font);
     y += 52;
     add(L"STATIC", L"", 0, L, y, W, 36, ID_STATUS, s_font);
-    CheckDlgButton(s_wnd, ID_FULLSCREEN, toml_true(L"fullscreen") ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(s_wnd, ID_FULLSCREEN, toml_bool(L"fullscreen", 0) ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(s_wnd, ID_UNLOCK_ALL, toml_bool(L"unlock_everything", 1) ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(s_wnd, ID_SKIP_INTROS, toml_bool(L"skip_intros", 0) ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(s_wnd, ID_SKIP_TRAINING, toml_bool(L"skip_training", 0) ? BST_CHECKED : BST_UNCHECKED);
 }
 
 /* The banner: the credit first. */
@@ -687,7 +700,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR args, int show)
     wc.lpszClassName = L"SvRAnthologyLauncher";
     RegisterClassW(&wc);
     {
-        RECT r = {0, 0, 720, 660};
+        RECT r = {0, 0, 720, 690};
         AdjustWindowRect(&r, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
         s_wnd = CreateWindowW(wc.lpszClassName, WINDOW_TITLE, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
                               CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, NULL, NULL, inst, NULL);

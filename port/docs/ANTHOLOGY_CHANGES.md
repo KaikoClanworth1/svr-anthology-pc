@@ -19,6 +19,11 @@ lists it so it can be shown to him. Addresses are the original disc program's (h
 | A1 | The file system's directory memory: 0x2C000 → 0x4B000 bytes (sub_82578848 [sub_82578F00]: `lis 2 / ori 0xC000` → `lis 4 / ori 0xB000`), for his 379 pacs (the disc has 248) | hook on sub_826A2A10: the set-up record's size and buffer replaced (a 0x4B000 buffer) | crash mounting pac ~373 (pool free list overwritten) |
 | A2 | The game's memory table at 0x82DAC2F8 ({size, id} pairs), part 2: 0x20 → 0x40 (the word at 0x82DAC304) | the table word set at start-up | start-up hang: the loader waited on a full heap |
 | A3 | The superstars' attire table (global 0x82EDEC3C): 80 → 129 entries of 40 bytes, its count +3200 → +5160, the allocation 3204 → 5164 (sub_828C40D0, the constructor sub_828C3F28, and sub_828C3F70 / 3FF8 / 4060 / 4140 / 4400) | the seven functions made at build time from this build's own recompiled code with those constants changed (tools/anthology_redo.py → build folder; the generated code is never in the repository). His second allocation path (201 × 16 bytes) is made 323 × 16 so it also has room | crash after the title: the table's overflow overwrote the match rules (a menu read ids as rule categories) |
+| A4 | Motion entry names `/MOVT/M%03d` for numbers up to 255 (sub_82156918: `cmpwi r3,100` → `256`) | the function made at build time with that constant (tools/anthology_redo.py) | found with A5 (the same loads) |
+| A5 | Names with a number in three digits: the hundreds over the "M" of a `/MENU/M00`-style name, then tens and units, and the fallback "00" at the first two places (sub_82478168, sub_8271D868) | after each of the original's two-digit writes, his three digits are written (a small helper in the build-time file, tools/anthology_redo.py) | match loading hung: the loader waited forever for `/MENU/M00I`, a name the original's two digits made for a number over 99 |
+
+The build also hides the main menu's Xbox LIVE row (no online in this version: anthology.cpp
+HideOnlineRows), which is the port's choice, not a change of his.
 
 Port-side fix that came with A2 (not a change of his): the native renderer took the game's D3D device to
 be at a fixed address (0xAD977E80); the larger heap moves it (0xAD96FE80). The device is now taken from
@@ -29,7 +34,6 @@ the game's own device calls (native_renderer.cpp NoteDevice).
 Changes found in his program that the port does not do, because nothing has needed them so far. Each
 waits for a test that shows it matters:
 
-- sub_82156918: a number limit 100 → 256 (`cmpwi r3,100` → `256`), probably the arena numbers.
 - sub_824B8AB8, sub_82776980: a compare 3 → 200; the value at 0x82DAB600 3 → 201 (the same feature).
 - sub_826533B0: a table on the stack grown 160 → 3296 bytes, its loop fixed to 206 entries.
 - sub_825A6868… / sub_825AAB7C…: two lists of ids remapped (0x11 → 0xBF, 0x0C → 0x80, ...).
