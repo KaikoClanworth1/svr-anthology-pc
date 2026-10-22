@@ -1,5 +1,6 @@
 SVR ANTHOLOGY by Yumboy11 - on the WWE SmackDown vs. Raw 2011 PC recomp
 ==========================================================================
+SvR Anthology PC 2.1.5 (the SvR 2011 PC recomp 2.1.5, Anthology version)
 
 SVR Anthology is made by Yumboy11. All credit for it goes to Yumboy11 and the
 people he thanks in his own Readme.txt (in his installer's folder):
@@ -40,8 +41,15 @@ HOW TO SET IT UP
    never moves or changes anything there.
    (Installed it already? Choose the "WWE SmackDown vs Raw Anthology" folder
    with Browse.)
-4. Saves and DLC: follow Yumboy11's readme in his "Saves and DLC" folder.
-5. PLAY.
+4. Step 4: "Install his saves and DLC" (from his "Saves and DLC" folder;
+   his folder is only read).
+5. PLAY. The first PLAY copies the original program (default.xex) out of
+   your ISO into the Original folder here. Always start the game with the
+   launcher (or after setting it up once, svr2011.exe in this folder).
+
+In the game, on a first start: A on the "Some save data cannot be used..."
+notice, then you are in the Training Facility - START for the menus (A on
+the WWE Universe welcome and Online Axxess notices).
 
 This version has no mods, no Mod Maker and no online play: it runs the
 Anthology as Yumboy11 made it. The game's settings, saves and DLC are kept in

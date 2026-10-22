@@ -239,6 +239,26 @@ void Svr2011App::OnConfigurePaths(rex::PathConfig& paths) {
   if (paths.game_data_root.empty()) {
     paths.game_data_root = exe_dir;
   }
+#if defined(_WIN32)
+  // The SvR Anthology build started on its own (not with the launcher's PLAY): the Anthology folder the
+  // launcher was given (anthology_launcher.ini), else a word on what to start instead.
+  if (svr2011::kAnthology && paths.game_data_root == exe_dir) {
+    wchar_t folder[MAX_PATH] = L"";
+    GetPrivateProfileStringW(L"Anthology", L"GameFolder", L"", folder, MAX_PATH,
+                             (exe_dir / "anthology_launcher.ini").wstring().c_str());
+    std::error_code ec;
+    if (folder[0] && std::filesystem::is_regular_file(std::filesystem::path(folder) / "default.xex", ec) &&
+        std::filesystem::is_regular_file(exe_dir / "Original" / "default.xex", ec)) {
+      paths.game_data_root = folder;
+    } else {
+      MessageBoxW(nullptr,
+                  L"Start \"SvR Anthology Launcher.exe\" (in this folder) to set SVR Anthology up and play.\n\n"
+                  L"It needs your SvR 2011 ISO and the folder Yumboy11's SVR Anthology installer made.",
+                  L"SVR Anthology by Yumboy11", MB_OK | MB_ICONINFORMATION);
+      std::exit(0);
+    }
+  }
+#endif
   svr2011::SetGameDataFolder(paths.game_data_root);  // (anthology.h: the disc files the port reads itself)
   paths.user_data_root = exe_dir / "UserData";
   // Tests: SVR2011_USER_DATA=<folder> keeps their saves away from the player's.
