@@ -11,14 +11,21 @@
 #include <mutex>
 #include <string>
 
+#include <rex/cvar.h>
+#include <rex/hook.h>
 #include <rex/logging.h>
 #include <rex/ppc.h>
 #include <rex/ui/window.h>
 #include <rex/ui/window_listener.h>
 
 #include "fps_overlay.h"
+#include "generated/default/svr2011_init.h"
 #include "frame_rate.h"
+#include "graphics_page.h"
 #include "keyboard_typing.h"
+
+REXCVAR_DEFINE_INT32(match_camera, 0, "UI",
+                     "The match camera: 0 NORMAL, 1 FAR, 2 CLOSE, 3 HIGH, 4 LOW, 5 RAMP (ring matches; BACK + R3 / F4 cycle it)");
 
 namespace svr2011 {
 namespace {
@@ -82,6 +89,7 @@ Clock::time_point g_last_tick;
 
 // Held keys (the window's key events) and script-held keys (test aid); the pads.
 bool g_held[256] = {};
+std::atomic<bool> g_keyboard_used{false};  // (a key pressed in the game's window this session: the hints are for it)
 Clock::time_point g_script_until[256] = {};
 float g_lx = 0, g_ly = 0, g_rx = 0, g_ry = 0, g_lt = 0, g_rt = 0;
 bool g_lb = false, g_rb = false;
@@ -132,9 +140,26 @@ void WriteView(uint8_t* p) {
 
 void Notice(const char* text) { ShowNotice(text, 3.0f); }
 
+// MATCH CAMERA (free_cam.h): the preset, and the eye / direction put back after the view is built.
+std::atomic<int> g_preset{-1};  // (-1: from the setting at first use)
+// (RAMP: the fighters' sphere the match camera frames - centre, radius; radius < 0 none yet)
+std::atomic<float> g_sx{0}, g_sy{0}, g_sz{0}, g_sr{-1};
+thread_local bool g_follow = false;  // (inside the follow camera's update: sub_822285F0's hook)
+struct Saved {
+  bool active = false;
+  uint32_t eye = 0, dir = 0;
+  float e[3] = {}, d[3] = {};
+} g_saved;
+constexpr uint32_t kLive = 0x82E3DE00;  // (+64 the match's arena)
+constexpr uint32_t kFollowBuild = 0x82228894;  // (sub_822285F0's call of sub_82227150)
+constexpr uint32_t kBackstageArena = 78;
+
 void Hotkey(uint8_t vk) {
   std::lock_guard lock(g_mutex);
   switch (vk) {
+    case 0x73:  // F4: the next MATCH CAMERA
+      CycleMatchCamera();
+      return;
     case 0x75:  // F6
       if (g_mode == Mode::kOff) {
         g_capture = true;
@@ -193,7 +218,8 @@ class FreeCamListener final : public rex::ui::WindowInputListener, public rex::u
   void OnKeyDown(rex::ui::KeyEvent& e) override {
     const uint32_t vk = uint32_t(e.virtual_key());
     if (vk >= 256 || GameKeyboardOpen()) return;
-    if (vk >= 0x74 && vk <= 0x77) {
+    g_keyboard_used = true;
+    if (vk >= 0x73 && vk <= 0x77) {
       if (!e.is_ctrl_pressed() && !e.is_alt_pressed()) {
         Hotkey(uint8_t(vk));
         e.set_handled(true);
@@ -282,15 +308,32 @@ void FreeCamSceneView(uint8_t* base, uint32_t view, uint32_t eye, uint32_t dir) 
 void FreeCamFrame(uint8_t* base) {
   static bool hinted = false;
   std::lock_guard lock(g_mutex);
-  if (!hinted && InMatch() && Rd32(base + kMatchFrames) > 180) {
+  // The keys, briefly, once a session: in a match, for someone playing on the keyboard (a pad or touch player
+  // never presses one, so never sees it; not on Android). While the camera flies, its keys stay up (not with
+  // the UI hidden: F7 is for pictures).
+#if !defined(__ANDROID__)
+  if (!hinted && g_keyboard_used.load() && InMatch() && Rd32(base + kMatchFrames) > 180) {
     hinted = true;
-    ShowNotice("Free camera: F6   back: F5   hide UI: F7", 5.0f);
+    ShowNotice("Free camera: F6   back: F5   hide UI: F7", 4.0f);
   }
+  if (g_mode == Mode::kFlying && !g_hide_ui.load())
+    ShowNotice("Free camera: W A S D  Q E  arrows  [ ]   F6 keep   F5 back   F7 hide UI", 0.5f);
+#else
+  (void)base, (void)hinted;
+#endif
   // (F8 holds the camera too: without world updates nothing builds the view - written here it isn't drawn.
   // Frame the shot, then F8.)
 }
 
 void FreeCamPad(uint32_t user, uint8_t* s) {
+  if (InMatch() && user < 8) {
+    static bool r3_was[8] = {};
+    const uint16_t b = uint16_t(s[4] << 8 | s[5]);
+    const bool r3 = (b & 0x0020) && (b & 0x0080);  // (BACK + R3)
+    if (r3 && !r3_was[user]) CycleMatchCamera();
+    r3_was[user] = r3;
+    if (b & 0x0020) s[5] = uint8_t(s[5] & ~0x80);  // (R3 with BACK held: the camera's, not SUBMIT)
+  }
   std::lock_guard lock(g_mutex);
   if (user == 0) g_lx = g_ly = g_rx = g_ry = g_lt = g_rt = 0, g_lb = g_rb = false;
   if (g_mode != Mode::kFlying) return;
@@ -307,18 +350,105 @@ void FreeCamPad(uint32_t user, uint8_t* s) {
 
 bool FreeCamPaused() { return g_paused; }
 
+void MatchCameraSphere(float x, float y, float z, float radius) { g_sx = x, g_sy = y, g_sz = z, g_sr = radius; }
+
+int MatchCamera() {
+  int p = g_preset.load();
+  if (p < 0) g_preset = p = std::clamp(REXCVAR_GET(match_camera), 0, kMatchCameras - 1);
+  return p;
+}
+
+const char* MatchCameraName(int preset) {
+  static const char* const kNames[kMatchCameras] = {"NORMAL", "FAR", "CLOSE", "HIGH", "LOW", "RAMP"};
+  return kNames[std::clamp(preset, 0, kMatchCameras - 1)];
+}
+
+void SetMatchCamera(int preset, bool save) {
+  preset = (preset % kMatchCameras + kMatchCameras) % kMatchCameras;
+  g_preset = preset;
+  rex::cvar::SetFlagByName("match_camera", std::to_string(preset));
+  if (save) SaveConfigSetting("match_camera", std::to_string(preset));
+}
+
+void CycleMatchCamera() {
+  const int p = (MatchCamera() + 1) % kMatchCameras;
+  SetMatchCamera(p, true);
+  REXLOG_INFO("[svr2011] match camera: {}", MatchCameraName(p));
+  if (InMatch()) ShowNotice(std::string("CAMERA: ") + MatchCameraName(p) + "   (BACK + R3 / F4)", 2.0f);
+}
+
+void MatchCameraBefore(uint8_t* base, uint32_t lr, uint32_t view, uint32_t eye, uint32_t dir) {
+  g_saved.active = false;
+  static const bool lr_log = std::getenv("SVR2011_TEST_CAM_LR") != nullptr;  // (test aid: who builds the view)
+  if (lr_log && view == kSceneView && InMatch()) {
+    static uint32_t seen[32] = {};
+    static int n = 0;
+    bool found = false;
+    for (int i = 0; i < n; ++i) found = found || seen[i] == lr;
+    if (!found && n < 32) {
+      seen[n++] = lr;
+      REXLOG_INFO("[svr2011] match camera: the view built from {:08X}", lr);
+    }
+  }
+  const int p = MatchCamera();
+  if (!p || view != kSceneView || !eye || !dir || lr != kFollowBuild || !g_follow || !InMatch()) return;
+  if (Rd32(base + kLive + 64) == kBackstageArena) return;
+  {
+    std::lock_guard lock(g_mutex);
+    if (g_mode != Mode::kOff || g_capture) return;  // (the free camera's)
+  }
+  const V3 e{RdF(base + eye), RdF(base + eye + 4), RdF(base + eye + 8)};
+  const V3 d = Unit(V3{RdF(base + dir), RdF(base + dir + 4), RdF(base + dir + 8)});
+  // What it looks at: the ring's centre along its direction (at least 30 ahead).
+  const float dist = std::max(30.0f, -Dot(e, d));
+  const V3 target = e + d * dist;
+  V3 ne = e;
+  switch (p) {
+    case 1: ne = target + d * (-dist * 1.45f); break;   // FAR
+    case 2: ne = target + d * (-dist * 0.65f); break;   // CLOSE
+    case 3: ne.y = e.y - dist * 0.45f; break;           // HIGH (-Y is up)
+    case 4: ne.y = std::min(e.y + dist * 0.25f, -14.0f); break;  // LOW (kept above the ring: the mat is at -12)
+  }
+  V3 nd = Unit(target + ne * -1.0f);
+  if (p == 5 && g_sr.load() >= 0) {
+    // RAMP: the Royal Rumble's camera (sub_82331980) - its direction locked, looking from the hard-camera side
+    // toward the ramp and stage (+z), a little down; its eye follows the fighters (their sphere's centre) from
+    // a distance that keeps them all in the shot. Any arena: the ring's at the origin in every one.
+    const V3 c{g_sx.load(), g_sy.load(), g_sz.load()};
+    nd = Unit(V3{0.0f, 0.3f, 0.95f});
+    const float back = std::clamp(g_sr.load() * 2.5f + 80.0f, 95.0f, 180.0f);  // (the Rumble's: about 95 away)
+    ne = c + nd * -back;
+  }
+  static int logged_preset = -1;
+  if (p != logged_preset) {
+    logged_preset = p;
+    REXLOG_INFO("[svr2011] match camera {}: eye ({:.1f}, {:.1f}, {:.1f}) -> ({:.1f}, {:.1f}, {:.1f}), {:.1f} from what it looks at",
+                MatchCameraName(p), e.x, e.y, e.z, ne.x, ne.y, ne.z, dist);
+  }
+  g_saved = {true, eye, dir, {e.x, e.y, e.z}, {RdF(base + dir), RdF(base + dir + 4), RdF(base + dir + 8)}};
+  WrF(base + eye, ne.x), WrF(base + eye + 4, ne.y), WrF(base + eye + 8, ne.z);
+  WrF(base + dir, nd.x), WrF(base + dir + 4, nd.y), WrF(base + dir + 8, nd.z);
+}
+
+void MatchCameraAfter(uint8_t* base) {
+  if (!g_saved.active) return;
+  g_saved.active = false;  // (the camera's own eye and direction back: its smoothing goes on from them)
+  for (int i = 0; i < 3; ++i) WrF(base + g_saved.eye + 4 * i, g_saved.e[i]), WrF(base + g_saved.dir + 4 * i, g_saved.d[i]);
+}
+
 bool UiHidden() { return g_hide_ui.load(); }
 
 bool FreeCamScriptKey(const char* name, int ms) {
   static const struct {
     const char* name;
     uint8_t vk;
-  } kKeys[] = {{"F5", 0x74},   {"F6", 0x75},   {"F7", 0x76},   {"F8", 0x77},   {"W", 'W'},      {"A", 'A'},
+  } kKeys[] = {{"F4", 0x73},   {"F5", 0x74},   {"F6", 0x75},   {"F7", 0x76},   {"F8", 0x77},   {"W", 'W'},      {"A", 'A'},
                {"S", 'S'},     {"D", 'D'},     {"Q", 'Q'},     {"E", 'E'},     {"UP", 0x26},    {"DOWN", 0x28},
                {"LEFT", 0x25}, {"RIGHT", 0x27}, {"SHIFT", 0x10}, {"CTRL", 0x11}, {"[", 0xDB},    {"]", 0xDD}};
   for (const auto& k : kKeys)
     if (std::strcmp(name, k.name) == 0) {
-      if (k.vk >= 0x74 && k.vk <= 0x77) {
+      g_keyboard_used = true;  // (a key, as from the window)
+      if (k.vk >= 0x73 && k.vk <= 0x77) {
         Hotkey(k.vk);
       } else {
         std::lock_guard lock(g_mutex);
@@ -331,3 +461,15 @@ bool FreeCamScriptKey(const char* name, int ms) {
 
 }  // namespace svr2011
 
+
+
+
+// The match camera's frame (free_cam.h): sub_822285F0(camera), the in-match cameras' view update (one class,
+// vtable 0x82005160), called from 0x82398B10 for the follow camera while the camera mode (0x82E3CCF8) is 1 -
+// during play; the entrances are mode 6, and the big-move cuts come through sub_822280B0 (from 0x82228C2C).
+REX_EXTERN(__imp__sub_822285F0);
+REX_HOOK_RAW(sub_822285F0) {
+  svr2011::g_follow = uint32_t(ctx.lr) == 0x82398B10 && svr2011::Rd32(base + 0x82E3CCF8) == 1;
+  __imp__sub_822285F0(ctx, base);
+  svr2011::g_follow = false;
+}

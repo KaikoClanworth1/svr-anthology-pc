@@ -10,6 +10,8 @@
 #include <cstring>
 #include <ctime>
 #include <map>
+#include <functional>
+#include <memory>
 #include <set>
 #include <thread>
 
@@ -196,6 +198,7 @@ struct Job {
   std::map<int, int> moveset;
   std::string id, manifest;
   std::wstring model, song, movie, voice, cae, attires[4];
+  std::string threads;  // (the Threads parts tab's threads.txt)
   std::string attire_names[4];
   Image picture, picture_small, picture_full;
   std::vector<Image> signs;
@@ -1128,6 +1131,7 @@ bool PrepareJob(Job& j) {
   if (!g_star.moves.empty() || !g_star.moveset.empty()) j.manifest += "moves=moves.txt\n";
   j.moves = g_star.moves, j.pack = g_star.pack, j.moveset = g_star.moveset;
   j.model = g_star.model, j.song = g_star.song, j.movie = g_star.movie, j.voice = g_star.voice, j.cae = g_star.cae;
+  j.threads = g_star.threads;
   j.gear = g_star.gear;
   j.mats = g_star.mats;
   for (int a = 1; a < 4; ++a) j.attires[a] = g_star.attires[a], j.attire_names[a] = g_star.attire_names[a];
@@ -1215,6 +1219,7 @@ bool BuildFiles(Job& j, std::vector<ZipEntry>& files) {
     files.push_back({"movie.bik", std::move(m)});
     man += "movie=movie.bik\n";
   }
+  if (!j.threads.empty()) files.push_back({"threads.txt", Bytes(j.threads.begin(), j.threads.end())});  // (Threads parts tab)
   if (!j.cae.empty()) {  // (a created entrance: the game's block as it wrote it - superstar_mods.cpp cae=)
     Bytes c;
     if (!ReadFile(Utf8(j.cae), c) || c.size() != 284) {
@@ -1300,7 +1305,7 @@ void SaveMod() {
       if (WriteFile(out, ZipWrite(files))) Status("Saved " + out + " (add it in the launcher's Mods tab with +).");
       else Status("The mod could not be written: " + out);
     };
-    if (OwnModel(j.model)) WithThreadsParts(j.id, std::move(files), write);
+    if (OwnModel(j.model) && j.threads.empty()) WithThreadsParts(j.id, std::move(files), write);  // (made in the tab: kept)
     else write(files);
   });
 }
@@ -1325,7 +1330,7 @@ void Install(bool start) {
       Status("Installed: under the M tile of the character select from the next game start (" + PathStr(dir) + ")." + InstallReport("Superstars", dir));
       if (start) StartGame();
     };
-    if (!OwnModel(j.model)) return done();
+    if (!OwnModel(j.model) || !j.threads.empty()) return done();
     OnUiThread([dir, done] {  // (its own model: its Superstar Threads parts first, then the doctor's report)
       WhenIdle([dir, done] { MakeThreadsParts(dir, [done](int, const std::string&) { RunInBackground(done); }); });
     });
@@ -1345,6 +1350,7 @@ struct FbxRig {
   std::vector<std::string> auto_map;  // MapRig's
   std::vector<int> depth;
   std::string rig, error;
+  std::vector<std::string> notes;  // what the matching decided on its own (a doubled eye bone)
   std::vector<FbxMeshInfo> meshes;
 };
 FbxRig g_fbx_rig;
@@ -1363,6 +1369,22 @@ const FbxRig& FbxSkeleton() {
   for (const auto& b : g_fbx_rig.bones) rb.push_back({b.name, b.parent});
   g_fbx_rig.auto_map = MapRig(rb);
   g_fbx_rig.rig = DetectRig(rb);
+  // two bones for one eye (Eye_L and LeftEye): the one holding weights stays, the other moves with its parent
+  for (const char* eye : {"l_eye", "r_eye"}) {
+    std::vector<size_t> on;
+    for (size_t i = 0; i < g_fbx_rig.auto_map.size(); ++i)
+      if (g_fbx_rig.auto_map[i] == eye) on.push_back(i);
+    if (on.size() < 2) continue;
+    size_t keep = on[0];
+    for (size_t i : on)
+      if (g_fbx_rig.bones[i].skinned && !g_fbx_rig.bones[keep].skinned) keep = i;
+    std::string dropped;
+    for (size_t i : on)
+      if (i != keep) g_fbx_rig.auto_map[i].clear(), dropped += (dropped.empty() ? "" : ", ") + g_fbx_rig.bones[i].name;
+    g_fbx_rig.notes.push_back(std::string(eye[0] == 'l' ? "Two left eye bones: " : "Two right eye bones: ") + g_fbx_rig.bones[keep].name +
+                              (g_fbx_rig.bones[keep].skinned ? " (it holds the eye's weights)" : "") + " is the eye; " + dropped +
+                              " moves with its parent.");
+  }
   std::string merr;
   FbxListMeshes(Utf8(g_star.fbx), g_fbx_rig.meshes, merr);
   for (size_t i = 0; i < g_fbx_rig.bones.size(); ++i) {
@@ -1415,13 +1437,17 @@ FbxImportOptions FbxOptions() {
   FbxImportOptions opts;
   for (const auto& [k, v] : g_star.fbx_on) opts.include[k] = v == "1";
   opts.kind = g_star.fbx_kind, opts.picture = g_star.fbx_pic;
+  opts.max_vertices = g_star.fbx_reduce, opts.keep_face = g_star.fbx_keep_face;
+  opts.hair = g_star.fbx_hair;
+  for (const auto& [k, v] : g_star.fbx_cloth) opts.cloth[k] = v == "1";
   for (const auto& [name, e] : g_star.fbx_mat) {  // (the builder's per-mesh material)
     svrfmt::FbxMaterial f;
     if (e.has_spec) f.specular = e.spec;
     if (e.normal == 1) f.normal = Utf8(e.normal_file);
     if (e.has_tint) f.has_tint = true, std::copy(e.tint, e.tint + 3, f.tint);
-    f.cutout = e.cutout, f.double_sided = e.two_sided;
+    f.cutout = e.cutout, f.double_sided = e.two_sided, f.flip = e.flip;
     if (e.spec_alpha) f.specular_alpha = e.spec_alpha == 1 ? "texture" : e.spec_alpha == 2 ? "flat" : "brightness";
+    if (!e.shine_mask.empty()) f.shine_mask = Utf8(e.shine_mask);
     opts.material[name] = f;
   }
   return opts;
@@ -1442,11 +1468,12 @@ void IssueList(const std::vector<FbxIssue>& list) {
     ImGui::PopID();
   }
 }
-void FbxReportPanel(const FbxRig& r) {
+void FbxReportPanel(const FbxRig& r, bool show = true) {
   std::error_code ec;
   const auto t = fs::last_write_time(g_star.fbx, ec);
   const std::string key = Utf8(g_star.fbx) + "|" + std::to_string(t.time_since_epoch().count()) + "|" + FbxMapText() + "|" +
-                          PairsText(g_star.fbx_on) + "|" + PairsText(g_star.fbx_pic);
+                          PairsText(g_star.fbx_on) + "|" + PairsText(g_star.fbx_pic) + "|" + std::to_string(g_star.fbx_reduce) +
+                          (g_star.fbx_keep_face ? "f" : "") + "|" + std::to_string(g_star.fbx_hair) + "|" + PairsText(g_star.fbx_cloth);
   if (key != g_fbx_report_key && !g_fbx_report_busy && !Busy()) {
     g_fbx_report_busy = true;
     std::vector<std::string> targets;
@@ -1459,6 +1486,7 @@ void FbxReportPanel(const FbxRig& r) {
       OnUiThread([key, list] { g_fbx_report = list, g_fbx_report_key = key, g_fbx_report_busy = false; });
     });
   }
+  if (!show) return;
   int counts[3] = {};
   for (const auto& is : g_fbx_report) ++counts[std::clamp(is.level, 0, 2)];
   const std::string head = g_fbx_report_key.empty() ? std::string("Model check: reading ...")
@@ -1540,7 +1568,7 @@ void MakeFromFbx() {
         if (code != 0 || !fs::exists(out)) {
           const std::string why = parsed ? j["error"].Str() : std::string();
           Status("The model could not be built from the FBX" + (why.empty() ? std::string(" (see the log).") : ": " + why));
-          g_fbx_after.push_back({2, "The model couldn't be built" + (why.empty() ? std::string(" (the log says why).") : ": " + why), "Turn off a mesh or two in Meshes, or reduce it in Blender, then Make again."});
+          g_fbx_after.push_back({2, "The model couldn't be built" + (why.empty() ? std::string(" (the log says why).") : ": " + why), "Leave out a part or two in the Outfit step, or reduce it in Blender, then Make again."});
           Log("svr11_build (" + std::to_string(code) + "): " + text);
           test_end();
           return;
@@ -1574,158 +1602,596 @@ void MakeFromFbx() {
 }
 
 bool FbxMaterialCell(const std::string& mesh, bool simple);
-void FbxRows(bool simple) {
-  FileRow(simple ? "Pick an FBX file..." : "Model from an FBX (optional)...", g_star.fbx, "none", kFbxFilter, 1,
-          "A rigged model (Unity / VRChat, Mixamo, Blender Rigify, 3ds Max Biped, UE Mannequin and rigs named like them):\n"
-          "its bones are matched to the 2011 skeleton by their names; the table below lets you change any of them.");
-  if (g_star.fbx.empty()) return;
-  const FbxRig& r = FbxSkeleton();
-  ImGui::Indent();
-  if (!r.error.empty()) {
-    ImGui::TextColored(ImVec4(1, 0.45f, 0.4f, 1), "The FBX could not be read: %s", r.error.c_str());
-    ImGui::Unindent();
+
+// ---- the FBX import, step by step (the Simple Look step's "Import a 3D model", the full page's FBX row): 1 the
+// file, 2 its skeleton, 3 its materials, 4 the outfit (which parts), 5 the check and Make - one step shown at a time
+int g_fbx_step = 0;
+const char* const kFbxSteps[] = {"Model", "Skeleton", "Materials", "Outfit", "Check and make"};
+constexpr int kFbxStepCount = 5;
+
+// A mesh's material ("node / material": the part after the slash; with none, the node's name).
+std::string FbxMaterialOf(const std::string& mesh) {
+  const size_t s = mesh.find(" / ");
+  return s == std::string::npos ? mesh : mesh.substr(s + 3);
+}
+bool FbxMeshOn(const FbxMeshInfo& m) {
+  const auto on = g_star.fbx_on.find(m.name);
+  return on != g_star.fbx_on.end() ? on->second == "1" : !m.hidden;
+}
+
+// Thumbnails: each mesh's picture as its material has it (FbxMeshPictures, read off the UI thread once per file),
+// a picture picked for it instead (by path).
+struct FbxThumbs {
+  std::wstring fbx;
+  fs::file_time_type time{};
+  bool busy = false;
+  std::map<std::string, Picture> pics;
+};
+FbxThumbs g_fbx_thumbs;
+std::map<std::string, Picture> g_file_thumbs;
+Picture* FileThumb(const std::string& path) {
+  auto it = g_file_thumbs.find(path);
+  if (it == g_file_thumbs.end()) {
+    Image img;
+    Picture p;
+    if (LoadPicture(Wide(path), img) && img.w > 0 && img.h > 0) {
+      const double f = std::min(1.0, 96.0 / std::max(img.w, img.h));
+      p.Set(Resize(img, std::max(1, int(img.w * f)), std::max(1, int(img.h * f))));
+    }
+    it = g_file_thumbs.emplace(path, std::move(p)).first;
+  }
+  return &it->second;
+}
+Picture* FbxThumb(const std::string& mesh) {
+  if (const auto p = g_star.fbx_pic.find(mesh); p != g_star.fbx_pic.end()) return FileThumb(p->second);
+  std::error_code ec;
+  const auto t = fs::last_write_time(g_star.fbx, ec);
+  if ((g_fbx_thumbs.fbx != g_star.fbx || g_fbx_thumbs.time != t) && !g_fbx_thumbs.busy) {
+    g_fbx_thumbs = FbxThumbs();
+    g_fbx_thumbs.fbx = g_star.fbx, g_fbx_thumbs.time = t, g_fbx_thumbs.busy = true;
+    const std::wstring fbx = g_star.fbx;
+    std::thread([fbx, t] {
+      auto got = std::make_shared<std::map<std::string, Image>>();
+      FbxMeshPictures(Utf8(fbx), 96, *got);
+      OnUiThread([fbx, t, got] {
+        if (g_fbx_thumbs.fbx != fbx || g_fbx_thumbs.time != t) return;
+        for (auto& [k, img] : *got) g_fbx_thumbs.pics[k].Set(std::move(img));
+        g_fbx_thumbs.busy = false;
+      });
+    }).detach();
+  }
+  const auto it = g_fbx_thumbs.pics.find(mesh);
+  return it == g_fbx_thumbs.pics.end() ? nullptr : &it->second;
+}
+// A thumbnail in a side x side box (a grey box saying so when there's none).
+void Thumb(Picture* p, float side, const char* none) {
+  if (p && !p->Empty()) {
+    p->Draw(side, side);
     return;
   }
-  int mapped = 0;
-  std::set<std::string> have;
-  for (size_t i = 0; i < r.bones.size(); ++i)
-    if (std::string t = FbxTarget(r, i); !t.empty()) ++mapped, have.insert(t);
-  int missing = 0;
-  for (const char* c : kFbxCore) missing += !have.count(c);
-  ImGui::TextDisabled("%s: %d of %d bones mapped%s, %d edited by hand", r.rig.c_str(), mapped, int(r.bones.size()),
-                      missing ? (", " + std::to_string(missing) + " of the main 2011 bones missing").c_str() : "",
-                      int(g_star.fbx_map.size()));
+  const ImVec2 a = ImGui::GetCursorScreenPos(), b(a.x + side, a.y + side);
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  dl->AddRectFilled(a, b, IM_COL32(70, 70, 76, 255), 4 * g_scale);
+  const ImVec2 ts = ImGui::CalcTextSize(none);
+  dl->AddText(ImVec2(a.x + (side - ts.x) / 2, a.y + (side - ts.y) / 2), IM_COL32(170, 170, 180, 255), none);
+  ImGui::Dummy(ImVec2(side, side));
+}
+// Has the picture see-through places (an alpha below 255 somewhere)?
+bool HasClearPlaces(Picture* p) {
+  if (!p || p->Empty()) return false;
+  for (size_t q = 3; q < p->image.rgba.size(); q += 4)
+    if (p->image.rgba[q] < 200) return true;
+  return false;
+}
 
-  FbxReportPanel(r);
-  if (ImGui::TreeNode("bonemap", "%s", simple ? (missing ? "Fix the matching (some main bones are missing)" : "Bone matching") : "Bone mapping")) {
-    ImGui::BeginDisabled(g_star.fbx_map.empty());
-    if (ImGui::SmallButton("Back to the automatic mapping")) g_star.fbx_map.clear(), Touch();
-    ImGui::EndDisabled();
+// A picture choice in a row: its label, the file's name (or `none`), Pick... and x. True when it changed.
+bool PictureChoice(const char* label, std::string& file, const char* none, const char* tip, const wchar_t* title) {
+  bool ch = false;
+  ImGui::PushID(label);
+  ImGui::AlignTextToFramePadding();
+  ImGui::TextUnformatted(label);
+  if (tip && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+  ImGui::SameLine(150 * g_scale);
+  if (file.empty()) ImGui::TextDisabled("%s", none);
+  else ImGui::TextUnformatted(FileName(Wide(file)).c_str());
+  ImGui::SameLine();
+  if (ImGui::SmallButton("Pick...")) {
+    const std::wstring f = PickFile(false, title, kPictureFilter, 1);
+    if (!f.empty()) file = Utf8(f), ch = true;
+  }
+  if (!file.empty()) {
     ImGui::SameLine();
-    ImGui::TextDisabled("(an unmapped bone's weights go to its nearest mapped parent)");
-    const auto& targets = TargetBones();
-    if (ImGui::BeginTable("fbxmap", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY,
-                          ImVec2(0, 340 * g_scale))) {
-      ImGui::TableSetupScrollFreeze(0, 1);
-      ImGui::TableSetupColumn("FBX bone");
-      ImGui::TableSetupColumn("SvR 2011 bone");
-      ImGui::TableSetupColumn("Its weights go to");
-      ImGui::TableHeadersRow();
-      for (size_t i = 0; i < r.bones.size(); ++i) {
-        const auto& b = r.bones[i];
-        const std::string cur = FbxTarget(r, i);
-        const bool edited = g_star.fbx_map.count(b.name) > 0;
-        ImGui::PushID(int(i));
-        ImGui::TableNextRow();
-        ImGui::TableNextColumn();
-        ImGui::Indent(float(std::min(r.depth[i], 12)) * 8 * g_scale + 0.001f);
-        if (b.skinned) ImGui::TextUnformatted(b.name.c_str());
-        else ImGui::TextDisabled("%s", b.name.c_str());
-        if (!b.skinned && ImGui::IsItemHovered()) ImGui::SetTooltip("No vertices use this bone.");
-        ImGui::Unindent(float(std::min(r.depth[i], 12)) * 8 * g_scale + 0.001f);
-        ImGui::TableNextColumn();
-        ImGui::SetNextItemWidth(-1);
-        if (edited) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 0.8f, 0.35f, 1));
-        const std::string shown = cur.empty() ? std::string("(folds into its parent)") : cur;
-        if (ImGui::BeginCombo("##t", shown.c_str(), ImGuiComboFlags_HeightLarge)) {
-          if (edited) ImGui::PopStyleColor();
-          auto pick = [&](const std::string& t) {
-            if (t == r.auto_map[i]) g_star.fbx_map.erase(b.name);
-            else g_star.fbx_map[b.name] = t;
-            Touch();
-          };
-          if (ImGui::Selectable("(folds into its parent)", cur.empty())) pick("");
-          for (const auto& t : targets)
-            if (ImGui::Selectable(t.c_str(), t == cur)) pick(t);
-          ImGui::EndCombo();
-        } else if (edited) {
-          ImGui::PopStyleColor();
-        }
-        if (edited && ImGui::IsItemHovered())
-          ImGui::SetTooltip("Edited (the automatic choice: %s)", r.auto_map[i].empty() ? "folds into its parent" : r.auto_map[i].c_str());
-        ImGui::TableNextColumn();
-        const std::string to = FbxWeightsTo(r, i);
-        if (cur.empty()) ImGui::TextDisabled("%s", to.empty() ? "nowhere (above the hips)" : to.c_str());
+    if (ImGui::SmallButton("x")) file.clear(), ch = true;
+  }
+  ImGui::PopID();
+  return ch;
+}
+
+// The materials of the FBX (step 3, and the Simple Look step's Materials tab): one row per material - its picture,
+// the pictures for its colour, bumps and shine, both sides / flip faces / see-through - for every part that uses it
+// (each part on its own below). Used when the model is made. True when something changed.
+bool FbxMaterials(bool simple, bool intro) {
+  const FbxRig& r = FbxSkeleton();
+  if (g_star.fbx.empty() || !r.error.empty() || r.meshes.empty()) {
+    ImGui::TextDisabled("Pick an FBX first (step 1).");
+    return false;
+  }
+  std::vector<std::pair<std::string, std::vector<const FbxMeshInfo*>>> groups;  // (the FBX's order)
+  for (const auto& m : r.meshes) {
+    const std::string mat = FbxMaterialOf(m.name);
+    auto g = std::find_if(groups.begin(), groups.end(), [&](const auto& x) { return x.first == mat; });
+    if (g == groups.end()) groups.push_back({mat, {}}), g = groups.end() - 1;
+    g->second.push_back(&m);
+  }
+  if (intro) {
+    ImGui::PushTextWrapPos(0);
+    ImGui::TextDisabled("Each material of your model with its picture. What you choose here is used when the model is made, "
+                        "for every part that uses the material.");
+    ImGui::PopTextWrapPos();
+    ImGui::Spacing();
+  }
+  bool changed = false;
+  const float side = 76 * g_scale;
+  for (size_t gi = 0; gi < groups.size(); ++gi) {
+    const auto& [mat, parts] = groups[gi];
+    ImGui::PushID(int(gi));
+    auto edit_of = [&](const std::string& mesh) {
+      const auto it = g_star.fbx_mat.find(mesh);
+      return it == g_star.fbx_mat.end() ? MatEdit() : it->second;
+    };
+    auto pic_of = [&](const std::string& mesh) {
+      const auto it = g_star.fbx_pic.find(mesh);
+      return it == g_star.fbx_pic.end() ? std::string() : it->second;
+    };
+    const std::string first = parts.front()->name;
+    MatEdit e = edit_of(first);
+    bool mixed = false;
+    for (const auto* p : parts) {
+      const MatEdit o = edit_of(p->name);
+      mixed |= o.cutout != e.cutout || o.two_sided != e.two_sided || o.flip != e.flip || o.normal_file != e.normal_file ||
+               o.shine_mask != e.shine_mask || pic_of(p->name) != pic_of(first);
+    }
+    // (an edit for the whole material: on each of its parts)
+    auto apply = [&](const std::function<void(MatEdit&)>& fn) {
+      for (const auto* p : parts) {
+        MatEdit x = edit_of(p->name);
+        fn(x);
+        if (x.Empty()) g_star.fbx_mat.erase(p->name);
+        else g_star.fbx_mat[p->name] = x;
+      }
+      changed = true;
+    };
+    Picture* pic = FbxThumb(first);
+    ImGui::BeginGroup();
+    Thumb(pic, side, parts.front()->has_texture || g_star.fbx_pic.count(first) ? "..." : "none");
+    ImGui::EndGroup();
+    ImGui::SameLine(0, 14 * g_scale);
+    ImGui::BeginGroup();
+    ImGui::TextUnformatted(mat.c_str());
+    ImGui::SameLine();
+    int on = 0;
+    for (const auto* p : parts) on += FbxMeshOn(*p);
+    ImGui::TextDisabled("%d part%s%s%s", int(parts.size()), parts.size() == 1 ? "" : "s", on < int(parts.size()) ? (", " + std::to_string(parts.size() - on) + " left out").c_str() : "",
+                        mixed ? ", set apart" : "");
+    if (ImGui::IsItemHovered()) {
+      std::string names;
+      for (const auto* p : parts) names += p->name + (FbxMeshOn(*p) ? "" : "  (left out in step 4)") + "\n";
+      ImGui::SetTooltip("%s", names.c_str());
+    }
+    std::string colour = pic_of(first);
+    if (PictureChoice("Colour picture", colour, parts.front()->has_texture ? "its own (from the FBX)" : "none - plain grey",
+                      "The picture painted on it. Pick one when the FBX has none, or to use another.", L"The material's colour picture")) {
+      for (const auto* p : parts) {
+        if (colour.empty()) g_star.fbx_pic.erase(p->name);
+        else g_star.fbx_pic[p->name] = colour;
+      }
+      changed = true;
+    }
+    std::string bumps = e.normal == 1 ? Utf8(e.normal_file) : "";
+    if (PictureChoice(simple ? "Bumps picture" : "Normal map", bumps, "its own (or none)",
+                      "A normal map (the blue-purple picture) for small bumps: folds, seams, muscles.", L"The material's normal map (PNG)"))
+      apply([&](MatEdit& x) { x.normal = bumps.empty() ? 0 : 1, x.normal_file = Wide(bumps); });
+    std::string shine = Utf8(e.shine_mask);
+    if (PictureChoice("Shine picture", shine, "none - the same shine all over",
+                      "A grey picture of where it shines: white shines most, black not at all (wet skin, leather, metal parts).\n"
+                      "It goes where the game reads it - on skin parts that's the bumps picture's alpha.", L"Where it shines (a grey picture)"))
+      apply([&](MatEdit& x) { x.shine_mask = Wide(shine); });
+    // the faces
+    bool both = e.two_sided == 1, flip = e.flip == 1, cut = e.cutout == 1;
+    if (ImGui::Checkbox("Draw both sides", &both)) apply([&](MatEdit& x) { x.two_sided = both ? 1 : -1; });
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("The game draws its back too (its flag 0x2 off): capes, open jackets, skirts, hair cards, single-layer\n"
+                        "cloth - anything you can see the inside of. Off: only its front, as the game's bodies.\n"
+                        "On a skin part the game then uses its plain shader: no sweat in matches.");
+    ImGui::SameLine(0, 16 * g_scale);
+    if (ImGui::Checkbox("Flip faces", &flip)) apply([&](MatEdit& x) { x.flip = flip ? 1 : -1; });
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Turns its faces the other way round. The import already turns every part to the game's way, so use\n"
+                        "this only for a part that still shows inside out (its faces point inward in the FBX).");
+    ImGui::SameLine(0, 16 * g_scale);
+    if (ImGui::Checkbox(simple ? "See-through where clear" : "See-through cut-out", &cut)) apply([&](MatEdit& x) { x.cutout = cut ? 1 : -1; });
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Where the colour picture is transparent the game doesn't draw it: lace, mesh, torn cloth, hair cards.\n"
+                        "The cut is at an alpha of about 0.2-0.3 (50-80 of 255): fainter than that is a hole, the rest is solid -\n"
+                        "the game has no half see-through on superstars. Needs a picture with transparency (PNG).\n"
+                        "On a skin part its sweat is turned off (the game's skin shader can't cut).");
+    {  // (the flat look: no shine, no bumps - the game's superstar shaders have no unlit / self-lit setting)
+      bool flat = e.has_spec && e.spec <= 0.0f && e.spec_alpha == 2;
+      if (ImGui::Checkbox("Flat look", &flat))
+        apply([&](MatEdit& x) {
+          if (flat) x.has_spec = true, x.spec = 0, x.spec_alpha = 2, x.normal = 0, x.normal_file.clear(), x.shine_mask.clear();
+          else x.has_spec = false, x.spec_alpha = 0;
+        });
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Flat, cartoon-like shading: no shine (specular 0, even) and no bumps (a flat normal map) - the closest the\n"
+                          "game's superstar shaders get to unlit: they have no self-lit setting, so the arena's lights still shade it.");
+    }
+    if (cut && pic && !pic->Empty() && !HasClearPlaces(pic))
+      ImGui::TextColored(ImVec4(1, 0.8f, 0.35f, 1), "Its picture has no transparent places: nothing will be cut.");
+    if (ImGui::TreeNode("more", "More: shine level, colour")) {
+      bool hs = e.has_spec;
+      if (ImGui::Checkbox(simple ? "My own shine level" : "Shine (specular level)", &hs)) apply([&](MatEdit& x) { x.has_spec = hs; });
+      if (e.has_spec) {
+        ImGui::SameLine();
+        float v = e.spec;
+        ImGui::SetNextItemWidth(160 * g_scale);
+        if (ImGui::SliderFloat("##spec", &v, 0, 4, "%.2f", ImGuiSliderFlags_Logarithmic)) apply([&](MatEdit& x) { x.has_spec = true, x.spec = v; });
+      }
+      static const char* kAlpha[] = {"as the builder does", "the picture's alpha", "even (flat)", "the picture's brightness"};
+      int sa = e.spec_alpha;
+      ImGui::SetNextItemWidth(200 * g_scale);
+      if (ImGui::Combo(simple ? "Where it shines" : "Shine pattern", &sa, kAlpha, 4)) apply([&](MatEdit& x) { x.spec_alpha = sa; });
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Without a shine picture: which places shine more.");
+      bool ht = e.has_tint;
+      float tint[3] = {e.tint[0], e.tint[1], e.tint[2]};
+      if (ImGui::Checkbox(simple ? "Colour it" : "Colour (multiplier)", &ht)) apply([&](MatEdit& x) { x.has_tint = ht; });
+      if (e.has_tint) {
+        ImGui::SameLine();
+        if (ImGui::ColorEdit3("##tint", tint, ImGuiColorEditFlags_NoInputs)) apply([&](MatEdit& x) { x.has_tint = true, std::copy(tint, tint + 3, x.tint); });
+      }
+      ImGui::TreePop();
+    }
+    if (parts.size() > 1 && ImGui::TreeNode("each", "Set each part on its own")) {
+      for (const auto* p : parts) {
+        ImGui::PushID(p->name.c_str());
+        changed |= FbxMaterialCell(p->name, simple);
+        ImGui::SameLine();
+        ImGui::TextUnformatted(p->name.c_str());
         ImGui::PopID();
       }
-      ImGui::EndTable();
+      ImGui::TreePop();
     }
-    ImGui::TreePop();
+    ImGui::EndGroup();
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::PopID();
   }
-  if (g_fbx_open_once) ImGui::SetScrollHereY(0.3f), ImGui::SetNextItemOpen(true), g_fbx_open_once = false;  // (test aid)
-  if (ImGui::TreeNode("meshes", "%s", simple ? "Clothes and parts" : "Meshes")) {
-    ImGui::TextDisabled("(hidden ones - an avatar's toggled-off clothes - start off)");
-    if (ImGui::BeginTable("fbxmeshes", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY,
-                          ImVec2(0, std::min(260.0f, 34.0f + 30.0f * float(r.meshes.size())) * g_scale))) {
-      ImGui::TableSetupScrollFreeze(0, 1);
-      ImGui::TableSetupColumn("Mesh");
-      ImGui::TableSetupColumn("Triangles", ImGuiTableColumnFlags_WidthFixed, 80 * g_scale);
-      ImGui::TableSetupColumn("Kind", ImGuiTableColumnFlags_WidthFixed, 110 * g_scale);
-      ImGui::TableSetupColumn("Picture");
-      ImGui::TableSetupColumn(simple ? "Shine, bumps, colour" : "Material");
-      ImGui::TableHeadersRow();
-      static const char* kKinds[] = {"skin", "eye", "hair", "lash"};
-      for (size_t i = 0; i < r.meshes.size(); ++i) {
-        const FbxMeshInfo& m = r.meshes[i];
-        ImGui::PushID(int(i));
-        ImGui::TableNextRow();
-        ImGui::TableNextColumn();
-        const auto on_it = g_star.fbx_on.find(m.name);
-        bool on = on_it != g_star.fbx_on.end() ? on_it->second == "1" : !m.hidden;
-        if (ImGui::Checkbox(m.name.c_str(), &on)) {
-          if (on == !m.hidden) g_star.fbx_on.erase(m.name);
-          else g_star.fbx_on[m.name] = on ? "1" : "0";
-          Touch();
-        }
-        if (m.hidden && ImGui::IsItemHovered()) ImGui::SetTooltip("Hidden in the FBX.");
-        ImGui::TableNextColumn();
-        ImGui::Text("%d", m.triangles);
-        ImGui::TableNextColumn();
-        const auto k_it = g_star.fbx_kind.find(m.name);
-        const std::string kind = k_it != g_star.fbx_kind.end() ? k_it->second : m.kind;
-        ImGui::SetNextItemWidth(-1);
-        if (ImGui::BeginCombo("##kind", kind.c_str())) {
-          for (const char* k : kKinds)
-            if (ImGui::Selectable(k, kind == k)) {
-              if (m.kind == k) g_star.fbx_kind.erase(m.name);
-              else g_star.fbx_kind[m.name] = k;
-              Touch();
-            }
-          ImGui::EndCombo();
-        }
-        ImGui::TableNextColumn();
-        const auto p_it = g_star.fbx_pic.find(m.name);
-        if (p_it != g_star.fbx_pic.end()) {
-          ImGui::TextUnformatted(FileName(Wide(p_it->second)).c_str());
-          ImGui::SameLine();
-          if (ImGui::SmallButton("x")) g_star.fbx_pic.erase(m.name), Touch();
-        } else {
-          if (!m.has_texture) ImGui::TextColored(ImVec4(1, 0.8f, 0.35f, 1), "none"), ImGui::SameLine();
-          else ImGui::TextDisabled("its material's"), ImGui::SameLine();
-          if (ImGui::SmallButton("Pick...")) {
-            const std::wstring f = PickFile(false, L"The mesh's colour picture", kPictureFilter, 1);
-            if (!f.empty()) g_star.fbx_pic[m.name] = Utf8(f), Touch();
-          }
-        }
-        ImGui::TableNextColumn();
-        if (FbxMaterialCell(m.name, simple)) Touch();
-        ImGui::PopID();
-      }
-      ImGui::EndTable();
-    }
-    ImGui::TreePop();
-  }
-  ImGui::BeginDisabled(Busy() || !r.error.empty());
-  if (ImGui::Button("Make the model from the FBX", ImVec2(260 * g_scale, 0))) MakeFromFbx();
+  if (changed) Touch();
+  return changed;
+}
+
+// The Make button (step 5; the Materials tab's "Make it again").
+void FbxMakeButton(const char* label, float width) {
+  const FbxRig& r = FbxSkeleton();
+  ImGui::BeginDisabled(Busy() || !r.error.empty() || r.bones.empty());
+  ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.78f, 0.12f, 0.2f, 1));
+  ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.88f, 0.2f, 0.28f, 1));
+  if (ImGui::Button(label, ImVec2(width * g_scale, 34 * g_scale))) MakeFromFbx();
+  ImGui::PopStyleColor(2);
   ImGui::EndDisabled();
   if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-    ImGui::SetTooltip("Poses it into the game's stance with the mapping above, moves its weights to the 2011 bones, packs its\n"
-                      "pictures into one sheet and builds a ch.pac on the fighting style's superstar (the model above then uses it).");
-  if (!g_fbx_after.empty()) {
-    ImGui::TextUnformatted("After Make");
-    IssueList(g_fbx_after);
+    ImGui::SetTooltip("Poses it into the game's stance with the skeleton matching, moves its weights to the 2011 bones, packs its\n"
+                      "pictures into one sheet and builds the game's model file on the fighting style's superstar.");
+}
+
+void FbxRows(bool simple) {
+  if (!simple && g_star.fbx.empty()) {  // (the full page: one row until an FBX is picked)
+    FileRow("Model from an FBX (optional)...", g_star.fbx, "none", kFbxFilter, 1,
+            "A rigged model (Unity / VRChat, Mixamo, Blender Rigify, 3ds Max Biped, UE Mannequin and rigs named like them):\n"
+            "its bones are matched to the 2011 skeleton by their names, then it's made into the game's model in five steps.");
+    return;
   }
-  ImGui::Unindent();
+  const FbxRig& r = FbxSkeleton();
+  const bool picked = !g_star.fbx.empty(), readable = picked && r.error.empty();
+  int mapped = 0;
+  std::set<std::string> have;
+  if (readable)
+    for (size_t i = 0; i < r.bones.size(); ++i)
+      if (std::string t = FbxTarget(r, i); !t.empty()) ++mapped, have.insert(t);
+  std::string missing_list;
+  for (const char* c : kFbxCore)
+    if (!have.count(c)) missing_list += (missing_list.empty() ? "" : ", ") + std::string(c);
+  int on = 0, tris = 0;
+  for (const auto& m : r.meshes)
+    if (FbxMeshOn(m)) ++on, tris += m.triangles;
+  if (readable) FbxReportPanel(r, false);  // (the model check keeps up in the background)
+  int counts[3] = {};
+  for (const auto& is : g_fbx_report) ++counts[std::clamp(is.level, 0, 2)];
+  bool made = false;
+  for (const auto& is : g_fbx_after) made |= is.level < 2;
+  const bool done[kFbxStepCount] = {readable, readable && missing_list.empty(), readable, readable && on > 0, made};
+  if (!readable) g_fbx_step = 0;
+  g_fbx_step = std::clamp(g_fbx_step, 0, kFbxStepCount - 1);
+  if (!simple) ImGui::TextUnformatted("Model from an FBX"), ImGui::Indent();  // (the full page: under the Files rows)
+
+  // the steps, a row of buttons (wrapped to the card's width)
+  {
+    const float avail = ImGui::GetContentRegionAvail().x, gap = 6 * g_scale;
+    float x = 0;
+    for (int i = 0; i < kFbxStepCount; ++i) {
+      char label[64];
+      std::snprintf(label, sizeof label, "%d  %s##fbxstep%d", i + 1, kFbxSteps[i], i);
+      const float w = ImGui::CalcTextSize(label, nullptr, true).x + ImGui::GetStyle().FramePadding.x * 2 + 4 * g_scale;
+      if (i && x + gap + w <= avail) ImGui::SameLine(0, gap), x += gap;
+      else if (i) x = 0;
+      x += w;
+      const bool cur = i == g_fbx_step;
+      int pushed = 0;
+      if (cur) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.78f, 0.12f, 0.2f, 1)), ++pushed;
+      else if (done[i]) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.85f, 0.55f, 1)), ++pushed;
+      ImGui::BeginDisabled(i > 0 && !readable);
+      if (ImGui::Button(label, ImVec2(w, 0))) g_fbx_step = i;
+      ImGui::EndDisabled();
+      ImGui::PopStyleColor(pushed);
+    }
+  }
+  ImGui::Spacing();
+  ImGui::Separator();
+  ImGui::Spacing();
+  auto heading = [&](const char* line) {
+    ImGui::Text("%d. %s", g_fbx_step + 1, kFbxSteps[g_fbx_step]);
+    ImGui::PushTextWrapPos(0);
+    ImGui::TextDisabled("%s", line);
+    ImGui::PopTextWrapPos();
+    ImGui::Spacing();
+  };
+
+  switch (g_fbx_step) {
+    case 0: {
+      heading("A rigged model (one with a skeleton) from Blender, Unity / VRChat, Mixamo, 3ds Max or UE: its bones are "
+              "matched to the game's by their names.");
+      FileRow("Pick an FBX file...", g_star.fbx, "none yet", kFbxFilter, 1, "An .fbx with a skeleton and its skin weights.");
+      if (!picked) break;
+      ImGui::Spacing();
+      if (!r.error.empty()) {
+        ImGui::TextColored(ImVec4(1, 0.45f, 0.4f, 1), "It could not be read: %s", r.error.c_str());
+        break;
+      }
+      int pics = 0;
+      for (const auto& m : r.meshes) pics += m.has_texture || g_star.fbx_pic.count(m.name);
+      ImGui::Text("Skeleton:");
+      ImGui::SameLine(110 * g_scale);
+      ImGui::TextDisabled("%s, %d bones", r.rig.c_str(), int(r.bones.size()));
+      ImGui::Text("Parts:");
+      ImGui::SameLine(110 * g_scale);
+      ImGui::TextDisabled("%d (%d in the outfit, %d triangles)", int(r.meshes.size()), on, tris);
+      ImGui::Text("Pictures:");
+      ImGui::SameLine(110 * g_scale);
+      if (pics < int(r.meshes.size())) ImGui::TextColored(ImVec4(1, 0.8f, 0.35f, 1), "%d of %d parts have one (pick the rest in step 3)", pics, int(r.meshes.size()));
+      else ImGui::TextDisabled("every part has one");
+      break;
+    }
+    case 1: {
+      heading("Each of your model's bones is matched to one of the game's, so the game's moves move it. Most rigs match "
+              "by themselves: change a bone only when it's wrong.");
+      if (missing_list.empty()) ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.55f, 1), "All the main bones are matched (%d of %d bones).", mapped, int(r.bones.size()));
+      else {
+        ImGui::PushTextWrapPos(0);
+        ImGui::TextColored(ImVec4(1, 0.8f, 0.35f, 1), "Not matched yet: %s - those body parts won't move in the game.", missing_list.c_str());
+        ImGui::PopTextWrapPos();
+      }
+      for (const auto& n : r.notes) ImGui::TextDisabled("%s", n.c_str());
+      ImGui::BeginDisabled(g_star.fbx_map.empty());
+      if (ImGui::SmallButton("Back to the automatic matching")) g_star.fbx_map.clear(), Touch();
+      ImGui::EndDisabled();
+      ImGui::SameLine();
+      ImGui::TextDisabled("(%d changed by hand; a bone left unmatched moves with its parent)", int(g_star.fbx_map.size()));
+      // moving hair and cloth: the game's spring chains
+      std::vector<std::string> cur_targets;
+      for (size_t i = 0; i < r.bones.size(); ++i) cur_targets.push_back(FbxTarget(r, i));
+      std::map<std::string, bool> cloth_ticks;
+      for (const auto& [k, v] : g_star.fbx_cloth) cloth_ticks[k] = v == "1";
+      const FbxChains chains = FindFbxChains(r.bones, cur_targets, g_star.fbx_hair, cloth_ticks);
+      std::vector<int> chain_of(r.bones.size(), -1);  // (the bone's chain: 0 hair, 1 cloth)
+      for (const auto& c : chains.hair)
+        for (int b : c) chain_of[size_t(b)] = 0;
+      for (const auto& c : chains.cloth)
+        for (int b : c) chain_of[size_t(b)] = 1;
+      {
+        static const char* kHair[] = {"its hair bones, not VRChat's secondary (J_Sec_*) ones", "none (the hair moves with the head)", "every hair bone"};
+        int h = g_star.fbx_hair < 0 ? 0 : g_star.fbx_hair == 0 ? 1 : 2;
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Moving hair:");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(320 * g_scale);
+        if (ImGui::Combo("##hair", &h, kHair, 3)) g_star.fbx_hair = h == 0 ? -1 : h == 1 ? 0 : 1, Touch();
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("The game moves up to 16 chains of hair or cloth with springs (4 bones or more each). Bones left out move\n"
+                            "with the head: VRChat's secondary hair bones aren't needed for that.");
+        ImGui::SameLine();
+        ImGui::TextDisabled("%d strand(s)%s", int(chains.hair.size()), chains.secondary ? (", " + std::to_string(chains.secondary) + " J_Sec_* left out").c_str() : "");
+        ImGui::TextDisabled("Moving cloth: %d chain(s) from the bones ticked in the Cloth column (jacket, coat, skirt, cape... ticked by their name).",
+                            int(chains.cloth.size()));
+        if (chains.over) ImGui::TextColored(ImVec4(1, 0.8f, 0.35f, 1), "%d chain(s) past the 16 the game moves: they ride on their bone.", chains.over);
+      }
+      ImGui::Spacing();
+      const auto& targets = TargetBones();
+      const float h = std::max(260.0f * g_scale, ImGui::GetContentRegionAvail().y - 60 * g_scale);
+      if (ImGui::BeginTable("fbxmap", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY, ImVec2(0, h))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Your model's bone");
+        ImGui::TableSetupColumn("The game's bone");
+        ImGui::TableSetupColumn("Moves with");
+        ImGui::TableSetupColumn("Cloth", ImGuiTableColumnFlags_WidthFixed, 56 * g_scale);
+        ImGui::TableHeadersRow();
+        for (size_t i = 0; i < r.bones.size(); ++i) {
+          const auto& b = r.bones[i];
+          const std::string cur = FbxTarget(r, i);
+          const bool edited = g_star.fbx_map.count(b.name) > 0;
+          ImGui::PushID(int(i));
+          ImGui::TableNextRow();
+          ImGui::TableNextColumn();
+          ImGui::Indent(float(std::min(r.depth[i], 12)) * 8 * g_scale + 0.001f);
+          if (b.skinned) ImGui::TextUnformatted(b.name.c_str());
+          else ImGui::TextDisabled("%s", b.name.c_str());
+          if (!b.skinned && ImGui::IsItemHovered()) ImGui::SetTooltip("No vertices use this bone.");
+          ImGui::Unindent(float(std::min(r.depth[i], 12)) * 8 * g_scale + 0.001f);
+          ImGui::TableNextColumn();
+          ImGui::SetNextItemWidth(-1);
+          if (edited) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 0.8f, 0.35f, 1));
+          const std::string shown = cur.empty() ? std::string("(moves with its parent)") : cur;
+          if (ImGui::BeginCombo("##t", shown.c_str(), ImGuiComboFlags_HeightLarge)) {
+            if (edited) ImGui::PopStyleColor();
+            auto pick = [&](const std::string& t) {
+              if (t == r.auto_map[i]) g_star.fbx_map.erase(b.name);
+              else g_star.fbx_map[b.name] = t;
+              Touch();
+            };
+            if (ImGui::Selectable("(moves with its parent)", cur.empty())) pick("");
+            for (const auto& t : targets)
+              if (ImGui::Selectable(t.c_str(), t == cur)) pick(t);
+            ImGui::EndCombo();
+          } else if (edited) {
+            ImGui::PopStyleColor();
+          }
+          if (edited && ImGui::IsItemHovered())
+            ImGui::SetTooltip("Changed (the automatic choice: %s)", r.auto_map[i].empty() ? "moves with its parent" : r.auto_map[i].c_str());
+          ImGui::TableNextColumn();
+          const std::string to = FbxWeightsTo(r, i);
+          if (chain_of[i] == 0) ImGui::TextColored(ImVec4(0.55f, 0.75f, 1, 1), "moving hair");
+          else if (chain_of[i] == 1) ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.55f, 1), "moving cloth");
+          else if (cur.empty()) ImGui::TextDisabled("%s", to.empty() ? "nothing (above the hips)" : to.c_str());
+          ImGui::TableNextColumn();
+          if (cur.empty()) {  // (only an unmatched bone can be cloth)
+            const auto ov = g_star.fbx_cloth.find(b.name);
+            bool tick = ov != g_star.fbx_cloth.end() ? ov->second == "1" : IsClothBoneName(b.name);
+            if (ImGui::Checkbox("##cloth", &tick)) {
+              if (tick == IsClothBoneName(b.name)) g_star.fbx_cloth.erase(b.name);
+              else g_star.fbx_cloth[b.name] = tick ? "1" : "0";
+              Touch();
+            }
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip("Loose cloth (a jacket's tail, a skirt, a cape, a ribbon): the game swings it with a spring chain - 3 bones\n"
+                                "in a row or more. Unticked: it moves stiffly with its parent bone.");
+          }
+          ImGui::PopID();
+        }
+        ImGui::EndTable();
+      }
+      break;
+    }
+    case 2:
+      heading("Each material of your model with its picture, and how the game draws it - for every part that uses it. "
+              "Used when the model is made (step 5).");
+      FbxMaterials(simple, false);
+      break;
+    case 3: {
+      heading("The parts your superstar wears. Hidden parts (an avatar's toggled-off clothes) start left out. This outfit "
+              "becomes attire 1; more attires come in the Attires step.");
+      static const char* kKinds[] = {"skin", "eye", "hair", "lash"};
+      static const char* kKindNames[] = {"body / clothes", "eye", "hair", "eyelashes"};
+      const float h = std::min(std::max(200.0f * g_scale, ImGui::GetContentRegionAvail().y - 60 * g_scale), (40.0f + 32.0f * float(r.meshes.size())) * g_scale);
+      if (ImGui::BeginTable("fbxmeshes", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_ScrollY, ImVec2(0, h))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Part");
+        ImGui::TableSetupColumn("Triangles", ImGuiTableColumnFlags_WidthFixed, 84 * g_scale);
+        ImGui::TableSetupColumn("It is", ImGuiTableColumnFlags_WidthFixed, 140 * g_scale);
+        ImGui::TableHeadersRow();
+        for (size_t i = 0; i < r.meshes.size(); ++i) {
+          const FbxMeshInfo& m = r.meshes[i];
+          ImGui::PushID(int(i));
+          ImGui::TableNextRow();
+          ImGui::TableNextColumn();
+          bool o = FbxMeshOn(m);
+          if (ImGui::Checkbox(m.name.c_str(), &o)) {
+            if (o == !m.hidden) g_star.fbx_on.erase(m.name);
+            else g_star.fbx_on[m.name] = o ? "1" : "0";
+            Touch();
+          }
+          if (m.hidden && ImGui::IsItemHovered()) ImGui::SetTooltip("Hidden in the FBX.");
+          ImGui::TableNextColumn();
+          ImGui::Text("%d", m.triangles);
+          ImGui::TableNextColumn();
+          const auto k_it = g_star.fbx_kind.find(m.name);
+          const std::string kind = k_it != g_star.fbx_kind.end() ? k_it->second : m.kind;
+          int ki = 0;
+          for (int k = 0; k < 4; ++k)
+            if (kind == kKinds[k]) ki = k;
+          ImGui::SetNextItemWidth(-1);
+          if (ImGui::BeginCombo("##kind", kKindNames[ki])) {
+            for (int k = 0; k < 4; ++k)
+              if (ImGui::Selectable(kKindNames[k], ki == k)) {
+                if (m.kind == kKinds[k]) g_star.fbx_kind.erase(m.name);
+                else g_star.fbx_kind[m.name] = kKinds[k];
+                Touch();
+              }
+            ImGui::EndCombo();
+          }
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("How the game draws it: skin and clothes, an eye (shiny, it looks around), hair, eyelashes.");
+          ImGui::PopID();
+        }
+        ImGui::EndTable();
+      }
+      ImGui::TextDisabled("%d of %d parts, %d triangles (the game takes about 10,500 vertices - step 5 checks it)", on, int(r.meshes.size()), tris);
+      break;
+    }
+    default: {
+      heading("The model checked, then made into the game's model file. Make it again after any change.");
+      for (const auto& n : r.notes) ImGui::TextColored(ImVec4(0.6f, 0.75f, 1, 1), "Note:"), ImGui::SameLine(), ImGui::TextWrapped("%s", n.c_str());
+      if (g_fbx_report_key.empty()) ImGui::TextDisabled("Checking the model ...");
+      else if (g_fbx_report.empty()) ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.55f, 1), "Nothing wrong found.");
+      else {
+        ImGui::Text("Found: %d must fix, %d warnings, %d tips", counts[2], counts[1], counts[0]);
+        ImGui::Indent();
+        IssueList(g_fbx_report);
+        ImGui::Unindent();
+      }
+      ImGui::Spacing();
+      {  // Reduce detail: only when asked (it used to cut every big model, a face too)
+        bool reduce = g_star.fbx_reduce > 0;
+        if (ImGui::Checkbox("Reduce detail", &reduce)) g_star.fbx_reduce = reduce ? 10000 : 0, Touch();
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("Fewer vertices so it fits the game (about 10,500 for a wrestler). Off: the model as it is - Make says\n"
+                            "when it's too big. For full control reduce it in Blender instead (Decimate modifier).");
+        if (reduce) {
+          ImGui::SameLine();
+          ImGui::SetNextItemWidth(200 * g_scale);
+          int v = g_star.fbx_reduce;
+          if (ImGui::SliderInt("vertices##reduce", &v, 4000, 10500, "to about %d")) g_star.fbx_reduce = std::clamp(v, 4000, 10500), Touch();
+          ImGui::SameLine();
+          if (ImGui::Checkbox("Keep the face", &g_star.fbx_keep_face)) Touch();
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("The head and its hair left as they are: only the rest of the model is reduced.");
+        }
+      }
+      ImGui::Spacing();
+      FbxMakeButton(made ? "Make the model again" : "Make the model", 260);
+      if (!g_fbx_after.empty()) {
+        ImGui::Spacing();
+        ImGui::TextUnformatted("After Make");
+        ImGui::Indent();
+        IssueList(g_fbx_after);
+        ImGui::Unindent();
+        if (made) ImGui::TextDisabled("The 3D view shows it. Save or install the superstar in the Finish step.");
+      }
+      break;
+    }
+  }
+  // Back / Next
+  ImGui::Spacing();
+  ImGui::Separator();
+  ImGui::BeginDisabled(g_fbx_step == 0);
+  if (ImGui::Button("< Back##fbx", ImVec2(110 * g_scale, 0))) --g_fbx_step;
+  ImGui::EndDisabled();
+  if (g_fbx_step + 1 < kFbxStepCount) {
+    ImGui::SameLine(std::max(ImGui::GetCursorPosX() + 10 * g_scale, ImGui::GetContentRegionMax().x - 150 * g_scale));
+    ImGui::BeginDisabled(!readable);
+    char next[64];
+    std::snprintf(next, sizeof next, "Next: %s >##fbx", kFbxSteps[g_fbx_step + 1]);
+    if (ImGui::Button(next, ImVec2(150 * g_scale, 0))) ++g_fbx_step;
+    ImGui::EndDisabled();
+  }
+  if (!simple) ImGui::Unindent();
 }
 
 void FbxProblems(std::vector<Problem>& p) {
@@ -1744,7 +2210,7 @@ void FbxProblems(std::vector<Problem>& p) {
     if (!have.count(c)) miss += (miss.empty() ? "" : ", ") + std::string(c);
   if (!miss.empty())
     p.push_back(Warning("Some of the FBX's bones aren't matched to the game's skeleton (" + miss + "): those body parts won't move in the game.")
-                    .With("Match them...", [] { GoStep(kStepLook); }, "the bone list is open"));
+                    .With("Match them...", [] { g_fbx_step = 1, GoStep(kStepLook); }, "the bone list is open"));
 }
 
 // ---- entrance gear (EMD kind 4: the whole wrestler in the outfit worn for the entrance) per attire
@@ -2011,6 +2477,18 @@ bool FbxMaterialCell(const std::string& mesh, bool simple) {
     if (ImGui::Combo(simple ? "See-through where clear" : "See-through cut-out", &cut, kTri, 3)) e.cutout = cut - 1, ch = true;
     ImGui::SetNextItemWidth(160 * g_scale);
     if (ImGui::Combo(simple ? "Both sides" : "Double-sided", &both, kTri, 3)) e.two_sided = both - 1, ch = true;
+    bool flip = e.flip == 1;
+    if (ImGui::Checkbox("Flip faces", &flip)) e.flip = flip ? 1 : -1, ch = true;
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Turns its faces the other way round: for a part that still shows inside out in the game.");
+    ImGui::TextUnformatted("Shine picture:");
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s", e.shine_mask.empty() ? "none" : Utf8(fs::path(e.shine_mask).filename().wstring()).c_str());
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Pick...##shine")) {
+      const std::wstring f = PickFile(false, L"Where it shines (a grey picture)", kPictureFilter, 1);
+      if (!f.empty()) e.shine_mask = f, ch = true;
+    }
+    if (!e.shine_mask.empty()) ImGui::SameLine(), (ImGui::SmallButton("x##shine") ? (e.shine_mask.clear(), ch = true) : false);
     if (!e.Empty() && ImGui::Button("As built")) e = MatEdit(), ch = true;
     ImGui::EndPopup();
   }
@@ -2021,8 +2499,11 @@ bool FbxMaterialCell(const std::string& mesh, bool simple) {
   return ch;
 }
 
-void MaterialsSection(bool simple) {
-  if (g_star.model.empty()) return;
+void MaterialsSection(bool simple, bool header, bool show_list) {
+  if (g_star.model.empty()) {
+    if (!header) ImGui::TextDisabled("Pick a look first (the Model tab).");
+    return;
+  }
   ApplyTestMaterials();
   const bool gear = char_preview::Gear() && char_preview::HasGear();
   const auto [pac, in] = AttireSource(g_view_attire);
@@ -2031,7 +2512,7 @@ void MaterialsSection(bool simple) {
   const std::string head = std::string(simple ? "Shine, bumps and colour" : "Materials") + (n ? " (" + std::to_string(n) + " changed)" : "") +
                            "###materials";
   if (g_test_open_mats) ImGui::SetNextItemOpen(true, ImGuiCond_Always), g_test_open_mats = false;
-  if (!ImGui::CollapsingHeader(head.c_str())) {
+  if (header ? !ImGui::CollapsingHeader(head.c_str()) : !show_list) {
     std::map<std::pair<uint32_t, int>, MatEdit> preview;  // (still shown while folded)
     for (const auto& [k, e] : g_star.mats)
       if (std::get<0>(k) == g_view_attire && std::get<1>(k) == gear) preview[{std::get<2>(k), std::get<3>(k)}] = e;
@@ -2649,7 +3130,7 @@ void Draw() {
         PostMessageW(g_wnd, WM_CLOSE, 0, 0);
       };
       if (!BuildFiles(j, files)) PostMessageW(g_wnd, WM_CLOSE, 0, 0);
-      else if (OwnModel(j.model)) WithThreadsParts(j.id, std::move(files), write);  // (as Save as mod)
+      else if (OwnModel(j.model) && j.threads.empty()) WithThreadsParts(j.id, std::move(files), write);  // (as Save as mod)
       else write(files);
     }
   }
@@ -3006,7 +3487,7 @@ std::string StateText() {
   for (int a = 1; a < 4; ++a)
     s += "\nattire" + std::to_string(a + 1) + "=" + Utf8(g_star.attires[a]) + "|" + g_star.attire_names[a] + "|" +
          std::to_string(g_star.attire_entrance[a]);
-  s += "\nmoveset=" + MovesetText() + "\ncae=" + Utf8(g_star.cae);
+  s += "\nmoveset=" + MovesetText() + "\ncae=" + Utf8(g_star.cae) + "\nthreads=" + g_star.threads;
   s += "\nentrance=" + std::to_string(g_star.entrance) + "\npose=" + std::to_string(g_star.pose) + "\nannouncer=" + g_star.announcer + "\nhometown=" + g_star.hometown_city + "," + g_star.hometown_state + "\nmoves=" + Utf8(g_star.moves) +
        "\npack=" + Utf8(g_star.pack) + "\nabil=" + std::to_string(g_star.own_abilities);
   for (int a : g_star.abilities) s += "," + std::to_string(a);
@@ -3100,6 +3581,9 @@ void WriteProject(ProjectOut& out) {
   out.Key("fbx_on", PairsText(g_star.fbx_on));
   out.Key("fbx_kind", PairsText(g_star.fbx_kind));
   out.Key("fbx_pic", PairsText(g_star.fbx_pic));
+  if (g_star.fbx_reduce > 0) out.Key("fbx_reduce", std::to_string(g_star.fbx_reduce) + (g_star.fbx_keep_face ? "" : ",all"));
+  if (g_star.fbx_hair != -1) out.Key("fbx_hair", std::to_string(g_star.fbx_hair));
+  out.Key("fbx_cloth", PairsText(g_star.fbx_cloth));
   {
     std::string t;
     for (const auto& [name, e] : g_star.fbx_mat) {
@@ -3119,6 +3603,10 @@ void WriteProject(ProjectOut& out) {
   if (const std::string g = GainText(); !g.empty()) out.Key("theme_gain", g);
   out.File("movie", g_star.movie, "star/movie");
   out.File("cae", g_star.cae, "star/cae");
+  if (!g_star.threads.empty()) {
+    out.Key("threads", "star/threads.txt");
+    out.files.push_back({"star/threads.txt", Bytes(g_star.threads.begin(), g_star.threads.end())});
+  }
   if (!g_star.cae_name.empty()) out.Key("cae_name", g_star.cae_name);
   out.File("voice", g_star.voice, "star/voice");
   for (int a = 1; a < 4; ++a) {
@@ -3238,6 +3726,13 @@ bool Read(const ProjectIn& in, bool mod) {
   ParsePairs(in.Get("fbx_on"), g_star.fbx_on);
   ParsePairs(in.Get("fbx_kind"), g_star.fbx_kind);
   ParsePairs(in.Get("fbx_pic"), g_star.fbx_pic);
+  {  // (Reduce detail: "<vertices>[,all]"; none: off)
+    const std::string t = in.Get("fbx_reduce");
+    g_star.fbx_reduce = t.empty() ? 0 : std::clamp(std::atoi(t.c_str()), 0, 10500);
+    g_star.fbx_keep_face = t.find(",all") == std::string::npos;
+  }
+  g_star.fbx_hair = in.Get("fbx_hair").empty() ? -1 : std::clamp(std::atoi(in.Get("fbx_hair").c_str()), -1, 1);
+  ParsePairs(in.Get("fbx_cloth"), g_star.fbx_cloth);
   {
     const std::string t = in.Get("fbx_mat");
     for (size_t at = 0; at < t.size();) {
@@ -3283,6 +3778,11 @@ bool Read(const ProjectIn& in, bool mod) {
   if (const std::string g = in.Get("theme_gain"); !g.empty()) g_star.theme_gain = std::clamp(float(std::atof(g.c_str())), -20.0f, 6.0f);
   g_star.movie = file("movie", nullptr);
   g_star.cae = file("cae", nullptr);
+  {  // (threads.txt: the project's own, or a mod's)
+    const std::string tf = mod ? std::string("threads.txt") : in.Get("threads");
+    for (const auto& f : in.files)
+      if (!tf.empty() && f.name == tf) g_star.threads.assign(f.data.begin(), f.data.end());
+  }
   g_star.cae_name = in.Get("cae_name");
   if (!g_star.cae.empty() && g_star.cae_name.empty()) g_star.cae_name = "this mod's";
   g_star.voice = file("voice", nullptr);
@@ -3361,6 +3861,7 @@ void ApplyTestMaterials() {
       if (k == "tint" && std::sscanf(v.c_str(), "%f/%f/%f", &m.tint[0], &m.tint[1], &m.tint[2]) == 3) m.has_tint = true;
       if (k == "cut") m.cutout = std::atoi(v.c_str());
       if (k == "both") m.two_sided = std::atoi(v.c_str());
+      if (k == "flip") m.flip = std::atoi(v.c_str());
       if (k == "normal") m.normal = v == "flat" ? 2 : v == "asis" ? 0 : 1, m.normal_file = m.normal == 1 ? Wide(v) : std::wstring();
     }
     Log("test: material " + one);
@@ -3506,6 +4007,7 @@ void TestGearFrom(const std::string& spec) { g_test_gear_from = spec; }
 void TestGearFbx(const std::string& spec) { g_test_gear_fbx = spec; }
 void TestSimpleTake(const std::wstring& svrmod, bool everything) { g_test_take = svrmod, g_test_take_all = everything; }
 void TestFbxMake() { g_test_fbx_make = true; }
+void TestFbxStep(int step) { g_fbx_step = step; }
 void TestFbxReport(const std::wstring& out) {  // with --star-fbx: the import report to <out> (automatic mapping), quit
   g_test_fbx_report = out;
 }

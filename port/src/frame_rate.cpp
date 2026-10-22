@@ -58,6 +58,7 @@
 #include <rex/ui/presenter.h>
 
 #include "arena_mods.h"
+#include "caw_limits.h"
 #include "generated/default/svr2011_init.h"
 #include "jukebox.h"
 #include "match_types.h"
@@ -66,6 +67,9 @@
 #include "online_rules.h"
 #include "players.h"
 #include "superstar_mods.h"
+#if SVR2011_DEBUG_SUITE
+#include "debug_suite/debug_suite.h"
+#endif
 
 REXCVAR_DEFINE_INT32(frame_rate, 60, "GPU", "Frames a second: 30 or 60");
 REXCVAR_DEFINE_BOOL(full_speed, true, "GPU",
@@ -445,6 +449,9 @@ REX_HOOK_RAW(sub_8269D768) {
   g_world_ticks = std::clamp(int(g_world_acc), 1, kMaxTicks);
   g_world_acc = std::clamp(g_world_acc - g_world_ticks, -0.5, 1.0);
   if (g_lockstep || !REXCVAR_GET(full_speed)) g_world_ticks = 1, g_world_acc = 0;
+#if SVR2011_DEBUG_SUITE
+  if (const int n = svr2011::dbg::SpeedTicks(); n && !g_lockstep) g_world_ticks = n, g_world_acc = 0;  // (dbg_speed)
+#endif
   // 30 fps at 60 Hz (SetHalfFrames): while frames take two updates (a PC that
   // can't keep 60 Hz) every frame is shown - as 30 fps did before - and every
   // other one again once it keeps up (a running average of the updates).
@@ -462,7 +469,12 @@ REX_HOOK_RAW(sub_8269D768) {
                     want ? "every frame shown (the world can't keep 60 Hz)" : "every other frame shown again", avg_ticks);
     }
   }
+  svr2011::HctpBeforeFrame(base);  // (match_types.h: a door's placements held)
   __imp__sub_8269D768(ctx, base);
+#if SVR2011_DEBUG_SUITE
+  svr2011::dbg::BootFrame(ctx, base);  // (dbg_boot: debug_suite.h)
+  svr2011::dbg::ClockFrame();          // (dbg_state_clock)
+#endif
   TestMatchTime(base);
   svr2011::MatchTypesUpdate(ctx, base);  // (match_types.h: the lumberjacks, Slobber Knocker)
   svr2011::HctpRoomUpdate(ctx, base);    // (match_types.h: an HCTP backstage room's gimmicks)
@@ -685,6 +697,9 @@ REX_HOOK_RAW(sub_8216ED38) {
   }
   if (!old_way) g_job_owed = JobOwed::kNone;
   svr2011::ThreeStagesCinematic();  // (the world held: a finisher's / signature's cinematic - match_types.h)
+#if SVR2011_DEBUG_SUITE
+  svr2011::dbg::OnWorldHeld();  // (dbg_burst)
+#endif
   // Research aid: SVR2011_TEST_PAUSE_LOG=1 - when the world starts being
   // held (a move's cinematic, a match's end), with the match frame.
   if (static const bool pause_log = std::getenv("SVR2011_TEST_PAUSE_LOG") != nullptr; pause_log) {
@@ -733,6 +748,9 @@ REX_HOOK_RAW(sub_82905058) {
   if (out && ctx.r3.u32 == 0) svr2011::FreeCamPad(user, base + out);  // (flying: the game gets no input - free_cam.h)
   if (user == 0 && out && ctx.r3.u32 == 0) {
     svr2011::FastStartInput(base, out);  // (the start skips: fast_start.h)
+#if SVR2011_DEBUG_SUITE
+    svr2011::dbg::BootInput(base, out);  // (dbg_boot: a booted match's entrances skipped)
+#endif
     // (the online overlay's BACK + RB never reaches the game: online_overlay.h)
     const uint16_t b = svr2011::OnlineOverlayPad(uint16_t(base[out + 4] << 8 | base[out + 5]));
     base[out + 4] = uint8_t(b >> 8), base[out + 5] = uint8_t(b);
@@ -948,6 +966,9 @@ REX_HOOK_RAW(sub_826E0F78) {
                     "frames played; mode {} part {})",
                     now ? "recording" : "playing", rec_frames, per, play_steps, play_frames, Rd32(base + obj + 92),
                     part ? Rd32(base + part + 1504) : 0);
+#if SVR2011_DEBUG_SUITE
+        if (now && rec_frames == 0) svr2011::dbg::OnMatchStarted();  // (a new match's first recording: the cues' zero)
+#endif
         phase = now;
         play_acc = 0;
         play_frames = play_steps = 0;
@@ -1172,6 +1193,7 @@ REX_HOOK_RAW(sub_826E02A8) {
 REX_EXTERN(__imp__sub_8269B2D0);
 REX_HOOK_RAW(sub_8269B2D0) {
   const uint32_t ptr = ctx.r3.u32;
+  if (svr2011::CawHeapFree(ptr)) return;  // (a CAW editor part from the fallback memory: caw_limits.h)
   if (ptr && !g_frame_commands.empty() && std::this_thread::get_id() == g_logic_thread.load()) {
     constexpr uint32_t kWithin = 0x4000;  // (the object: at or just after the block's start)
     for (const uint32_t cmd : g_frame_commands) {
@@ -1252,6 +1274,43 @@ struct PinGuard {
 };
 int32_t CountAt(uint32_t frames) { return frames >= 210 ? 3 : frames >= 140 ? 2 : frames >= 78 ? 1 : 0; }
 PinGuard g_pin;
+
+// Problem reports: each step of a pin's count as the judge leaves it (+100, its voice is played as it changes:
+// sub_82165AD8, 0x20000 + count - 30863 / 30866) - count, match frame, the judge's update tick (+96), the
+// referee's count motion frame, who is pinned, an extra update (two in a frame), the guard's say. (200 lines
+// a session.)
+struct PinLog {
+  uint32_t judge = 0;
+  int32_t count = -1;
+  uint32_t start = 0;  // (match frame the count began: its first step)
+};
+PinLog g_pin_log;
+int PersonOf(uint8_t* base, uint32_t ch) {  // (the character's place in the match's list)
+  for (int i = 0; i < 10; ++i)
+    if (Rd32(base + kChars + uint32_t(i) * 4) == ch) return i;
+  return -1;
+}
+void PinCountLog(uint8_t* base, uint32_t judge, uint32_t pinner, bool pin_on, uint32_t frame) {
+  static int lines = 0;
+  const int32_t count = int32_t(Rd32(base + judge + 100));
+  if (g_pin_log.judge != judge) {
+    if (count <= 0) return;  // (a judge with no count going: nothing to tell)
+    g_pin_log = PinLog{judge, 0, frame};
+  }
+  if (count == g_pin_log.count) return;
+  if (g_pin_log.count <= 0 && count > 0) g_pin_log.start = frame;
+  const uint32_t pinned = pinner ? Rd32(base + pinner + 96) : 0;
+  if (lines < 200 && ++lines)
+    REXLOG_INFO("pin count: {} -> {} (frame {}, {} frames into the count, judge tick {}, pin {}{}{}){}",
+                g_pin_log.count, count, frame, frame - g_pin_log.start, int32_t(Rd32(base + judge + 96)),
+                pin_on ? "on" : "off", g_pin.broken ? ", by the guard's timing" : "",
+                g_extra_update ? ", an extra update" : "",
+                pinned ? fmt::format(" - person {} pinning person {}", PersonOf(base, pinner), PersonOf(base, pinned))
+                       : std::string());
+  g_pin_log.count = count;
+  if (count <= 0) g_pin_log = PinLog{};  // (the count over: kicked out, broken, or the pin won)
+}
+
 uint32_t RefereeOf(uint8_t* base) {
   for (uint32_t i = 0; i < 9; ++i)
     if (const uint32_t c = Rd32(base + kChars + i * 4))
@@ -1268,6 +1327,18 @@ REX_HOOK_RAW(sub_822446E0) {
   const uint32_t frame = Rd32(base + kMatchFrames);
   const bool pin_on = pinner && Rd32(base + pinner + 516) == 2;
   const bool counting = ref && (Rd32(base + ref + 212) & 0x7FFF) == 190;
+  // Test aid: SVR2011_TEST_PIN_DROP_3=1 - once a session, a count of 2 drops to 0 in an extra update when the 3 is
+  // due (as the lost step does), to try the guard's repair at the 3.
+  if (static const bool drop3 = std::getenv("SVR2011_TEST_PIN_DROP_3") != nullptr; drop3 && g_extra_update && pin_on &&
+      counting && g_pin.judge == judge && g_pin.count == 2 && frame - g_pin.start >= 205 &&
+      Rd32(base + judge + 100) == 2) {
+    static bool dropped = false;
+    if (!dropped) {
+      dropped = true;
+      Wr32(base + judge + 100, 0);
+      REXLOG_INFO("frame rate: test - the pin count of 2 dropped to 0 (SVR2011_TEST_PIN_DROP_3)");
+    }
+  }
   const int32_t count = int32_t(Rd32(base + judge + 100));
   const uint32_t pinned = pinner ? Rd32(base + pinner + 96) : 0;
   const uint32_t motions = pinner && pinned ? (Rd32(base + pinner + 212) << 16) ^ Rd32(base + pinned + 212) : 0;
@@ -1276,11 +1347,17 @@ REX_HOOK_RAW(sub_822446E0) {
   } else if (count > g_pin.count) {
     g_pin.count = count;
   } else if (count == 0 && g_pin.count > 0) {
-    // Only the lost step is put right: a count of 1 dropping when the 2 is due (140 frames in). A count
-    // dropping at any other moment, or from 2, is the pinned man kicking out - not always with a motion
-    // change in the same update: taken as broken, nobody kicked out at 30 fps (report 2026-10-17).
+    // Only the lost step is put right: a count of 1 dropping when the 2 is due (140 frames in), or of 2 when
+    // the 3 is due (210) - the same lost step one slap later, seen in an extra update (the only place it
+    // happens: never at 60 fps). Left alone, the referee stayed at 2 and the pin was never given, or he
+    // counted again and called "two" at his third slap (report 2026-10-21). A count dropping at any other
+    // moment is the pinned man kicking out - not always with a motion change in the same update: taken as
+    // broken, nobody kicked out at 30 fps (report 2026-10-17); a kick-out at the 3 still counts in a
+    // frame's only (or last) update.
     const uint32_t into = frame - g_pin.start;
-    if (!g_pin.broken && !(g_pin.count == 1 && into >= 128 && into <= 160)) {
+    const bool lost_2 = g_pin.count == 1 && into >= 128 && into <= 160;
+    const bool lost_3 = g_pin.count == 2 && into >= 198 && into <= 230 && g_extra_update;
+    if (!g_pin.broken && !lost_2 && !lost_3) {
       g_pin = PinGuard{};  // (a kick-out: the game's own count)
     } else {
       if (!g_pin.broken) {
@@ -1294,7 +1371,11 @@ REX_HOOK_RAW(sub_822446E0) {
       Wr32(base + judge + 100, uint32_t(g_pin.count));
     }
   }
-  if (!LostTraceOn()) return __imp__sub_822446E0(ctx, base);
+  if (!LostTraceOn()) {
+    __imp__sub_822446E0(ctx, base);
+    PinCountLog(base, judge, pinner, pin_on, frame);
+    return;
+  }
   const LostSnap before = SnapLost(base);
   if (!g_watch.load()) g_watch = judge + 100, g_watch_last = Rd32(base + judge + 100);
   if (pin_on)
@@ -1304,6 +1385,7 @@ REX_HOOK_RAW(sub_822446E0) {
                 ref ? Rd32(base + ref + 212) : 0, frame, g_extra_update ? " (extra update)" : "");
   __imp__sub_822446E0(ctx, base);
   CheckLost(base, before, "sub_822446E0", lr);
+  PinCountLog(base, judge, pinner, pin_on, frame);
 }
 SVR2011_LOST_TRACE(sub_82245DF8)
 SVR2011_LOST_TRACE(sub_82243660)

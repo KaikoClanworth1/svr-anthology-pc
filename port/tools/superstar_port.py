@@ -9,6 +9,8 @@ the Mod Maker calls (docs/MOD_MAKER_3_PLAN.md section 4, docs/OTHER_GAMES.md).
     py superstar_port.py moveset-pack --game <id> --src <...> --item <key> --rows all|0x012,0x14E [--taunts-only] --out <dir>
     py superstar_port.py detect  --src <one character pac> [--game <id>] [--svrmod <exe>]
     py superstar_port.py convert --src <one character pac> [--game <id>] [--item <id>] --out <dir> [--name S] [--base N]
+    py superstar_port.py attires --src <PS2 disc | one PS2 character archive> [--game <id>] [--item <key>] --out <dir>
+        (every attire drawn as a picture; convert --attires 0,3,5,9 then takes up to four of them, in that order)
 
 One character pac (tools/lone_pac.py): a 360 ch<id>.pac of any game here (plus Legends of WrestleMania) or a PS2
 character archive (CH.PAC / CH2.PAC: --item one of detect's characters, hex). The game is read from the file;
@@ -123,8 +125,73 @@ def log(*a):
     print(*a, file=sys.stderr, flush=True)
 
 
+_step = ['starting']   # (the step under way: a crash names it - explain)
+_template_note = []    # (a warning when ch104.pac wasn't the game's own - template104)
+_template_ok = {}
+
+
+def _complete_template(path):
+    """A stock-like template: its first model has the body, the face animation / collision / offsets parts
+    (0x28 0x32 0x50 0x64) and the standard 2011 skeleton (koshi, l_ashi as ch104's)."""
+    if path in _template_ok:
+        return _template_ok[path]
+    ok = False
+    try:
+        import ch_tool
+        import jboy
+        import svrfmt
+        _, groups = ch_tool.epk8_read(open(path, 'rb').read())
+        kids = {i: d for i, d in svrfmt.pach_read(ch_tool.unpack(groups[0][1][0][1]))}
+        if all(k in kids for k in (0, 0x28, 0x32, 0x50, 0x64)):
+            nodes = {n['name']: n for n in jboy.read(ch_tool.unpack(kids[0])).nodes}
+            ok = (abs(nodes['koshi']['t'][0] + 1.869) < 0.02 and abs(nodes['l_ashi']['t'][0] - 4.348) < 0.02)
+    except Exception:   # noqa: BLE001
+        ok = False
+    _template_ok[path] = ok
+    return ok
+
+
+def template104(pac11):
+    """2011's template for a built model: ch104.pac (skeleton frames, face animation, collision, cube map). One that
+    was replaced - no face animation / offsets parts ("KeyError: 40", user report 22 Oct) or another skeleton -
+    gives way to a stock superstar with the same skeleton, with a warning."""
+    for cid in (104, 103, 100, 106, 115, 126):
+        path = os.path.join(pac11, 'ch', 'ch%d.pac' % cid)
+        if _complete_template(path):
+            if cid != 104 and not _template_note:
+                _template_note.append('your game\'s pac\\ch\\ch104.pac isn\'t the original (the converter builds on it): '
+                                      'ch%d.pac, the same skeleton, was used instead - put the original back with the '
+                                      'launcher\'s Install tab (Verify game files)' % cid)
+                progress(1, 'template: ch%d.pac (ch104.pac is not the original)' % cid)
+            return path
+    return os.path.join(pac11, 'ch', 'ch%d.pac' % 104)   # (none: the converter's own error names it)
+
+
 def progress(pct, text):
+    _step[0] = text
     print('progress %d %s' % (pct, text), file=sys.stderr, flush=True)
+
+
+def explain(e, a):
+    """An unexpected error in plain words - the step, the tool file and line, what went wrong - never a bare
+    'KeyError: 40' (user report 22 Oct). The whole traceback goes to stderr (the Mod Maker's log) and detail."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    tb = traceback.extract_tb(e.__traceback__)
+    ours = [f for f in tb if os.path.dirname(os.path.abspath(f.filename)) == here] or tb
+    f = ours[-1] if ours else None
+    what = {KeyError: 'something it looked up (%s) isn\'t there - a part, entry or bone the file was expected to have'
+                      % (e.args[0] if e.args else '?'),
+            IndexError: 'a table in the file is shorter than expected',
+            struct.error: 'the file\'s data didn\'t read as expected (%s)' % e,
+            ValueError: 'a value in the file wasn\'t what the converter expected (%s)' % e,
+            ZeroDivisionError: 'a size or count in the file is zero',
+            MemoryError: 'the computer ran out of memory'}
+    text = next((v for t, v in what.items() if isinstance(e, t)), '%s' % (e or type(e).__name__))
+    item = a.get('item') or (os.path.basename(a.get('src') or '') if a.get('src') else '')
+    return ('Converting %s stopped at the "%s" step: %s.%s The full details are in the Mod Maker\'s log (Report a '
+            'problem sends them).' % (('"%s"' % item) if item else 'it', _step[0], text,
+                                     (' (%s in %s line %d, %s.)' % (type(e).__name__, os.path.basename(f.filename),
+                                                                    f.lineno, f.name)) if f else ''))
 
 
 # --------------------------------------------------------------------------- source
@@ -494,7 +561,6 @@ def model_from_2008_family(src_pac, cid, pac11, out, portrait, hex_names):
     whole wrestler in a coat / hat for the entrance - 2008's Undertaker 0304) the same way. -> [(entry, 2011 name)];
     .gear the gear entries made ([2011 name])"""
     import svr08_char
-    tp = svr08_char.Template(os.path.join(pac11, 'ch', 'ch104.pac'))
     h, g, t = svrfmt.epac_read(open(src_pac, 'rb').read())
     emd = next(es for ty, es in g if ty == b'EMD ')
     ents, gear_src = [], {}
@@ -511,9 +577,11 @@ def model_from_2008_family(src_pac, cid, pac11, out, portrait, hex_names):
         raise RuntimeError('no wrestler (kind 2) model in %s' % os.path.basename(src_pac))
     ents.sort(key=lambda e: e[1])
     first = ents[0][2]
+    # (the skeleton the source is bound to: ch104's, or 2011's diva skeleton for a diva - svr08_char.template_for)
+    tp, tcid = svr08_char.template_for(template104(pac11), first[0])
     entries, kept = [], []
     import model_budget
-    budget_notes = []
+    budget_notes = ['skeleton: ch%d\'s (a diva\'s)' % tcid] if tcid else []
     for k, (s, att, kids) in enumerate(ents[:4]):
         o = svr08_char.attire(kids, tp, portrait, [0x20], first)
         # a wrestler's vertex buffers get 192 pages in a match (model_budget.py): over that the
@@ -551,7 +619,7 @@ def model_from_2008_family(src_pac, cid, pac11, out, portrait, hex_names):
         name = b'%06d%02d' % (cid, k * 10 + 4)
         entries.append((name, svrfmt.pach_write([(i, svrfmt.bpe_encode(o[i], compress=True)) for i in sorted(o)])))
         gear_made.append(name.decode())
-    svr08_char.write_epk8(os.path.join(pac11, 'ch', 'ch104.pac'), entries, out)
+    svr08_char.write_epk8(template104(pac11), entries, out)
     model_from_2008_family.notes = budget_notes
     model_from_2008_family.gear = gear_made
     return kept, [e[0] for e in ents[4:]]
@@ -602,7 +670,7 @@ def write_mod(mod, man, out_svrmod, rep=None, pac11=None):
             except Exception as e:   # noqa: BLE001
                 if rep is not None:
                     rep['warnings'].append('%s: bone rests not checked (prop_bones: %s)' % (f_, e))
-        for d_ in fit_budget(os.path.join(mod, 'ch.pac'), os.path.join(pac11, 'ch', 'ch104.pac')):
+        for d_ in fit_budget(os.path.join(mod, 'ch.pac'), template104(pac11)):
             if rep is not None:
                 rep['dropped'].append(d_)
     order = ['type', 'id', 'name', 'short', 'base', 'author', 'made_with', 'version', 'ratings', 'abilities', 'moves',
@@ -711,7 +779,7 @@ def build09(cid, outdir, o, rep):
         note('model: 2011\'s own ch%d.pac (--model 11)' % i11)
     elif g9.has_chpac(cid) and g9.year == 7:   # (per-part textures: baked into 2011's sheets)
         import svr07_char
-        kept7, extra = svr07_char.convert(g9.chpac(cid), os.path.join(mod, 'ch.pac'), os.path.join(pac11, 'ch', 'ch104.pac'),
+        kept7, extra = svr07_char.convert(g9.chpac(cid), os.path.join(mod, 'ch.pac'), template104(pac11),
                                           cid, portrait)
         note('model: %s ch%02d.pac attires %s converted (svr07_char: %s)' % (
             g9.label, cid, ', '.join('%s -> %s' % k[:2] for k in kept7), '; '.join(k[2] for k in kept7)))
@@ -1364,7 +1432,7 @@ def model_w(g, cid, pac11, out, portrait):
             gear = [(n, b) for t, es in g.MP.read_pac(raw) if t == b'EMD ' for n, b in es
                     if len(n) == 8 and n.endswith(b'4') and n[:7] in own]
         model_w.gear = [n.decode('latin1') for n, _ in gear]
-        w13_char.write_epk8(os.path.join(pac11, 'ch', 'ch104.pac'), [(b'EMD ', n, b) for n, b in kept + gear], tmp)
+        w13_char.write_epk8(template104(pac11), [(b'EMD ', n, b) for n, b in kept + gear], tmp)
         raw = open(tmp, 'rb').read()
     open(tmp, 'wb').write(raw)
     ptmp = None
@@ -1372,7 +1440,8 @@ def model_w(g, cid, pac11, out, portrait):
         ptmp = tmp + '.portrait.dds'
         open(ptmp, 'wb').write(portrait)
     with contextlib.redirect_stdout(sys.stderr):
-        w13_char.convert(tmp, out, os.path.join(pac11, 'ch', 'ch104.pac'), ptmp)
+        w13_char.convert(tmp, out, template104(pac11), ptmp)
+    model_w.extras = list(getattr(w13_char.convert, 'extras', []))   # (extra models left out: the report's dropped[])
     for f in (tmp, ptmp):
         try:
             if f:
@@ -1407,6 +1476,17 @@ def fit_budget(path, tmpl):
                 if bad:
                     raise BadInput('attire %s: its hair settings are ones the game can\'t take (%s) - a converter bug, '
                                    'please report it' % (n, '; '.join(bad)))
+            if (0x3c in kids and n.endswith('4') and w13_char.hair_chain_count(kids[0x3c])
+                    and w13_char.model_bytes(kids) > w13_char.CHAIN_MODEL_BYTES_MAX):
+                # (entrance gear - kind 4 - too big for moving hair: its hair stands still for the entrance rather
+                # than the gear going - 2K14 Hollywood Hogan's T-shirt and feather boa, 1 025 384 bytes. 2011's own
+                # gear models have no hair settings either: Undertaker 00010104, Cena 00013904)
+                kids.pop(0x3c, None)
+                kids.pop(0x3d, None)
+                blob = w13_char.pack_kids(kids)
+                changed = True
+                out.append('entrance gear %s: its hair stands still (too big for moving hair: %d bytes)'
+                           % (n, w13_char.model_bytes(kids)))
             if 0x3c in kids and w13_char.hair_chain_count(kids[0x3c]):
                 # (moving hair: the models must fit the room the largest stock attire takes, or the match load
                 # crashes / hangs - Asuka 2K17; the blood overlays go first, then the eyelashes)
@@ -1763,12 +1843,16 @@ def build_single(cid, outdir, o, rep):
                                                                       str(e)[:120]))
         if left:
             drop('attires past %d (2011 has 4 at most): %s' % (g.max_attires, ', '.join(left)))
+        for e in getattr(model_w, 'extras', []):
+            drop(e)
         gear = [n for n in pac_children(out) if n.endswith('4')]
     elif game == 'svr2007':
         import svr07_char
         with contextlib.redirect_stdout(sys.stderr):
-            kept7, extra = svr07_char.convert(pac, out, os.path.join(pac11, 'ch', 'ch104.pac'), cid, None)
+            kept7, extra = svr07_char.convert(pac, out, template104(pac11), cid, None)
         note('attires %s (svr07_char)' % ', '.join('%s -> %s' % k[:2] for k in kept7))
+        if getattr(svr07_char.convert, 'skeleton', None):
+            note('skeleton: ch%d (a diva)' % svr07_char.convert.skeleton)
         for e in extra:
             drop('attire %s (a mod holds 4)' % e)
     elif game in ('svr2008', 'svr2009', 'low'):
@@ -1791,7 +1875,7 @@ def build_single(cid, outdir, o, rep):
         def base_bust(pac_dir, group, i):   # (the 2010 bust is in the disc's DLC_HD.pac: the base's portrait)
             p = os.path.join(pac11, 'ch', 'ch%d.pac' % base)
             if not os.path.exists(p):
-                p = os.path.join(pac11, 'ch', 'ch104.pac')
+                p = template104(pac11)
             emd = [b for t, n, b in svr10_char.epk8_entries(p) if t == b'EMD ']
             return dict(svrfmt.pach_read(ch_tool.unpack(emd[0])))[0xc8]
         svr10_char.dlc_render = base_bust
@@ -1808,11 +1892,17 @@ def build_single(cid, outdir, o, rep):
             raise BadInput('%s has no character %x (it has %s)' % (os.path.basename(pac), cid,
                                                                      ' '.join('%x' % c for c in sorted(chars))))
         ats = chars[cid]
-        if len(ats) > 4:
-            drop('attires %s (a mod holds 4)' % ', '.join(str(x) for x in ats[4:]))
+        if o.get('attires'):   # (--attires: which of the source's become the mod's four, in that order)
+            pick = [int(x) for x in str(o['attires']).split(',') if x.strip()]
+            bad = [x for x in pick if x not in ats]
+            if bad or not pick or len(pick) > 4:
+                raise BadInput('--attires: up to 4 of %s (attires lists them)' % ', '.join(str(x) for x in ats))
+            ats = pick
+        elif len(ats) > 4:
+            drop('attires %s (a mod holds 4; --attires to choose)' % ', '.join(str(x) for x in ats[4:]))
         tmpl = os.path.join(pac11, 'ch', 'ch%d.pac' % base)
         if not os.path.exists(tmpl):
-            tmpl = os.path.join(pac11, 'ch', 'ch104.pac')
+            tmpl = template104(pac11)
         pw = os.path.join(work, 'ps2_char')
         import subprocess
         r = subprocess.run([sys.executable, os.path.join(HERE, 'ps2_char.py'), lone_pac.ps2_disc(pac, game, work),
@@ -2348,6 +2438,45 @@ def convert_single(a):
     return rep
 
 
+def cmd_attires(a):
+    """attires --src <disc image | one character archive> [--game G] [--item K] --out D: every attire of a PS2
+    character drawn (ps2_char --attire-pictures) -> {ok, game, id, attires: [{attire, model_id, picture, meshes,
+    see_through, drawn_solid}]} - the numbers --attires takes. A disc: --game ps2_* and --item from list (decimal);
+    one file: --item from detect (hex; left out when it holds one character)."""
+    import lone_pac
+    import subprocess
+    if not a.get('src') or not a.get('out'):
+        raise BadInput('attires needs --src and --out')
+    outdir = os.path.abspath(a['out'])
+    os.makedirs(outdir, exist_ok=True)
+    tmpl = template104(a['pac11'])
+    if os.path.isfile(a['src']) and not discfs_image(a['src']):
+        game, _ = single_game(a)
+        if not game.startswith('ps2_'):
+            raise BadInput('attires is for PS2 characters (%s keeps its attires in the pac: convert takes the first 4)'
+                           % lone_pac.LABELS.get(game, game))
+        chars = lone_pac.ps2_characters(a['src'], game, os.path.join(outdir, '.lone'),
+                                        __import__('moves_port').cache_dir(a['pac11'], os.path.join(outdir, '.lone')))
+        if a.get('item'):
+            cid = int(a['item'], 16)
+        elif len(chars) == 1:
+            cid = int(chars[0]['id'], 16)
+        else:
+            raise BadInput('%s holds %d characters: say which with --item (detect lists them)' % (
+                os.path.basename(a['src']), len(chars)))
+        disc = lone_pac.ps2_disc(a['src'], game, os.path.join(outdir, '.lone'))
+    else:
+        if not str(a.get('game', '')).startswith('ps2_') or not a.get('item'):
+            raise BadInput('attires on a disc: --game ps2_* and --item (from list)')
+        cid, disc = int(a['item']), a['src']
+    r = subprocess.run([sys.executable, os.path.join(HERE, 'ps2_char.py'), disc, '%x' % cid, outdir, '--template', tmpl,
+                        '--attire-pictures'], capture_output=True, text=True)
+    try:
+        return json.loads(r.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        raise BadInput('ps2_char failed: %s' % (r.stderr or r.stdout)[-600:])
+
+
 def cmd_convert(a):
     single = os.path.isfile(a.get('src') or '') and not discfs_image(a['src'])
     if (not a.get('item') and not single) or not a.get('out'):
@@ -2428,6 +2557,8 @@ def main(argv):
                                              + (['--svrmod', a['svrmod']] if a.get('svrmod') else [])
                                              + (['--game', a['game']] if a.get('game') else [])
                                              + ['--cache', __import__('moves_port').cache_dir(a['pac11'], os.path.join(HERE, 'work'))]))
+        elif cmd == 'attires':   # (a PS2 character's attires as pictures, to choose --attires)
+            res = cmd_attires(a)
         elif cmd == 'convert' and os.path.isfile(a.get('src') or '') and not discfs_image(a['src']):
             rep_path = os.path.join(os.path.abspath(a['out']), 'report.json') if a.get('out') else None
             res = cmd_convert(a)
@@ -2464,12 +2595,15 @@ def main(argv):
         return 2
     except Exception as e:   # noqa: BLE001
         traceback.print_exc(file=sys.stderr)
-        res = {'ok': False, 'error': '%s: %s' % (type(e).__name__, e), 'opens': 'superstar'}
+        res = {'ok': False, 'error': explain(e, a), 'opens': 'superstar',
+               'detail': ''.join(traceback.format_exception(type(e), e, e.__traceback__))[-3000:]}
         if rep_path:
             os.makedirs(os.path.dirname(rep_path), exist_ok=True)
             json.dump(res, open(rep_path, 'w'), indent=1)
         print(json.dumps(res))
         return 3
+    if _template_note and isinstance(res, dict):
+        res.setdefault('warnings', []).extend(_template_note)
     if rep_path:
         os.makedirs(os.path.dirname(rep_path), exist_ok=True)
         json.dump(res, open(rep_path, 'w'), indent=1)

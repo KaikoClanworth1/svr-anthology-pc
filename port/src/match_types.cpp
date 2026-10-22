@@ -44,12 +44,15 @@
 #include "online_rules.h"
 #include "p2p.h"
 #include "script_input.h"
+#include "weapons_page.h"
 #include "generated/default/svr2011_init.h"
 #include "free_cam.h"
 
 namespace svr2011 {
 std::atomic<uint32_t> g_match_rule{~0u}, g_match_arena{~0u};  // (the last match placed: LastMatch)
 void LastMatch(uint32_t* rule, uint32_t* arena) { *rule = g_match_rule.load(), *arena = g_match_arena.load(); }
+std::atomic<uint32_t> g_match_placements{0};
+uint32_t MatchPlacements() { return g_match_placements.load(); }
 // (the whole backstage 0x19 / 0x1A, the 1 on 1 rooms 0x1B.. and the 2 on 2 rooms 0x70-0x76: arena 78)
 bool BackstageRule(uint32_t rule) { return (rule >= 0x19 && rule <= 0x21) || (rule >= 0x70 && rule <= 0x76); }
 }  // namespace svr2011
@@ -1184,7 +1187,12 @@ REX_HOOK_RAW(sub_827374A0) {
   // A backstage mod's own row: its bg78 for this match (any other: the usual)
   {
     const auto& own = svr2011::BackstageRows();
-    const int k = g_pending_own_row;
+    int k = g_pending_own_row;
+    // (test aid SVR2011_TEST_BACKSTAGE_ROW=<row name>: that mod's row, with SVR2011_TEST_RULE its area's rule -
+    // a match started without the menus, e.g. svrtest lan)
+    if (const char* v = std::getenv("SVR2011_TEST_BACKSTAGE_ROW"); k < 0 && v && *v)
+      for (size_t i = 0; i < own.size(); ++i)
+        if (own[i].label == v) k = int(i);
     const bool use = k >= 0 && size_t(k) < own.size() && !Rd32(base + kStoryContext) &&
                      rule == kBackstage1v1FirstRule + uint32_t(own[size_t(k)].area);
     if (use) REXLOG_INFO("match types: backstage area '{}'", own[size_t(k)].label);
@@ -1430,6 +1438,29 @@ REX_HOOK_RAW(sub_828BBEF0) {
 // by the set-up sub_828BD278 from the match's rule at +8 - online the
 // session's 6-man, kinds 0): 3 = a waiting entrant (role 3, state 1 when the
 // character is made). (+4 is the slot's no-pad / CPU flag.)
+// Test aid (a LAN test, tools/dev/svrtest_lan.ps1): online, SVR2011_TEST_RULE plays where the session's ONE ON
+// ONE NORMAL would - the online set-up gives the rule to sub_828BD278(match, rule, options) itself (not
+// sub_827374A0) - alike on both games (with SVR2011_TEST_BACKSTAGE_ROW, a backstage mod's row for its area).
+REX_EXTERN(__imp__sub_828BD278);
+REX_HOOK_RAW(sub_828BD278) {
+  if (g_test_rule >= 0 && ctx.r4.u32 == 0 && svr2011::P2POnlineMode() && !Rd32(base + kStoryContext)) {
+    ctx.r4.u64 = uint32_t(g_test_rule);
+    static int told = 0;
+    if (told++ < 4) REXLOG_INFO("match types: online ONE ON ONE NORMAL plays rule {:02X} (SVR2011_TEST_RULE)", g_test_rule);
+    // (and SVR2011_TEST_BACKSTAGE_ROW's row when the rule is its area's: online, the menus' own-row
+    // choice in sub_827374A0's hook isn't made)
+    if (const char* v = std::getenv("SVR2011_TEST_BACKSTAGE_ROW"); v && *v) {
+      const auto& own = svr2011::BackstageRows();
+      for (size_t i = 0; i < own.size(); ++i)
+        if (own[i].label == v && uint32_t(g_test_rule) == kBackstage1v1FirstRule + uint32_t(own[i].area)) {
+          svr2011::UseBackstageRow(int(i));
+          REXLOG_INFO("match types: online backstage area '{}' (SVR2011_TEST_BACKSTAGE_ROW)", own[i].label);
+        }
+    }
+  }
+  __imp__sub_828BD278(ctx, base);
+}
+
 REX_EXTERN(__imp__sub_828BB290);
 REX_HOOK_RAW(sub_828BB290) {
   const uint32_t match = ctx.r3.u32;
@@ -1467,6 +1498,7 @@ REX_EXTERN(__imp__sub_825310B8);
 REX_HOOK_RAW(sub_825310B8) {
   const uint32_t task = ctx.r3.u32 - 32;
   __imp__sub_825310B8(ctx, base);
+  svr2011::HctpWorldVisibility(ctx, base);
   constexpr uint32_t kLive = 0x82E3DE00, kStory = 0x82E3C1F4;
   if (Rd32(base + kLive + 64) != 78 || !g_free_roam || Rd32(base + kStory)) return;
   const auto saved = ctx;
@@ -1564,6 +1596,14 @@ REX_HOOK_RAW(sub_822F26B8) {
 // vehicles on that side. (Clamping the eye inside the area, or putting it on
 // the area's centre side, gave extreme close-ups.)
 uint32_t g_camera_frame = 0;
+// After the fighters jump (SnapMatchCamera: through an HCTP door into another room, 1000s away), the
+// eye follows them at once: for kSnapFrames views it is put at the framed target + the eye's offset
+// from it before the jump (x / z), also in its kept copy (+96 / +104), so the camera's own easing
+// carries on from there. (Moving the eye once didn't hold: it was rebuilt and panned across.)
+constexpr int kSnapFrames = 30;
+int g_camera_snap = 0;
+float g_camera_offset[2] = {};
+bool g_camera_offset_set = false;
 REX_EXTERN(__imp__sub_822F2A38);
 REX_HOOK_RAW(sub_822F2A38) {
   g_camera_frame = ctx.r3.u32;
@@ -1572,7 +1612,45 @@ REX_HOOK_RAW(sub_822F2A38) {
 }
 REX_EXTERN(__imp__sub_82227150);
 REX_HOOK_RAW(sub_82227150) {
+  // Test aid: SVR2011_TEST_VIEW="<eye x,y,z>,<target x,y,z>" - every scene view from there (y up is negative), to
+  // look at one place of an arena in a match (the announce tables).
+  static const std::vector<float> test_view = [] {
+    std::vector<float> v;
+    if (const char* s = std::getenv("SVR2011_TEST_VIEW"))
+      for (const char* p = s; *p;) {
+        v.push_back(float(std::atof(p)));
+        while (*p && *p != ',') ++p;
+        if (*p) ++p;
+      }
+    return v;
+  }();
+  // (SVR2011_TEST_VIEW_PAN=<units a frame>: eye and target moved along x with the match's clock - a camera pan the
+  // same every run, for FSR 2's motion vectors)
+  static const float test_pan = std::getenv("SVR2011_TEST_VIEW_PAN") ? float(std::atof(std::getenv("SVR2011_TEST_VIEW_PAN"))) : 0.0f;
+  if (test_view.size() == 6 && ctx.r3.u32 == 0x82E3CC00 && Rd32(base + 0x82E3CD0C) > 0) {
+    const float dx = test_view[3] - test_view[0], dy = test_view[4] - test_view[1], dz = test_view[5] - test_view[2];
+    const float len = std::sqrt(dx * dx + dy * dy + dz * dz);
+    const float pan = test_pan * float(Rd32(base + 0x82E3CD0C) % 600);
+    for (int k = 0; k < 3 && len > 1e-3f; ++k) {
+      WrF(base + ctx.r4.u32 + 4 * uint32_t(k), test_view[size_t(k)] + (k == 0 ? pan : 0.0f));
+      WrF(base + ctx.r5.u32 + 4 * uint32_t(k), (k == 0 ? dx : k == 1 ? dy : dz) / len);
+    }
+  }
   const uint32_t cam = g_camera_frame;
+  if (cam && ctx.r3.u32 == 0x82E3CC00 && ctx.r4.u32 == cam + 304 && ctx.r5.u32 == cam + 288) {
+    const uint32_t sp = ctx.r1.u32;  // (still sub_822F2A38's frame: the framed target at +128 / +136)
+    const float tx = RdF(base + sp + 128), tz = RdF(base + sp + 136);
+    if (g_camera_snap > 0 && g_camera_offset_set) {
+      --g_camera_snap;
+      for (uint32_t at : {96u, 304u}) {
+        WrF(base + cam + at, tx + g_camera_offset[0]);
+        WrF(base + cam + at + 8, tz + g_camera_offset[1]);
+      }
+    } else {
+      g_camera_offset[0] = RdF(base + cam + 304) - tx, g_camera_offset[1] = RdF(base + cam + 312) - tz;
+      g_camera_offset_set = true;
+    }
+  }
   if (cam && ctx.r3.u32 == 0x82E3CC00 && ctx.r4.u32 == cam + 304 && ctx.r5.u32 == cam + 288 &&
       svr2011::g_active_row >= 0 && size_t(svr2011::g_active_row) < svr2011::BackstageRows().size() &&
       !Rd32(base + 0x82E3C1F4)) {
@@ -1595,7 +1673,9 @@ REX_HOOK_RAW(sub_82227150) {
     }
   }
   const uint32_t view = ctx.r3.u32, eye = ctx.r4.u32, dir = ctx.r5.u32;
+  svr2011::MatchCameraBefore(base, uint32_t(ctx.lr), view, eye, dir);  // (MATCH CAMERA: free_cam.h)
   __imp__sub_82227150(ctx, base);
+  svr2011::MatchCameraAfter(base);
   svr2011::FreeCamSceneView(base, view, eye, dir);  // (the free camera's, F6: free_cam.h)
 }
 
@@ -1609,6 +1689,9 @@ REX_EXTERN(__imp__sub_82227690);
 REX_HOOK_RAW(sub_82227690) {
   __imp__sub_82227690(ctx, base);
   const uint32_t sphere = ctx.r3.u32;
+  if (sphere)  // (MATCH CAMERA's RAMP: free_cam.h)
+    svr2011::MatchCameraSphere(RdF(base + sphere + 16), RdF(base + sphere + 20), RdF(base + sphere + 24),
+                               RdF(base + sphere + 32));
   if (!sphere || Rd32(base + kLiveSettings + 64) != 78) return;
   constexpr uint32_t kChars = 0x82E3CC50;
   float xs[9], ys[9], zs[9];
@@ -1681,10 +1764,12 @@ REX_HOOK_RAW(sub_82227690) {
 // The whole backstage has no area there - the box would stay a point - so it
 // gets a box around all of it: the walls of the whole backstage (bg78 wall
 // mesh 0, x -530..510, z -550..470) keep the fighters in, as in story mode.
+uint32_t g_fight_box = 0;  // (the last box set up: SetFightBox moves it)
 REX_EXTERN(__imp__sub_8224EF28);
 REX_HOOK_RAW(sub_8224EF28) {
   const uint32_t box = ctx.r3.u32;
   __imp__sub_8224EF28(ctx, base);
+  if (box) g_fight_box = box;
   if (box && std::getenv("SVR2011_TEST_BOX_LOG"))  // (test aid: the area's own box)
     REXLOG_INFO("match types: area box centre {:.0f} {:.0f} {:.0f}, half {:.0f} {:.0f} / {:.0f} {:.0f}",
                 RdF(base + box + 32), RdF(base + box + 36), RdF(base + box + 40), RdF(base + box + 64),
@@ -1783,6 +1868,7 @@ REX_EXTERN(__imp__sub_822AD738);
 REX_HOOK_RAW(sub_822AD738) {
   const uint32_t placer = ctx.r3.u32;
   svr2011::SetMatchLoading(false);  // (its loading screen is up)
+  svr2011::g_match_placements.fetch_add(1);
   LogMatch(ctx, base, ctx.r4.u32);
   // Research aid (Hell in a Cell roof): SVR2011_TEST_CELL_START=<y tenths> -
   // in a cell match people 0 and 1 start at that height (x -150 / +150, z 0).
@@ -2323,7 +2409,7 @@ void MatchTypesUpdate(PPCContext& ctx, uint8_t* base) {
     }
   }
   // (with SVR2011_TEST_ITEM_LOG) the stock under the ring (*0x82E3C06C: +0
-  // count, +8 entries, -1 taken) each time it changes, and how long each
+  // count, +8 entries: weapon model ids, -1 taken) each time it changes, and how long each
   // search under the ring (motions 15480 / 15481) lasts.
   if (static const bool item_log = std::getenv("SVR2011_TEST_ITEM_LOG") != nullptr; item_log) {
     const uint32_t frames = Rd32(base + 0x82E3CD0C);
@@ -2332,11 +2418,7 @@ void MatchTypesUpdate(PPCContext& ctx, uint8_t* base) {
       const uint32_t entries = Rd32(base + list + 8);
       std::string s;
       for (int32_t i = 0; i < n && i < 32 && entries; ++i) {
-        const int32_t e = int32_t(Rd32(base + entries + uint32_t(i) * 4));
-        const uint32_t o = e >= 0 && e < 72 ? Rd32(base + 0x82DE0220 + uint32_t(e) * 4) : 0;
-        s += o ? fmt::format(" {}:m{}{}", e, Rd32(base + o + 80),
-                             RdF(base + o + 288) == 0.f && RdF(base + o + 296) == 0.f ? "" : "(out)")
-               : fmt::format(" {}", e);
+        s += fmt::format(" {}", int32_t(Rd32(base + entries + uint32_t(i) * 4)));  // (weapon model ids; -1 taken)
       }
       static std::string last;
       if (s != last) {
@@ -2551,6 +2633,22 @@ bool ApplyRowWeapons(uint8_t* base, uint32_t rule) {
   return true;
 }
 
+// Test aid: SVR2011_TEST_PLACED_MODELS=<model>,... - the weapons WEAPONS
+// EVERYWHERE places, in its order (to see weapons: OPTIONS -> WEAPONS ones).
+int TestPlacedModel(uint32_t i, int model) {
+  static const std::vector<int> models = [] {
+    std::vector<int> out;
+    if (const char* v = std::getenv("SVR2011_TEST_PLACED_MODELS"))
+      for (const char* p = v; *p;) {
+        out.push_back(std::atoi(p));
+        while (*p && *p != ',') ++p;
+        if (*p) ++p;
+      }
+    return out;
+  }();
+  return i < models.size() && models[i] > 0 ? models[i] : model;
+}
+
 void ApplyWeapons(uint8_t* base) {
   RestoreWeapons(base);
   const uint32_t rule = base[0x82E3DE00];
@@ -2581,6 +2679,7 @@ void ApplyWeapons(uint8_t* base) {
       Placed w = list[i];
       // (test aid: SVR2011_TEST_WE_IN_RING=1 - all of them in the ring, in a row: to see them)
       if (std::getenv("SVR2011_TEST_WE_IN_RING")) w.place = 0, w.x = -24.f + 7.f * float(i), w.y = -12.f, w.z = 0.f;
+      w.model = uint8_t(TestPlacedModel(i, w.model));
       WrF(r, w.x), WrF(r + 4, w.y), WrF(r + 8, w.z);
       WrF(r + 12, 0.f), WrF(r + 16, w.yaw), WrF(r + 20, 0.f);
       r[24] = uint8_t(15010 >> 8), r[25] = uint8_t(15010 & 0xFF);  // (motion: lying)
@@ -2588,6 +2687,8 @@ void ApplyWeapons(uint8_t* base) {
       r[27] = w.model;
     }
   }
+  for (uint32_t i = 0; i < n; ++i)  // (the chosen weapons lie about in place of the game's: OPTIONS -> WEAPONS)
+    base[records + i * 28 + 27] = uint8_t(svr2011::ExtremeWeaponsPlacedModel(int(i), TestPlacedModel(i, list[i].model)));
   g_swapped = {entry, Rd32(base + entry), Rd32(base + entry + 4), lent, lent ? kExtremeFirst : 0};
   Wr32(base + entry, n);
   Wr32(base + entry + 4, records);
@@ -2600,7 +2701,9 @@ REX_EXTERN(__imp__sub_8227B938);
 REX_HOOK_RAW(sub_8227B938) {
   ApplyWeapons(base);
   if (g_swapped.entry) REXLOG_INFO("match types: WEAPONS EVERYWHERE - the weapons are made");
+  svr2011::ExtremeWeaponsMaking(base, true, ctx);  // (the Extreme Rules weapons as chosen: weapons_page.h)
   __imp__sub_8227B938(ctx, base);
+  svr2011::ExtremeWeaponsMaking(base, false, ctx);
   RestoreWeapons(base);
 }
 
@@ -2609,6 +2712,7 @@ REX_EXTERN(__imp__sub_8227D130);
 REX_HOOK_RAW(sub_8227D130) {
   ApplyWeapons(base);
   __imp__sub_8227D130(ctx, base);
+  svr2011::ExtremeWeaponsPlaced(base, g_memory);  // (the stock under the ring: the chosen weapons - weapons_page.h)
   RestoreWeapons(base);
 }
 
@@ -2758,6 +2862,34 @@ REX_EXTERN(__imp__sub_82301148);
 REX_HOOK_RAW(sub_82301148) {
   const uint32_t list = ctx.r3.u32;
   __imp__sub_82301148(ctx, base);
+  // (the Extreme Rules option on: its weapons as chosen on MY WWE -> OPTIONS -> WEAPONS - weapons_page.h)
+  if (list && base[0x82E3DE00 + 56]) svr2011::ChooseExtremeWeapons(base, list);
+  // Test aid: SVR2011_TEST_EXTRA_WEAPONS=<model>,... - more entries in the load list (how much room the weapons'
+  // memory has: with SVR2011_TEST_HEAP_LOG the failing heap); <model>=<model> swaps an entry instead (a weapon
+  // mod in a stock weapon's place, the list as long as it was).
+  if (const char* v = std::getenv("SVR2011_TEST_EXTRA_WEAPONS"); v && *v && list && base[0x82E3DE00 + 56]) {
+    for (const char* p = v; *p;) {
+      const uint32_t n = Rd32(base + list);
+      const uint32_t a = uint32_t(std::atoi(p));
+      while (*p && *p != ',' && *p != '=') ++p;
+      if (*p == '=') {
+        const uint32_t b = uint32_t(std::atoi(++p));
+        for (uint32_t i = 0; i < n && i < 72; ++i)
+          if (Rd32(base + list + 4 + 4 * i) == a) {
+            Wr32(base + list + 4 + 4 * i, b);
+            break;
+          }
+        while (*p && *p != ',') ++p;
+      } else if (n < 72) {
+        Wr32(base + list + 4 + 4 * n, a);
+        Wr32(base + list, n + 1);
+      }
+      if (*p) ++p;
+    }
+    REXLOG_INFO("match types: test - the weapon load list has {} entries", Rd32(base + list));
+  }
+  // (for reports: each load's list - a longer one than the game's crashed loads)
+  if (list) REXLOG_INFO("match types: the weapon load list has {} models (rule {:02X})", Rd32(base + list), base[0x82E3DE00]);
   const int r = svr2011::g_active_row;
   if (!list || r < 0 || size_t(r) >= svr2011::BackstageRows().size() || Rd32(base + kStoryContext)) return;
   const auto& row = svr2011::BackstageRows()[size_t(r)];
@@ -3202,3 +3334,52 @@ REX_HOOK_RAW(sub_82856B00) {
   }
   __imp__sub_82856B00(ctx, base);
 }
+
+// ...and its conditions 400-483 (sub_82858B08(object, id), which sub_82859388 hands the 400s): the same kind
+// of unchecked reads. Road to WrestleMania, Jericho's week 12 (2.1.4.1, Android, every time, right after the
+// cutscene): with id 32 answered false, the script asked id 460 - the character's +4 handed to sub_821B4C70
+// (its +212 == 284) - and +4 was empty there: a read of 0xD4, the world update stuck. The ids whose case reads
+// the character's +4 (or hands it on) or its +20 - the one it handles - with nothing there answer false, as the
+// console's read near address 0 did; id 422 checks +4 itself (a missing character still answers false).
+REX_EXTERN(__imp__sub_82858B08);
+REX_HOOK_RAW(sub_82858B08) {
+  static constexpr uint16_t kPlus4[] = {424, 434, 435, 442, 448, 450, 451, 452, 457, 458, 459, 460, 461, 462, 464, 465};
+  static constexpr uint16_t kPlus20[] = {453, 454, 455, 456, 478};
+  const uint32_t id = ctx.r4.u32;
+  auto listed = [&](const auto& ids) {
+    for (const uint16_t v : ids)
+      if (v == id) return true;
+    return false;
+  };
+  if (ctx.r3.u32 && id >= 400 && id < 484) {
+    const bool plus4 = listed(kPlus4), plus20 = listed(kPlus20);
+    if (plus4 || plus20 || id == 422) {
+      const uint32_t ch = Rd32(base + ctx.r3.u32);
+      if (!ch || (plus4 && !Rd32(base + ch + 4)) || (plus20 && !Rd32(base + ch + 20))) {
+        static int logged = 0;
+        if (logged++ < 3)
+          REXLOG_INFO("[svr2011] event condition {} with no character to check - false (as on the console)", id);
+        ctx.r3.u64 = 0;
+        return;
+      }
+    }
+  }
+  __imp__sub_82858B08(ctx, base);
+}
+
+namespace svr2011 {
+
+void SetFightBox(uint8_t* base, float cx, float cz, float hx, float hz) {
+  if (!g_fight_box) return;
+  WrF(base + g_fight_box + 32, cx);
+  WrF(base + g_fight_box + 40, cz);
+  const float half[4] = {hx, hz, hx + 5.0f, hz + 5.0f};
+  for (uint32_t i = 0; i < 4; ++i) {
+    WrF(base + g_fight_box + 64 + i * 4, half[i]);
+    WrF(base + 0x82D9E9D4 + i * 4, half[i]);
+  }
+}
+
+void SnapMatchCamera() { g_camera_snap = kSnapFrames; }
+
+}  // namespace svr2011

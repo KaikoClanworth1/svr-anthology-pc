@@ -32,6 +32,8 @@
 
 #include "generated/default/svr2011_init.h"
 #include "arena_mods.h"
+#include "p2p.h"
+#include "rtwm_streak.h"
 #include "script_input.h"
 
 namespace {
@@ -187,6 +189,7 @@ REX_HOOK_RAW(sub_8247B6C8) {
 
 REX_EXTERN(__imp__sub_828BC5E8);
 REX_HOOK_RAW(sub_828BC5E8) {
+  if (ctx.r3.u32) svr2011::RtwmStreakPeople(base, ctx.r3.u32);  // (the Streak story played as a mod)
   const TestMatch& m = Config();
   if (Applies() && ctx.r3.u32) {
     const uint32_t match = ctx.r3.u32;
@@ -232,6 +235,11 @@ REX_HOOK_RAW(sub_828BC5E8) {
         slot[-8] = 1;          // (controller: the CPU)
       }
       if (m.all_cpu) slot[-8] = 1;  // (cpu=all: the picks too)
+      // Online (a LAN test, tools/dev/svrtest_lan.ps1): a player's slot carries the lobby's whole person record
+      // (+56 its flag, the record at +92 - sub_828B90F8) and two 112-byte entries (+2040 / +2044 their flags -
+      // sub_828B91A0), which the commit's people builder copies instead of building the superstar at +8. Off:
+      // the superstar asked for is built from the game's data, alike on both games.
+      if (svr2011::P2POnlineMode()) Wr32(slot + 56, 0), Wr32(slot + 2040, 0), Wr32(slot + 2044, 0);
       done += (done.empty() ? "" : ", ") +
               (caw ? "CAW " + std::to_string(id) : std::string(reinterpret_cast<const char*>(Record(base, id) + kName)));
     }

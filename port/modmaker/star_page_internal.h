@@ -31,6 +31,7 @@ struct StarProject {
   bool ratings_set = false;  // (the style's, until moved)
   char name[32] = "", short_name[32] = "", author[64] = "", version[16] = "1.0";
   std::wstring model, song, movie, voice;
+  std::string threads;   // threads.txt made in the Threads parts tab ("" = none: an own model gets threads_parts.py's)
   std::wstring cae;      // a created entrance (cae=: the game's 284-byte entrance block, "Made in the game")
   std::string cae_name;  // whose it was in the game (shown)
   std::wstring attires[4];        // [1..3]: attires 2-4 from other model pacs (their first attire)
@@ -73,6 +74,10 @@ struct StarProject {
   std::map<int, std::string> gear;
   std::map<MatKey, MatEdit> mats;  // the material panel's edits: (attire 1-4, gear, model id, mesh) -> edit
   std::map<std::string, MatEdit> fbx_mat;  // FBX import: a mesh's material for the builder (by mesh name)
+  int fbx_reduce = 0;          // FBX import's Reduce detail: about this many vertices (0: off - never on its own)
+  int fbx_hair = -1;           // ... moving hair: -1 auto (not VRChat's J_Sec_* bones), 0 none, 1 every hair bone
+  std::map<std::string, std::string> fbx_cloth;  // ... spring cloth bones ticked ("1") / unticked ("0") by hand
+  bool fbx_keep_face = true;   // ... the head left as it is
 };
 extern StarProject g_star;
 // The overall rating as the game works it out (sub_828B7950, used by the select screen's OVERALL list and ~28 more
@@ -84,7 +89,9 @@ inline int OverallRating(const int r[7]) {
   return v > 100 ? 100 : v;
 }
 extern int g_view_attire;  // the attire the preview shows (1-4)
-void MaterialsSection(bool simple);  // the material panel for the model the 3D view shows (its attire, its gear)
+// The material panel for the model the 3D view shows (its attire, its gear): under a header of its own, or (header
+// false) just the list - show_list false: none of it, its edits still shown in the 3D view.
+void MaterialsSection(bool simple, bool header = true, bool show_list = true);
 // The Full preview window (full_preview.cpp) of entrance n for this project (star_page.cpp).
 void OpenFullPreview(int n, int start_part = 0);  // (start_part: full_preview::Request)
 
@@ -104,8 +111,12 @@ void Install(bool start);
 void SetPicture(const Image& src);
 std::wstring StyleChPac();  // the fighting style's superstar's model (pac\ch\ch<id>.pac)
 void SimpleDraw();          // simple_star.cpp
-void FbxRows(bool simple);
+void FbxRows(bool simple);  // the FBX import, step by step
+bool FbxMaterials(bool simple, bool intro = true);  // the FBX's materials (its step 3; Simple's Materials tab)
+void FbxMakeButton(const char* label, float width);
 void GearRows(bool simple);  // entrance gear per attire: has it, show it, leave it out, give it another attire's
+std::vector<int> AttireCount();  // the attires the mod has, 1..4 (star_page.cpp)
+void ThreadsOpen(int attire);    // the Threads parts tab on that attire (threads_page.cpp)
 // the move-set: the picker (g_pick_slot >= 0 opens it), slot names, the preview of a pose
 extern int g_pick_slot;
 extern char g_pick_find[48];

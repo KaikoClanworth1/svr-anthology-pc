@@ -42,6 +42,10 @@ std::string FailureReason();
 // game runs (the GRAPHICS page). CanSwitch: started as the main renderer
 // and still working.
 bool CanSwitch();
+
+// Whether an upscaler can run here (the GRAPHICS page's UPSCALING choices): "fsr2" - FSR 2, Direct3D 12 / Vulkan
+// on Windows; "dlss" - NVIDIA DLSS (not in this build yet). `why`: the reason when not (logged once each).
+bool UpscalerAvailable(const std::string& kind, std::string* why = nullptr);
 void SetNativeActive(bool active);
 bool NativeActive();
 
@@ -53,6 +57,8 @@ std::string RendererLabel();
 // draws; the textures' host memory. Zero before the first frames.
 struct FrameCosts {
   double draw_ms = 0, gpu_wait_ms = 0, submit_ms = 0, draws = 0, texture_mb = 0;
+  double targets_mb = 0;  // the render targets standing in for the Xbox 360's (colour and depth; scale and wide screen)
+  uint32_t textures = 0;  // the game's textures on the GPU
 };
 FrameCosts LastFrameCosts();
 

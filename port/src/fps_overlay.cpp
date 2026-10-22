@@ -20,6 +20,7 @@
 #include "native/native_renderer.h"
 #include "net_sim.h"
 #include "perf_stats.h"
+#include "touch_controls.h"
 
 REXCVAR_DEFINE_BOOL(show_fps, true, "UI", "Show the frame rate counter (toggle in game: F2)");
 REXCVAR_DEFINE_INT32(perf_overlay, -1, "UI",
@@ -205,7 +206,12 @@ void FpsOverlay::OnDraw(ImGuiIO& io) {
   const float pad = 6.0f;
   // (top right: under the online ping when it shows)
   const float ping_h = right && !bottom && REXCVAR_GET(show_ping) && !NetLinks().empty() ? 34.0f : 0.0f;
-  ImGui::SetNextWindowPos(ImVec2(right ? io.DisplaySize.x - pad : pad, bottom ? io.DisplaySize.y - pad : pad + ping_h),
+  // (the touch controls' buttons in that corner - MENU, EDIT: beside them, not under them; the window's height
+  // from the last frame)
+  static float last_h = 0;
+  const float y0 = bottom ? io.DisplaySize.y - pad - last_h : pad + ping_h;
+  const float side = pad + TouchControlsSideInset(right, y0, y0 + last_h);
+  ImGui::SetNextWindowPos(ImVec2(right ? io.DisplaySize.x - side : side, bottom ? io.DisplaySize.y - pad : pad + ping_h),
                           ImGuiCond_Always, ImVec2(right ? 1.0f : 0.0f, bottom ? 1.0f : 0.0f));
   ImGui::SetNextWindowBgAlpha(level >= 2 ? 0.6f : 0.45f);
   const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
@@ -221,38 +227,24 @@ void FpsOverlay::OnDraw(ImGuiIO& io) {
     const ImVec4 colour = t.fps >= cap * 0.97   ? ImVec4(0.45f, 1.0f, 0.45f, 1.0f)
                           : t.fps >= cap * 0.75 ? ImVec4(1.0f, 0.85f, 0.3f, 1.0f)
                                                 : ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
-    ImGui::TextColored(colour, "%.0f FPS", t.fps);
+    ImGui::TextColored(colour, "FPS %.0f", t.fps);
     ImGui::SameLine();
     ImGui::TextDisabled("%.1f ms  1%% low %.0f", t.frame_ms, t.low_1pct_fps);
 #ifndef SVR2011_D3D_TRACE  // the census build has no native renderer
     ImGui::SameLine();
     ImGui::TextDisabled("|  %s", native::RendererLabel().c_str());
 #endif
-    if (level >= 2) {  // (perf_stats.h: sampled twice a second, only at this level)
-      const PerfSample s = SamplePerf();
+#ifndef SVR2011_D3D_TRACE
+    if (level >= 2) {  // (the game's own GPU memory: the renderer's textures and render targets - the system's
+                       // numbers, RAM / CPU / the driver's budget, go to the perf: log lines, perf_stats.h)
+      const native::FrameCosts c = native::LastFrameCosts();
       ImGui::SetWindowFontScale(1.15f * k);
       const ImVec4 dim(0.85f, 0.85f, 0.85f, 1.0f);
-      ImGui::TextColored(dim, "RAM %.0f MB  (private %.0f MB)   guest %.0f / %.0f MB  +%.0f MB virtual", s.ram_ws_mb,
-                         s.ram_private_mb, s.guest_physical_mb, s.guest_physical_total_mb, s.guest_virtual_mb);
-      if (s.vram) {
-        const double f = s.vram_budget_mb > 0 ? s.vram_used_mb / s.vram_budget_mb : 0;
-        ImGui::TextColored(f > 0.9 ? ImVec4(1.0f, 0.4f, 0.4f, 1.0f) : f > 0.75 ? ImVec4(1.0f, 0.85f, 0.3f, 1.0f) : dim,
-                           "VRAM %.0f / %.0f MB   textures %.0f MB", s.vram_used_mb, s.vram_budget_mb, s.texture_mb);
-      } else {
-        ImGui::TextColored(dim, "VRAM n/a   textures %.0f MB", s.texture_mb);
-      }
-      std::string cpu;
-      char b[96];
-      for (const auto& th : s.busiest) {
-        std::snprintf(b, sizeof b, "   %s %.0f%%", th.name.c_str(), th.pct);
-        cpu += b;
-      }
-      ImGui::TextColored(dim, "CPU %.0f%% of %d cores%s", s.cpu_pct, s.cores, cpu.c_str());
-      // (GPU wait: the CPU waiting for the GPU's frame before - high when the GPU is the limit)
-      ImGui::TextColored(s.gpu_wait_ms > 4.0 ? ImVec4(1.0f, 0.85f, 0.3f, 1.0f) : dim,
-                         "GPU wait %.2f ms   draw %.2f ms   submit %.2f ms   %.0f draws", s.gpu_wait_ms, s.draw_ms,
-                         s.submit_ms, s.draws);
+      ImGui::TextColored(dim, "Game VRAM %.0f MB", c.texture_mb + c.targets_mb);
+      ImGui::TextColored(dim, "Textures %.0f MB (%u)   render targets %.0f MB", c.texture_mb, c.textures, c.targets_mb);
     }
+#endif
+    last_h = ImGui::GetWindowHeight();
   }
   ImGui::End();
 }

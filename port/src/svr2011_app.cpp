@@ -35,6 +35,8 @@
 #include "achievements_page.h"
 #include "jukebox.h"
 #include "backgrounds_page.h"
+#include "weapons_page.h"
+#include "weapon_mods.h"
 #include "caw_logos.h"
 #include "paint_pages.h"
 #include "match_types.h"
@@ -45,6 +47,7 @@
 #include "story_designer.h"
 #include "move_packs.h"
 #include "ring_rules.h"
+#include "caw_limits.h"
 #include "superstar_mods.h"
 #include "caw_check.h"
 #include "superstar_threads.h"
@@ -57,6 +60,9 @@
 #include "dlc.h"
 #include "fps_overlay.h"
 #include "perf_stats.h"
+#if SVR2011_DEBUG_SUITE
+#include "debug_suite/debug_suite.h"
+#endif
 #include "game_files.h"
 #include "graphics_page.h"
 #include "menu_hooks.h"
@@ -447,6 +453,7 @@ void Svr2011App::OnConfigureFonts(ImFontAtlas* atlas) {
   svr2011::SetAchievementsPageFonts(menu, title ? title : menu);
   svr2011::SetJukeboxPageFonts(menu, title ? title : menu);
   svr2011::SetBackgroundsPageFonts(menu, title ? title : menu);
+  svr2011::SetWeaponsPageFonts(menu, title ? title : menu);
   svr2011::SetMatchHudFonts(menu, title ? title : menu);
 }
 
@@ -645,6 +652,9 @@ void Svr2011App::OnPostLoadXexImage() {
   svr2011::InstallAnthology(runtime()->memory());  // (the Anthology build's hooks: anthology.h)
   svr2011::InstallMenuHooks(runtime()->memory());
   svr2011::InstallPerfStats(runtime()->memory());  // (perf_stats.h: the overlay's numbers, perf_log_seconds)
+#if SVR2011_DEBUG_SUITE
+  svr2011::dbg::Install(runtime()->memory());  // (debug_suite.h: the dbg build only)
+#endif
   svr2011::InstallPadIcons(runtime()->memory());  // (pad_icons.h)
   svr2011::InstallPlaytime();                     // (playtime.h)
   svr2011::InstallCawLogos(runtime()->memory(), g_saves);
@@ -665,11 +675,16 @@ void Svr2011App::OnPostLoadXexImage() {
     svr2011::InstallMovePacks(runtime()->file_system(),  // (arenas branch: before the game mounts its pacs)
                               g_user_data / "0000000000000000" / title / "00000002");
   }
+  // Weapon mods: new weapons in the game's weapon tables (weapon_mods.h) - before the arena mods: backstage rows name
+  // them in load_weapons= / weapons=.
+  svr2011::SetWeaponModsMemory(runtime()->memory());
+  svr2011::LoadWeaponMods();
   svr2011::KeepWindowAlive();
   svr2011::InstallArenaMods(runtime()->memory(), runtime()->file_system());
   svr2011::KeepWindowAlive();
   // Ring Kit: rope heights and rules from a custom arena's manifest (ring_rules.h).
   svr2011::InstallRingRules(runtime()->memory());
+  svr2011::InstallCawLimits(runtime()->memory());  // (the CAW editor's part heap fallback: caw_limits.h)
   svr2011::InstallJukebox(runtime()->memory());  // MY WWE -> JUKEBOX (jukebox.h)
   // Superstar mods: new characters in the free DLC slots (superstar_mods.h).
   svr2011::InstallMediaMods(runtime()->memory());  // (arenas branch: before the superstar mods mount its pac)
@@ -694,6 +709,7 @@ void Svr2011App::OnPostLoadXexImage() {
         static_cast<rex::input::InputSystem*>(runtime()->input_system()));
     svr2011::InstallJukeboxPage(imgui_drawer(), static_cast<rex::input::InputSystem*>(runtime()->input_system()));
     svr2011::InstallBackgroundsPage(imgui_drawer(), static_cast<rex::input::InputSystem*>(runtime()->input_system()));
+    svr2011::InstallWeaponsPage(imgui_drawer(), static_cast<rex::input::InputSystem*>(runtime()->input_system()));
     svr2011::InstallGraphicsPage(
         imgui_drawer(), window(),
         static_cast<rex::input::InputSystem*>(runtime()->input_system()), g_config_path);
@@ -701,6 +717,7 @@ void Svr2011App::OnPostLoadXexImage() {
     svr2011::InstallTouchControls(imgui_drawer(), window(), g_user_data);
     svr2011::InstallPaintPagesOverlay(imgui_drawer());
     svr2011::InstallSlobberKnockerOverlay(imgui_drawer());  // (match_types.h)
+    svr2011::InstallHctpOverlay(imgui_drawer());            // (match_types.h: HCTP door prompts)
     svr2011::InstallGauntletEliminatorOverlay(imgui_drawer());
     svr2011::InstallOnlineRulesOverlay(imgui_drawer());  // (online_rules.h)
     svr2011::InstallThreeStagesOverlay(imgui_drawer());

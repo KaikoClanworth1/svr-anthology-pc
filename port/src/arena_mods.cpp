@@ -25,6 +25,7 @@
 #include "backgrounds_page.h"
 #include "arena_lights.h"
 #include "no_mods.h"
+#include "weapon_mods.h"
 #include "arena_mods.h"
 #include "crowd_off.h"
 #include "move_packs.h"
@@ -38,6 +39,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <set>
 #include <cstring>
 #include <fstream>
@@ -70,6 +72,7 @@
 #include "native/native_renderer.h"
 #include "../modmaker/svrfmt/pac.h"
 #include "../modmaker/svrfmt/texture.h"
+#include "../modmaker/svrfmt/jboy.h"
 
 namespace {
 
@@ -283,6 +286,7 @@ struct CustomArena {
   std::string manifest;        // its text (ring.* keys: ring_rules.h)
   std::string base;            // the arena it was made from (manifest base=arena_SS)
   int base_arena = -1;         // its number (-1: no base - it plays as the tile's arena)
+  bool tron_live = false;      // manifest titantron=live: its video screens show the match camera (TitantronFile)
   svrfmt::Bytes banner;        // DXT5 blocks, 16-bit swapped (empty = none)
   // its VS screen pictures (vs/<name>.dds): name -> DXT5 blocks, swapped
   std::vector<std::pair<std::string, svrfmt::Bytes>> vs;
@@ -503,6 +507,7 @@ void LoadCustomArenas() {
       std::fclose(t);
     }
     c.base_arena = ArenaOfBanner(c.base);
+    c.tron_live = c.manifest.find("\ntitantron=live") != std::string::npos || c.manifest.rfind("titantron=live", 0) == 0;
     svrfmt::Bytes dds;
     if (svrfmt::ReadFile((f / "banner.dds").string(), dds)) c.banner = BannerBlocks(dds);
     if (c.banner.empty()) REXLOG_WARN("[svr2011] arena mods: {} has no 256 x 128 DXT5 banner.dds", c.id);
@@ -936,6 +941,125 @@ void ForceTheme(char* path) {
   path[8] = b;
 }
 
+// The titantron. The game shows its videos on an arena's models 800-899 (every stock arena: 801 / 807 the arena's
+// loop video, 803 / 806 / 808 the entrance video): during entrances the video, in a match the match camera (it
+// resolves the camera into their texture). Stock arenas are made for that; a ported one (WWE 2K / '13) has its own
+// screen art on other models, flagged g (shown in matches only), which those screens cover - so its match showed the
+// camera over it (user report 20 Oct). Custom arenas therefore get their 800-899 models flagged e (0xC351: shown
+// during entrances only) - the entrance video stays, the match shows the arena's own screens; manifest
+// titantron=live keeps the camera. The flagged copy: Mods/ArenaOverlay/tron_<id>.pac, made once (again when the
+// arena's file changes: size and time in tron_<id>.pac.src).
+std::string TitantronFile(const CustomArena& c) {
+  if (c.tron_live) return c.file;
+  std::error_code ec;
+  const fs::path src = g_game / fs::u8path(c.file);
+  const std::string rel = "Mods/ArenaOverlay/tron_" + c.id + ".pac";
+  const fs::path dst = g_game / fs::u8path(rel), stamp_file = dst.string() + ".src";
+  // (" v2": announce table monitors kept - copies made by the first rule are made again)
+  const std::string stamp = std::to_string(fs::file_size(src, ec)) + " " +
+                            std::to_string(static_cast<long long>(fs::last_write_time(src, ec).time_since_epoch().count())) +
+                            " v2";
+  if (fs::exists(dst, ec)) {
+    std::ifstream in(stamp_file);
+    std::string had;
+    std::getline(in, had);
+    if (had == stamp) return rel;
+    if (had == stamp + " unchanged") return c.file;
+  }
+  svrfmt::Bytes data;
+  svrfmt::Epac e;
+  if (!svrfmt::ReadFile(src.string(), data) || !svrfmt::EpacRead(data, e)) {
+    REXLOG_WARN("[svr2011] arena mods: {} - its file can't be read for the titantron (as it is)", c.id);
+    return c.file;
+  }
+  int flagged = 0, kept = 0;
+  for (auto& g : e.groups)
+    for (auto& en : g.entries) {
+      const svrfmt::Bytes raw = svrfmt::Unpack(en.data);
+      std::vector<svrfmt::PachEntry> kids;
+      if (raw.size() < 4 || std::memcmp(raw.data(), "PACH", 4) || !svrfmt::PachRead(raw, kids)) continue;
+      // Which of its 800-899 models are the hall's screens: an announce table's monitor (small, at the ring:
+      // a 2K17 port's 820) keeps the game's feed in the match - it showed nothing once flagged (21 Oct report).
+      std::set<int> monitors;
+      for (const auto& k : kids) {
+        if (k.id < 800 || k.id > 899) continue;
+        svrfmt::Bytes m = svrfmt::Unpack(k.data);
+        if (svrfmt::IsPach(m)) {
+          std::vector<svrfmt::PachEntry> parts;
+          svrfmt::Bytes jboy;
+          if (svrfmt::PachRead(m, parts))
+            for (const auto& p : parts)
+              if (p.id == 0) jboy = svrfmt::Unpack(p.data);
+          m = std::move(jboy);
+        }
+        svrfmt::Model model;
+        if (!svrfmt::IsJboy(m) || !svrfmt::JboyRead(m, model) || model.meshes.empty()) continue;
+        bool small_at_ring = true;
+        for (const auto& s : model.meshes)
+          small_at_ring = small_at_ring && s.sphere[3] < 60.f && std::fabs(s.sphere[0]) < 60.f && std::fabs(s.sphere[2]) < 60.f;
+        if (small_at_ring) monitors.insert(int(k.id));
+      }
+      bool changed = false;
+      for (auto& k : kids) {
+        if (k.id != 0xC351) continue;
+        const svrfmt::Bytes text = svrfmt::Unpack(k.data);
+        std::string t(text.begin(), text.end()), out;
+        size_t at = 0;
+        while (at < t.size()) {  // (lines "<model id> <flags>"; ids 800-899 without e / g get e)
+          size_t end = t.find('\n', at);
+          if (end == std::string::npos) end = t.size();
+          std::string line = t.substr(at, end - at);
+          const bool cr = !line.empty() && line.back() == '\r';
+          if (cr) line.pop_back();
+          size_t p = line.find_first_not_of(" \t");
+          if (p != std::string::npos && std::isdigit(uint8_t(line[p]))) {
+            const int id = std::atoi(line.c_str() + p);
+            std::istringstream words(line.substr(p));
+            std::string w;
+            bool has = false;
+            words >> w;
+            while (words >> w) has |= w == "e" || w == "g";
+            if (id >= 800 && id <= 899 && !has) {
+              if (monitors.count(id)) ++kept;
+              else line += " e", ++flagged, changed = true;
+            }
+          }
+          out += line + (cr ? "\r" : "") + (end < t.size() ? "\n" : "");
+          at = end + 1;
+        }
+        if (changed) k.data = svrfmt::BpeEncode(svrfmt::Bytes(out.begin(), out.end()));
+      }
+      if (changed) {  // (packed again when it was: the arena's memory holds the file as it is)
+        const bool packed = en.data.size() >= 4 && !std::memcmp(en.data.data(), "BPE ", 4);
+        en.data = packed ? svrfmt::BpeEncode(svrfmt::PachWrite(kids)) : svrfmt::PachWrite(kids);
+      }
+    }
+  fs::create_directories(dst.parent_path(), ec);
+  if (!flagged) {  // (no video screens to change: its own file, remembered)
+    std::ofstream(dst, std::ios::binary | std::ios::trunc);
+    std::ofstream(stamp_file, std::ios::trunc) << stamp << " unchanged\n";
+    return c.file;
+  }
+  const svrfmt::Bytes out = svrfmt::EpacWrite(e);
+  const fs::path tmp = dst.string() + ".tmp";
+  {
+    std::ofstream o(tmp, std::ios::binary | std::ios::trunc);
+    o.write(reinterpret_cast<const char*>(out.data()), std::streamsize(out.size()));
+    if (!o) {
+      REXLOG_WARN("[svr2011] arena mods: {} - the titantron copy can't be written (as it is)", c.id);
+      return c.file;
+    }
+  }
+  fs::remove(dst, ec);
+  fs::rename(tmp, dst, ec);
+  if (ec) return c.file;
+  std::ofstream(stamp_file, std::ios::trunc) << stamp << "\n";
+  REXLOG_INFO("[svr2011] arena mods: {} - {} video screens shown during entrances only (its own screens in the "
+              "match; titantron=live keeps the camera){}",
+              c.id, flagged, kept ? fmt::format(", {} announce table monitor(s) as they were", kept) : std::string());
+  return rel;
+}
+
 // Custom arena c picked on the tile of arena `tile` (nullptr: none): it plays as its base arena (the tile's when it
 // has none) - that arena's file is c's, and a match on the tile plays as that arena (g_plays_as).
 int g_redirected_file = -1;  // (the arena whose file is the custom one: its base)
@@ -948,7 +1072,7 @@ void PointAt(const CustomArena* c, int tile) {
   SetDecodeSwaps(c, as);
   svr2011::SetRingRules(c ? c->manifest : std::string());
   if (!c || tile < 0) return;
-  svr2011::RedirectArena(as, c->file);
+  svr2011::RedirectArena(as, TitantronFile(*c));
   g_redirected_host = tile, g_redirected_file = as;
   if (as != tile) g_plays_as[tile] = as;
 }
@@ -1007,6 +1131,20 @@ REX_HOOK_RAW(sub_8217DCE8) {
   __imp__sub_8217DCE8(ctx, base);
 }
 
+// The live match settings' arena (0x82E3DE00 +0x40) holds the tile's number from the pick until the match record
+// copies the screen's: the first load's show branding, the host announcer and the interfaces read it there (a RAW
+// port on the Judgment Day tile: its first entrance as Judgment Day, 21 Oct report) - it plays as its base too.
+int g_loads_since_pick = 0;  // (a match's loads, for the log: counted from the match screen's arena read)
+
+void LiveArenaPlaysAs(uint8_t* base) {
+  uint8_t* q = base + 0x82E3DE40;
+  const uint32_t arena = uint32_t(q[0]) << 24 | uint32_t(q[1]) << 16 | uint32_t(q[2]) << 8 | q[3];
+  if (arena >= 100 || !g_plays_as[arena]) return;
+  const uint32_t as = uint32_t(g_plays_as[arena]);
+  q[0] = uint8_t(as >> 24), q[1] = uint8_t(as >> 16), q[2] = uint8_t(as >> 8), q[3] = uint8_t(as);
+  REXLOG_INFO("[svr2011] arena mods: the live settings' arena {} plays as arena {}", arena, as);
+}
+
 REX_EXTERN(__imp__sub_82773F00);
 REX_HOOK_RAW(sub_82773F00) {
   constexpr uint32_t kMatchScreen = 0x82EDEB48, kScreenArena = 244;
@@ -1015,16 +1153,41 @@ REX_HOOK_RAW(sub_82773F00) {
     return uint32_t(q[0]) << 24 | uint32_t(q[1]) << 16 | uint32_t(q[2]) << 8 | q[3];
   };
   g_crowd_guard_logged = false, g_crowd_frames = 0;  // (the crowd guard: once per match)
+  LiveArenaPlaysAs(base);
   if (const uint32_t screen = rd(kMatchScreen)) {
     const uint32_t arena = rd(screen + kScreenArena);
     g_crowd_arena = int(arena);
     const int as = svr2011::ArenaNumberFor(int(arena));
     REXLOG_INFO("[svr2011] arena mods: a match loads in arena {}{}", arena,
                 g_redirected_custom ? " - " + static_cast<const CustomArena*>(g_redirected_custom)->name + " chosen" : "");
+    // Test aid: SVR2011_TEST_ARENA_SCAN=1 - where else the tile's arena number sits (the match screen, the live settings)
+    if (std::getenv("SVR2011_TEST_ARENA_SCAN") && g_redirected_host >= 0) {
+      const uint32_t tile = uint32_t(g_redirected_host);
+      std::string s;
+      for (uint32_t o = 0; o < 0x1000; ++o) {
+        if (o % 4 == 0 && rd(screen + o) == tile) s += fmt::format(" screen+{:X}(w)", o);
+        if (base[screen + o] == tile) s += fmt::format(" screen+{:X}(b)", o);
+      }
+      for (uint32_t o = 0; o < 0x800; ++o) {
+        if (o % 4 == 0 && rd(0x82E3DE00 + o) == tile) s += fmt::format(" live+{:X}(w)", o);
+        if (base[0x82E3DE00 + o] == tile) s += fmt::format(" live+{:X}(b)", o);
+      }
+      REXLOG_INFO("[svr2011] arena mods: test - tile arena {} at:{}", tile, s);
+    }
     if (as != int(arena)) {
       uint8_t* q = base + screen + kScreenArena;
       q[0] = uint8_t(uint32_t(as) >> 24), q[1] = uint8_t(uint32_t(as) >> 16), q[2] = uint8_t(uint32_t(as) >> 8), q[3] = uint8_t(as);
       REXLOG_INFO("[svr2011] arena mods: the match in arena {} plays as arena {}", arena, as);
+    }
+    // (for reports: each load since the pick - an entrance, the match - with the arena file it reads)
+    {
+      std::string file;
+      if (as >= 0 && as < 100) {
+        std::lock_guard lock(g_mutex);
+        file = g_redirect[as];
+      }
+      REXLOG_INFO("[svr2011] arena mods: load {} since the pick - arena {} (screen {}, live {}), BG{:02} -> {}", ++g_loads_since_pick,
+                  as, arena, rd(0x82E3DE40), as, file.empty() ? "original" : file);
     }
     // (for reports: a custom arena chosen whose file the match doesn't load - the stock arena plays)
     if (const auto* c = static_cast<const CustomArena*>(g_redirected_custom); c && g_redirected_file >= 0) {
@@ -1191,6 +1354,11 @@ REX_HOOK_RAW(sub_823D4FC0) {
   if (pressed & 0x1000) {
     g_committed_custom = g_redirected_custom;
     g_committed_host = g_redirected_host;
+    // (for reports: the tile the cursor was on as seen here - the match's own arena follows at its load)
+    if (new_row < 4 && new_col < 5)
+      REXLOG_INFO("[svr2011] arena select: A on page {} row {} col {} - {} (tile arena {})", g_page + 1, new_row, new_col,
+                  g_redirected_custom ? static_cast<const CustomArena*>(g_redirected_custom)->name : std::string("stock"),
+                  g_page == 0 ? g_tiles[new_row * 5 + new_col].arena : g_redirected_host);
   } else if (pressed & 0x2000) {
     if (g_committed_custom != g_redirected_custom || g_committed_host != g_redirected_host) {
       const auto* c = static_cast<const CustomArena*>(g_committed_custom);
@@ -1250,6 +1418,20 @@ uint32_t ArenaSelectString(uint32_t caller) {
 // bg78 plays only in matches started from that row (UseBackstageRow).
 std::vector<BackstageRow> g_backstage_rows;
 
+// A weapon in a backstage row's load_weapons= / weapons=: a model number, or a weapon mod's folder (weapon_mods.h,
+// pool=backstage; 0: none such).
+int BackstageWeaponModel(std::string token, const std::string& row) {
+  while (!token.empty() && token.front() == ' ') token.erase(0, 1);
+  while (!token.empty() && token.back() == ' ') token.pop_back();
+  if (token.empty()) return 0;
+  if (std::all_of(token.begin(), token.end(), [](unsigned char c) { return std::isdigit(c); })) return std::atoi(token.c_str());
+  for (const auto& m : svr2011::WeaponMods())
+    if (m.folder == token && m.backstage) return m.id;
+  REXLOG_WARN("[svr2011] arena mods: backstage row '{}' - weapon '{}' is no weapon mod for backstage areas: left out", row,
+              token);
+  return 0;
+}
+
 void LoadBackstage() {
   if (svr2011::NoMods()) return;  // (Start Without Mods: no_mods.h)
   std::error_code ec;
@@ -1280,7 +1462,7 @@ void LoadBackstage() {
           std::string v = l.substr(13);
           for (size_t at = 0; at < v.size();) {
             const size_t end = std::min(v.find(',', at), v.size());
-            if (const int m = std::atoi(v.substr(at, end - at).c_str()); m > 0) r.load_weapons.push_back(m);
+            if (const int m = BackstageWeaponModel(v.substr(at, end - at), r.label); m > 0) r.load_weapons.push_back(m);
             at = end + 1;
           }
         }
@@ -1300,9 +1482,12 @@ void LoadBackstage() {
           while (at < l.size()) {
             const size_t end = std::min(l.find(';', at), l.size());
             BackstageRow::Weapon w{};
-            if (std::sscanf(l.substr(at, end - at).c_str(), "%d,%f,%f,%f,%f", &w.model, &w.x, &w.y, &w.z, &w.yaw) ==
-                    5 &&
-                w.model > 0 && w.model < 256)
+            const std::string item = l.substr(at, end - at);
+            const size_t comma = item.find(',');
+            w.model = BackstageWeaponModel(item.substr(0, comma), r.label);
+            if (comma != std::string::npos &&
+                std::sscanf(item.c_str() + comma + 1, "%f,%f,%f,%f", &w.x, &w.y, &w.z, &w.yaw) == 4 && w.model > 0 &&
+                w.model < 256)
               r.weapons.push_back(w);
             at = end + 1;
           }
@@ -1360,6 +1545,11 @@ std::string ArenaModInUse(int* tile) {
   return c->id;
 }
 
+std::string ArenaModManifest() {
+  const auto* c = static_cast<const CustomArena*>(g_redirected_custom);
+  return c && g_redirected_host >= 0 ? c->manifest : std::string();
+}
+
 // (tile: the arena of the host's tile - the session's arena; this game finds the mod's base itself, so the pages'
 // order may differ between the two games)
 bool UseArenaMod(const std::string& folder, int tile) {
@@ -1396,6 +1586,8 @@ int ArenaNumberFor(int arena) {
 // once one is picked: a WWE Universe match picked on page 2 played the tile's stock arena without it.)
 void ScreenArenaRead(uint8_t* base, uint32_t screen) {
   constexpr uint32_t kScreenArena = 244;
+  LiveArenaPlaysAs(base);
+  g_loads_since_pick = 0;
   if (!screen) return;
   uint8_t* q = base + screen + kScreenArena;
   const uint32_t arena = uint32_t(q[0]) << 24 | uint32_t(q[1]) << 16 | uint32_t(q[2]) << 8 | q[3];
@@ -1576,6 +1768,15 @@ void InstallArenaMods(rex::memory::Memory* memory, rex::filesystem::VirtualFileS
     REXLOG_INFO("[svr2011] crowd: off - arenas without their crowd");
   }
   LoadCustomArenas();
+  // Test aid: SVR2011_TEST_ARENA_MOD=<custom arena folder> - it is picked from the start, on its base arena's tile
+  // (SVR2011_TEST_MATCH arena=<that base> plays it).
+  if (const char* v = std::getenv("SVR2011_TEST_ARENA_MOD"); v && *v) {
+    for (const auto& c : g_customs)
+      if (c.id == v) {
+        PointAt(&c, c.base_arena >= 0 ? c.base_arena : 1);
+        REXLOG_INFO("[svr2011] arena mods: test - {} picked (plays as arena {})", c.name, g_redirected_file);
+      }
+  }
   LoadBackstage();
   LoadLoadingPictures();
   // Test aid: SVR2011_TEST_LOADING=<custom arena id>:<theme>: its loading and

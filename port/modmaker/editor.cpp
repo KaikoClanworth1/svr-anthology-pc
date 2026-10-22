@@ -280,6 +280,7 @@ float g_snap_step = 5;  // units (1 = 10 cm)
 bool g_frame_all = false;
 int g_test_view = -1;  // (TestStart)
 std::string g_test_select;
+std::string g_test_picture;  // (test aid --test-picture: put on the --select object as "Use a picture..." does)
 
 // camera
 V3 g_target{0, -12, 0};
@@ -1856,6 +1857,14 @@ void LightingPanel() {
     if (ImGui::IsItemHovered())
       ImGui::SetTooltip("The arena's lights in the game - wrestlers, ring and hall - times this (and the player's\n"
                         "GRAPHICS -> ARENA BRIGHTNESS). Not shown in this view.");
+    static const char* const kTron[] = {"Titantron: the arena's screens", "Titantron: the live camera"};
+    int tron = g_light.tron_live ? 1 : 0;
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::Combo("##titantron", &tron, kTron, 2)) g_light.tron_live = tron == 1, Edited();
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("What the video screens (models 800-899) show during the match. The arena's own screens:\n"
+                        "the screen art it was made with. The live camera: the match itself, as in the game's own\n"
+                        "arenas. The entrance video plays on them either way.");
   }
   ImGui::Checkbox("The arena's own stage lights", &g_stage_lights);  // (the view only: the game always uses them)
   if (ImGui::IsItemHovered())
@@ -1955,17 +1964,21 @@ void Inspector() {
           if (ImGui::Selectable(t.name.c_str(), t.name == cur)) PushUndo(), SetObjTexture(o, t.name);
       ImGui::EndCombo();
     }
-    if (ImGui::Button("Use a picture...")) {
+    const bool test = !g_test_picture.empty();  // (test aid --test-picture: as if picked with this button)
+    if (ImGui::Button("Use a picture...") || test) {
       wchar_t file[MAX_PATH] = L"";
       OPENFILENAMEW ofn = {sizeof ofn};
       ofn.lpstrFilter = L"Pictures\0*.png;*.jpg;*.jpeg;*.tga;*.bmp\0";
       ofn.lpstrFile = file;
       ofn.nMaxFile = MAX_PATH;
       ofn.Flags = OFN_FILEMUSTEXIST;
-      if (GetOpenFileNameW(&ofn)) {
-        const std::string path = U8(fs::path(file));
+      std::string picked;
+      if (test) picked = g_test_picture, g_test_picture.clear(), Log("test: a picture on " + o.label);
+      else if (GetOpenFileNameW(&ofn)) picked = U8(fs::path(file));
+      if (!picked.empty()) {
+        const std::string path = picked;
         const std::string name = AddPicture(path);
-        if (name.empty()) Log("That picture could not be read.");
+        if (name.empty()) Log("That picture could not be read (PNG, JPG, BMP or TGA): nothing changed.");
         else PushUndo(), SetObjTexture(o, name), Log("New texture " + name + " on " + o.label + ".");
       }
     }
@@ -2465,7 +2478,8 @@ void SetArena(Arena* arena, const std::string& title) {
   if (g_test_view >= 0) ViewPreset(g_test_view);
   if (!g_test_select.empty())
     for (size_t i = 0; i < g_objs.size(); ++i)
-      if (g_objs[i].label.rfind(g_test_select, 0) == 0) {
+      if (g_test_select[0] == '#' ? g_arena->models[g_objs[i].model].id == std::atoi(g_test_select.c_str() + 1)  // (#<model id>)
+                                  : g_objs[i].label.rfind(g_test_select, 0) == 0) {
         g_sel = int(i);
         g_target = g_objs[i].pivot;
         break;
@@ -2698,6 +2712,7 @@ void TestStart(int view, const std::string& select) {
   g_test_view = view;
   g_test_select = select;
 }
+void TestPicture(const std::string& path) { g_test_picture = path; }
 
 void Shutdown() {
   if (g_budget_thread.joinable()) g_budget_thread.join();
@@ -2769,6 +2784,7 @@ std::string ManifestLines() {
   }
   if (g_light.match_light == 1) s += "match_light=entrance\n";
   if (g_light.match_light == 2) s += "match_light=entrance_spot\n";
+  if (g_light.tron_live) s += "titantron=live\n";
   return s;
 }
 
@@ -2792,6 +2808,8 @@ void FromManifest(const std::string& text) {
       g_light.match_light = 1;
     } else if (line == "match_light=entrance_spot") {
       g_light.match_light = 2;
+    } else if (line == "titantron=live") {
+      g_light.tron_live = true;
     } else if (line.rfind("light.strength=", 0) == 0) {
       g_light.strength = std::strtof(line.c_str() + 15, nullptr);
       g_light.preset = int(std::size(kPresets)) - 1;

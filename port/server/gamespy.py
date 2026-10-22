@@ -946,12 +946,32 @@ class Sake:
     # (set by the service: the NEWS panel's first line starts with it, e.g.
     # "12 players online now. ")
     news_prefix = None
+    # (set by the service: the dashboard's news as the record's Text1-5, or None
+    # for the stored record's own)
+    news_text = None
+    # (set by the service: whether a Community Creations record without the game's "checked for mods"
+    # mark - a build before the check - is refused (True) or only logged)
+    refuse_unmarked = None
+
+    def news_panel(self):
+        """The NEWS panel's whole text as the game's fetch gets it (the prefix, then
+        Text1-5 joined): the dashboard's news, else the stored record's."""
+        own = self.news_text() if self.news_text else None
+        if not own:
+            recs = self.store.all("Newsfeed")
+            f = recs[-1]["fields"] if recs else {}
+            own = [str((f.get("Text%d" % k) or [None, ""])[1] or "") for k in range(1, 6)]
+        return (self.news_prefix() if self.news_prefix else "") + "".join(own)
 
     def field(self, tableid, rec, name, viewer):
         """A record's value for a requested field: (type, value)."""
         f = rec["fields"]
-        if tableid == "Newsfeed" and name == "Text1" and self.news_prefix:
-            return "unicodeStringValue", self.news_prefix() + str((f.get("Text1") or [None, ""])[1] or "")
+        if tableid == "Newsfeed" and name in ("Text1", "Text2", "Text3", "Text4", "Text5"):
+            own = self.news_text() if self.news_text else None
+            text = own[int(name[4]) - 1] if own else str((f.get(name) or [None, ""])[1] or "")
+            if name == "Text1" and self.news_prefix:
+                text = self.news_prefix() + text
+            return "unicodeStringValue", text
         if name == "recordid":
             return "intValue", rec["recordid"]
         if name == "ownerid":
@@ -998,7 +1018,7 @@ class Sake:
                 out.append(rec)
         return out
 
-    def handle(self, func, call, owner, xuid):
+    def handle(self, func, call, owner, xuid, modfree=False):
         """A Sake call from the player with profile `owner` and XUID `xuid`."""
         tableid = text_of(call, "tableid")
         fields = [s.text or "" for s in (child(call, "fields") or [])]
@@ -1016,6 +1036,14 @@ class Sake:
                 values["UserID"] = ["binaryDataValue", base64.b64encode(xuid.to_bytes(8, "big")).decode()]
             if self.store.count_owned(tableid, owner) >= RECORD_LIMIT:
                 return reply("RecordLimitReached")
+            # a creation from a build that doesn't check for mods (no X-Svr-ModFree from the relay): it may
+            # need mods others don't have
+            if tableid == "UserContent" and not modfree:
+                if self.refuse_unmarked and self.refuse_unmarked():
+                    log("sake: UserContent record refused: not checked for mods (a build before the check)")
+                    return reply("NoPermission")
+                log("sake: UserContent record from a build that doesn't check for mods (allowed: cc_unmarked / "
+                    "latest_release)")
             # its files: uploaded by the same player, the size the record says (a
             # big upload - a story, a highlight reel - comes in 2 MB parts, F00
             # on: FileSize is all of them)

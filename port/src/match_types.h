@@ -20,6 +20,8 @@ void InstallMatchTypes(rex::memory::Memory* memory);
 
 // The last match placed (its rule and arena; ~0 before one): the online live report.
 void LastMatch(uint32_t* rule, uint32_t* arena);
+// How many times a match's people were placed (sub_822AD738, as a match loads) - it changes when a new match starts.
+uint32_t MatchPlacements();
 // A backstage match's rule (its rooms are bg78 - where backstage mods play).
 bool BackstageRule(uint32_t rule);
 
@@ -54,6 +56,19 @@ uint32_t FighterInput(uint32_t fighter);
 // Each world update (frame_rate.cpp): an HCTP backstage room's gimmicks
 // (hctp_room.cpp; only in a match from a row with hctp=).
 void HctpRoomUpdate(PPCContext& ctx, uint8_t* base);
+
+// The HCTP backstage as one stage (hctp_room.cpp): after each CFRS room-visibility
+// update (match_types.cpp), only the current room's models and objects are shown.
+void HctpWorldVisibility(PPCContext& ctx, uint8_t* base);
+// The door prompt over the match (a player at a door: his Y button, "GO TO <room>").
+void InstallHctpOverlay(rex::ui::ImGuiDrawer* drawer);
+// (hctp_room.cpp) A world frame's start, before the game's update: wrestlers put through a door held there.
+void HctpBeforeFrame(uint8_t* base);
+// (match_types.cpp) The backstage fight box set up for the match: a new centre and
+// half sizes (the fighters went through a door into another room); the match
+// camera snapped onto them (not panning across).
+void SetFightBox(uint8_t* base, float cx, float cz, float hx, float hz);
+void SnapMatchCamera();
 
 // Slobber Knocker (slobber_knocker.cpp): the match set up is one
 // (match_types.cpp), a new one starts, and each world update while it runs.

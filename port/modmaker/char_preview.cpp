@@ -927,6 +927,38 @@ struct IkNumbers {
 };
 IkNumbers g_ik_last[4];  // (the last Pose's solve, per limb: for the pose-dump comparison)
 
+// The game's limb template: the standard 2011 skeleton's local translations (ch104's, tools/svr11_skeleton.json) of
+// the bones the arms' and legs' solve stands on. The game solves every character's limbs on it (scaled with its
+// height), not on the model's own bones (pose dump, 21 Oct: the parts' translations the same for a made model, Mickie
+// James' ch143, Hornswoggle and the rest; a made model's bends equal to a stock one's).
+const float* TemplateT(const std::string& n) {
+  static const struct {
+    const char* name;
+    float t[3];
+  } kT[] = {
+      // (not the root: its place is the motion's)
+      {"koshi", {-1.86908f, 1e-05f, 0}},
+      {"mune", {2.23149f, 0, 0}},
+      {"l_sakotsu", {1.7637f, -0.00014f, 0}},
+      {"l_ninoude", {2.0f, 0.00019f, 0}},
+      {"l_ninoude_x", {1.40795f, 0.00014f, 0}},
+      {"l_kote", {1.40696f, 0, 0}},
+      {"r_sakotsu", {1.7637f, -0.00014f, 0}},
+      {"r_ninoude", {1.99998f, 0, 0}},
+      {"r_ninoude_x", {1.40794f, 0, 0}},
+      {"r_kote", {1.40696f, 0, 0}},
+      {"l_momo", {0, -1.142f, -0.00014f}},
+      {"l_momo_x", {2.16597f, 0, 0}},
+      {"l_sune", {2.18203f, 0, 0}},
+      {"r_momo", {0, 1.1418f, -0.00014f}},
+      {"r_momo_x", {2.16535f, -8e-05f, 0}},
+      {"r_sune", {2.18264f, 0.00012f, 0}},
+  };
+  for (const auto& b : kT)
+    if (n == b.name) return b.t;
+  return nullptr;
+}
+
 bool BodyBone(const std::string& n) {
   for (const char* b : kBones)
     if (n == b) return true;
@@ -1070,6 +1102,22 @@ std::vector<Xf> Pose(const Character& ch, const Motion& m, float key, std::vecto
     return w;
   }
   const V3 root_p = w[size_t(root)].t;
+  // The limbs are solved as the game solves them: on its limb template (TemplateT) - the shoulder / hip and the
+  // segment lengths the template's, the rotations (the torso's keys) the pose's - and the angles put on the model's
+  // own bones. Solved on the model's own lengths, a made model with other proportions bent its arms further and
+  // locked its legs straight: the 3D view's hunched idle (user report 21 Oct), where the game stands it up. (A small
+  // rig - limbs well under the template's: Hornswoggle - keeps its own: the game retargets its targets,
+  // small_rig.cpp.)
+  std::vector<Xf> wt(nb);
+  {
+    std::vector<Xf> lt = local;
+    for (size_t i = 0; i < nb; ++i)
+      if (const float* t = TemplateT(ch.bones[i].name)) lt[i].t = {t[0], t[1], t[2]};
+    for (size_t i = 0; i < nb; ++i) {
+      const int p = ch.bones[i].parent;
+      wt[i] = p >= 0 && size_t(p) < i ? Mul(wt[size_t(p)], lt[i]) : lt[i];
+    }
+  }
   // the game's solve (sub_823A4DD8), in the parent frame: arms the sakotsu's, legs the root's
   struct Limb {
     const char *up, *lo, *parent;
@@ -1086,15 +1134,18 @@ std::vector<Xf> Pose(const Character& ch, const Motion& m, float key, std::vecto
     if (iu < 0 || il < 0 || ip < 0) continue;
     const int su = ch.bones[size_t(iu)].parent;  // (the upper bone's own parent in the skeleton)
     if (su < 0) continue;
-    const Xf& P = w[size_t(ip)];
+    // (the template's limb unless the model's is a small rig's)
+    const float Lt = 2 * Len(wt[size_t(il)].t - wt[size_t(iu)].t), Lm = 2 * Len(w[size_t(il)].t - w[size_t(iu)].t);
+    const std::vector<Xf>& on = Lt > 1e-4f && Lm >= 0.7f * Lt ? wt : w;
+    const Xf& P = on[size_t(ip)];
     const Xf Pi = Inverse(P);
-    const V3 S = Apply(Pi, w[size_t(iu)].t);  // the shoulder / hip in the parent frame
+    const V3 S = Apply(Pi, on[size_t(iu)].t);  // the shoulder / hip in the parent frame
     const V3 target = root_p + V3{Key(m.ik[size_t(l)][0], 2 * key, false, kMove), Key(m.ik[size_t(l)][1], 2 * key, false, kMove),
                                   Key(m.ik[size_t(l)][2], 2 * key, false, kMove)};
     V3 v = Apply(Pi, target) - S;
     // L: 2 x the upper segment (the game assumes equal segments) - shoulder / hip to elbow / knee, measured in
     // the world (the lower bone hangs off the twist bone half way down: its own offset is half a segment)
-    const float L = 2 * Len(w[size_t(il)].t - w[size_t(iu)].t);
+    const float L = &on == &wt ? Lt : Lm;
     float d = Len(v);
     if (L <= 1e-4f || d <= 1e-5f) continue;
     const float lim = (limbs[l].arm ? 0.99f : 0.99999f) * L;
@@ -1157,7 +1208,7 @@ struct GpuVertex {
 };
 struct Cb {
   float viewproj[16];
-  float flags[4];  // x: alpha test, y: the floor
+  float flags[4];  // x: alpha test, y: the floor, z: the normals (NormalMode)
   float key[4];    // toward the key light (view space, camera relative: upper left)
   float fill[4];   // toward the fill light (lower right)
   float fwd[4];    // the camera's forward
@@ -1179,8 +1230,11 @@ float4 ps(VO i) : SV_Target {
   float4 tx = t.Sample(s, i.uv);
   if (flags.x > 0.5 && tx.a < 0.3) discard;
   float3 n = normalize(i.n + 1e-5);
-  float side = dot(n, fwd.xyz) > 0 ? -1 : 1;
-  n *= side;  // (the back of a two-sided part: cloth, hair cards)
+  // (a culled part lit as the game lights it - its normals point in, so the game's light comes from -n: a part with
+  // its faces the wrong way round shows dark and inside out here too; flipped: turned over. Both sides: the back of
+  // cloth and hair cards faces the camera)
+  if (flags.z > 0.5) n = -n;
+  else if (flags.z > -0.5) n *= dot(n, fwd.xyz) > 0 ? -1 : 1;
   if (mat.z > 0.5 && dot(i.t, i.t) > 1e-8) {  // the normal map (tangent space, +U along the tangent)
     float3 T = normalize(i.t - n * dot(n, i.t)), B = cross(n, T);
     float3 m = tn.Sample(s, i.uv).xyz * 2 - 1;
@@ -1213,6 +1267,7 @@ ID3D11Buffer* g_cb = nullptr;
 ID3D11SamplerState* g_sampler = nullptr;
 ID3D11RasterizerState* g_raster = nullptr;
 ID3D11RasterizerState* g_raster_cull = nullptr;  // (culled meshes: render flag 0x2)
+ID3D11RasterizerState* g_raster_cull_front = nullptr;  // (culled and turned over: Flip faces)
 ID3D11DepthStencilState* g_depth = nullptr;
 ID3D11ShaderResourceView* g_white = nullptr;
 ID3D11ShaderResourceView* g_floor_tex = nullptr;  // the ring canvas with a 1 m grid
@@ -1233,6 +1288,7 @@ struct GpuMesh {
   ID3D11ShaderResourceView* mask = nullptr;  // a skin's shine mask: this map's alpha (the pac's normal map, kept when it's replaced)
   float spec = 0.5f, spec_pow = 50, tint[3] = {1, 1, 1};
   bool culled = true;
+  bool flipped = false;      // (the panel's Flip faces: its fronts are its backs)
   bool skin_params = false;  // (PMesh) - culled too: the game's skin shader, shine from the normal map's alpha
   int spec_alpha = -1;  // the shine's mask: -1 the game's (skin: the normal map's alpha, else the colour's), 0 none, 1 the colour's alpha, 2 its brightness
   uint32_t model_id = 0;
@@ -1263,6 +1319,7 @@ struct Slot {
   struct Phys {  // hair and jiggle (Physics): built once the character is in, settled on load / a new motion
     bool built = false, settle = true;
     std::vector<hair::Chain> chains;
+    int rigid_chains = 0;  // (cloth chains kept as posed: BuildPhysics)
     std::vector<std::pair<int, hair::CapsuleParams>> caps;  // (bone, capsule)
     std::vector<hair::Muscle> muscles;
     std::vector<hair::MuscleRow> rows;
@@ -1286,6 +1343,8 @@ int g_blood_stage = 2;  // which of the shared textures: stage 0 light .. 2 heav
 std::map<std::string, ID3D11ShaderResourceView*> g_blood_srv;  // "bloodface0_2" -> texture (misc.pac BATS/INIT/110)
 bool g_blood_loaded = false;
 bool g_frame = false;  // (frame the camera on the next posed frame)
+ID3D11ShaderResourceView* g_colour_override = nullptr;  // (SetColourOverride: the model's "color" texture swapped)
+int g_colour_override_frame = -100;
 
 void Release(IUnknown* p) {
   if (p) p->Release();
@@ -1480,6 +1539,8 @@ bool CreatePipeline() {
   rd.CullMode = D3D11_CULL_BACK;  // (a culled mesh, flag 0x2: the game's fronts are clockwise in this view - checked on stock bodies)
   rd.FrontCounterClockwise = FALSE;
   g_dev->CreateRasterizerState(&rd, &g_raster_cull);
+  rd.CullMode = D3D11_CULL_FRONT;
+  g_dev->CreateRasterizerState(&rd, &g_raster_cull_front);
   D3D11_DEPTH_STENCIL_DESC dd = {};
   dd.DepthEnable = TRUE;
   dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
@@ -1816,6 +1877,19 @@ void BuildPhysics(Slot& sl) {
     if (cp.A != 0) continue;  // (2 of the game's 570 lines: their write-back moves nothing)
     const int root = find(cp.root);
     if (root < 0 || ch.bones[size_t(root)].parent < 0) continue;
+    // Only the hair (chains hanging from the head) swings here. A coat's / cloth's chains (hung from the hips or the
+    // chest: Undertaker's entrance coat, an FBX jacket) are kept as posed - the game's collision keeps a coat's flare
+    // around the legs, this solver doesn't yet: its panels folded in between the legs (user report 21 Oct, the Full
+    // preview - "the legs flipped"). The game swings them.
+    {
+      bool hair = false;
+      for (int b = ch.bones[size_t(root)].parent, n = 0; b >= 0 && n < 64 && !hair; b = ch.bones[size_t(b)].parent, ++n)
+        hair = ch.bones[size_t(b)].name == "atama";
+      if (!hair) {
+        ++ph.rigid_chains;
+        continue;
+      }
+    }
     hair::Chain c;
     c.p = cp, c.parent = ch.bones[size_t(root)].parent;
     c.n.push_back({}), c.n.back().bone = root;
@@ -1844,9 +1918,10 @@ void BuildPhysics(Slot& sl) {
         m.bone = b, m.row = row;
         ph.muscles.push_back(m);
       }
-  if (!ph.chains.empty() || !ph.muscles.empty())
+  if (!ph.chains.empty() || !ph.muscles.empty() || ph.rigid_chains)
     mm::Log("physics: " + std::to_string(ph.chains.size()) + " hair chains, " + std::to_string(ph.caps.size()) + " capsules, " +
-            std::to_string(ph.muscles.size()) + " jiggle bones");
+            std::to_string(ph.muscles.size()) + " jiggle bones" +
+            (ph.rigid_chains ? ", " + std::to_string(ph.rigid_chains) + " cloth chains as posed (they swing in the game)" : ""));
 }
 
 // The rotation turning +X onto unit u (the shortest arc, 826A8890: identity when nearly parallel).
@@ -1878,6 +1953,7 @@ void Physics(Slot& sl, std::vector<Xf>& world, const std::vector<Xf>& local, con
   Slot::Phys& ph = sl.phys;
   if (!ph.built) BuildPhysics(sl);
   if (ph.chains.empty() && ph.muscles.empty()) return;
+  const float prev_key = ph.last_key;
   if (motion != ph.motion || key + 0.5f < ph.last_key) ph.settle = true;
   ph.motion = motion, ph.last_key = key;
   auto pos = [&](int b) { return ToV(world[size_t(b)].t); };
@@ -1903,10 +1979,11 @@ void Physics(Slot& sl, std::vector<Xf>& world, const std::vector<Xf>& local, con
     ph.settle = false, ph.acc = 0, steps = 30;
     for (hair::Chain& c : ph.chains) hair::Reset(c, pos(c.parent));
     for (size_t i = 0; i < ph.muscles.size(); ++i) hair::MuscleReset(ph.muscles[i], mpos[i]);
-  } else {
-    ph.acc += std::min(0.25, double(ImGui::GetIO().DeltaTime));
-    steps = int(ph.acc * 60.0);
-    ph.acc -= steps / 60.0;
+  } else {  // (the motion's clock: 2 steps a key, the game's 60 Hz - not the frame clock, whose 0 / 2 step frames
+             // made the hair stutter against the body)
+    ph.acc += std::clamp(double(key - prev_key) * 2.0, 0.0, 4.0);
+    steps = int(ph.acc + 1e-4);
+    ph.acc -= steps;
     steps = std::min(steps, 4);
   }
   for (int s = 0; s < steps; ++s) step();
@@ -1972,6 +2049,7 @@ GpuMesh Previewed(const GpuMesh& g) {
   if (e.cutout >= 0) o.cutout = e.cutout != 0;
   if (e.cutout == 1) o.skin_params = false;  // (PatchMaterials: g_fSweatSPA 0 - the colour-alpha shader, which cuts)
   if (e.two_sided >= 0) o.culled = e.two_sided == 0;
+  if (e.flip == 1) o.flipped = !o.flipped;
   if (e.normal == 1) {  // (as PatchMaterials: a skin keeps its old shine mask unless the picture has an alpha)
     o.ntex = PreviewNormal(e.normal_file);
     if (g_preview_normal_alpha[e.normal_file]) o.mask = o.ntex;
@@ -2000,10 +2078,14 @@ void UseMaterial(Cb* c, const GpuMesh* g) {
   for (int k = 0; k < 3; ++k) c->tint[k] = g ? g->tint[k] : 1;
   c->tint[3] = 1;
 }
+// The shader's normals (flags.z): 0 both sides (toward the camera), 1 culled (the game's: they point in), -1 culled
+// and turned over.
+float NormalMode(const GpuMesh* g) { return !g || !g->culled ? 0.0f : g->flipped ? -1.0f : 1.0f; }
 void BindMaterial(const GpuMesh* g) {
   ID3D11ShaderResourceView* n[2] = {g && g->ntex ? g->ntex : nullptr, g && g->mask ? g->mask : nullptr};
   g_ctx->PSSetShaderResources(1, 2, n);
-  g_ctx->RSSetState(g && g->culled && g_raster_cull ? g_raster_cull : g_raster);
+  ID3D11RasterizerState* cull = g && g->flipped ? g_raster_cull_front : g_raster_cull;
+  g_ctx->RSSetState(g && g->culled && cull ? cull : g_raster);
 }
 
 void Render(int w, int h) {
@@ -2153,7 +2235,7 @@ void Render(int w, int h) {
     Cb* c = static_cast<Cb*>(ms.pData);
     std::memcpy(c->viewproj, viewproj, 64);
     UseMaterial(c, g);
-    c->flags[0] = cutout, c->flags[1] = floor, c->flags[2] = c->flags[3] = 0;
+    c->flags[0] = cutout, c->flags[1] = floor, c->flags[2] = NormalMode(g), c->flags[3] = 0;
     const float k4[4] = {key.x, key.y, key.z, 0}, f4[4] = {fill.x, fill.y, fill.z, 0}, w4[4] = {fwd.x, fwd.y, fwd.z, 0};
     std::memcpy(c->key, k4, 16), std::memcpy(c->fill, f4, 16), std::memcpy(c->fwd, w4, 16);
     std::memcpy(c->shadow, shadows, sizeof shadows);
@@ -2213,6 +2295,10 @@ void Render(int w, int h) {
     g_ctx->IASetVertexBuffers(0, 1, &g.vb, &stride, &offset);
     g_ctx->IASetIndexBuffer(g.ib, DXGI_FORMAT_R32_UINT, 0);
     ID3D11ShaderResourceView* srv = g.tex;
+    if (g_colour_override && &sl == &g_slots[0] && ImGui::GetFrameCount() - g_colour_override_frame <= 2) {
+      const auto ct = sl.textures.find("color");
+      if (ct != sl.textures.end() && srv == ct->second) srv = g_colour_override;
+    }
     if (g.blood_kind) {
       const auto bit = g_blood_srv.find(std::string(g.blood_kind == 1 ? "bloodface0_" : "bloodbody0_") + std::to_string(g_blood_stage));
       if (bit == g_blood_srv.end() || !bit->second) continue;
@@ -2396,6 +2482,12 @@ void SetRing(bool on, const std::string& arena_pac) {
 }
 bool Ring() { return g_ring_on; }
 void SetMaterialPreview(const std::map<std::pair<uint32_t, int>, mm::MatEdit>& edits) { g_mat_preview = edits; }
+void SetColourOverride(const svrfmt::Image* img) {
+  if (g_colour_override) g_colour_override->Release(), g_colour_override = nullptr;
+  if (img && img->w && img->h) g_colour_override = MakeTexture(svrfmt::DdsEncode(*img, svrfmt::DxtFormat::kArgb, false));
+  g_colour_override_frame = ImGui::GetFrameCount();
+}
+void KeepColourOverride() { g_colour_override_frame = ImGui::GetFrameCount(); }
 void SetHighlight(uint32_t model_id, int mesh) { g_highlight = {model_id, mesh}, g_highlight_frame = ImGui::GetFrameCount(); }
 
 bool MeshAtlas(uint32_t model_id, int mesh, bool normal, void** texture, std::vector<std::array<float, 2>>* uvs) {
@@ -2540,6 +2632,7 @@ void DrawPosed(Slot& sl, const std::vector<Xf>& pose, ID3D11RenderTargetView* rt
     std::memset(c, 0, sizeof *c);
     std::memcpy(c->viewproj, viewproj, 64);
     c->flags[0] = g.cutout && !(g.skin_params && g.culled) ? 1.0f : 0.0f;
+    c->flags[2] = NormalMode(&g);
     UseMaterial(c, &g);
     const float k4[4] = {key_l.x, key_l.y, key_l.z, 0}, f4[4] = {fill.x, fill.y, fill.z, 0}, w4[4] = {fwd.x, fwd.y, fwd.z, 0};
     std::memcpy(c->key, k4, 16), std::memcpy(c->fill, f4, 16), std::memcpy(c->fwd, w4, 16);
@@ -2644,7 +2737,11 @@ std::string ComparePoseDump(const std::wstring& dump, std::shared_ptr<const std:
     while (std::fgets(buf, sizeof buf, f)) {
       unsigned F = 0, P = 0, M = 0, S = 0, Rq = 0;
       int used = 0;
-      if (std::sscanf(buf, "F %u P %u M %u S %u Rq %u Q%n", &F, &P, &M, &S, &Rq, &used) < 5 || int(M) != id) continue;
+      // (since the camera dump a line has its tick: "F <frame> T <tick> P ...")
+      if (std::sscanf(buf, "F %u T %*u P %u M %u S %u Rq %u Q%n", &F, &P, &M, &S, &Rq, &used) < 5 &&
+          std::sscanf(buf, "F %u P %u M %u S %u Rq %u Q%n", &F, &P, &M, &S, &Rq, &used) < 5)
+        continue;
+      if (int(M) != id) continue;
       Line l{};
       const char* p = buf + used;
       auto num = [&](float& v) { char* e; v = std::strtof(p, &e); p = e; };

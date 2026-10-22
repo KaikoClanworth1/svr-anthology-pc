@@ -195,6 +195,36 @@ superstar mod (docs/SUPERSTAR_MODS.md) and a move pack (docs/MOVE_PACKS.md).
 Entrances have their own file: [OTHER_GAMES_ENTRANCES.md](OTHER_GAMES_ENTRANCES.md)
 (HCTP Entrance chat).
 
+**Vehicle entrances (2.1.5).** The bike is 2011's own prop 2540 (`evtobj.pac`,
+entrances 518/519): parent 9999, one world track, one 0x75 key a frame (root =
+cm x 10, node 0 = body heading, 1/4 steering about y, 2/3 wheels about x), lights
+on at the first move, off after the last. `wwe13_entrance.py` builds it from a
+2K14 bike (prop 2540, channels `#0c5879e5` root, `#fdd95b24/25` wheels,
+`#fdd95b27` steering). `hctp_entrance.py` maps HCTP prop 2035 to 2540 (HCTP nodes
+1/4 wheels, 2 steering; world heading = 32768 - y). HCTP segments where the bike
+is the rider's child are baked onto a world track from the rider (offset
+(10, -790, -32) root units, heading +150). Heights: in a vehicle entrance the
+rider's and the bike's slot origins (and HCTP's ramp pitch, slot param 4) are
+baked into their roots, their 2011 slots stay at 0, and a baked bike near the
+floor is put on it (root y 1217). HCTP's flat-stage versions (32xx / 35xx: the
+stage segments' slot 12 down) get no ground fix. A 2K14 bike off the floor (409:
+a raised stage) moves onto it frame by frame with its rider; the cameras stay.
+Tested: 2K14 210 / 409, HCTP 3003 / 3411 (3203 / 3511 checked offline).
+
+**The source game's own bike.** The pack adds it as a new `evtobj.pac` SOBJ
+entry (`pacentry evt\evtobj.pac SOBJ <id> props/<id>.bin`, `entrance_props.py`):
+the game copies evtobj.pac into Mods\PacOverlay with it and never writes its own.
+`propfallback <id> <game prop>`: if that copy can't be made, the packs' entrance
+scripts use 2011's prop and the other packs still play (test aid
+SVR2011_TEST_NO_PROP_COPY). 2K14 2540 = 2011's mesh with 2K14's textures (the
+black bike) -> 2541. HCTP 2035 -> 2542 (`hctp_bike.py`: its YOBJ, model-space
+vertices on their nodes, its own 13 nodes). Prop entries are plain PACHs (a
+BPE-packed one crashed `sub_826B6BA8`); palettes count nodes from 1; a prop
+track's node k drives the node named `root` / `bone0k`. HCTP segments with the
+bike on the rider: it heads along his path, wheels level, and he sits where he
+sits in its world segment (3003: (17, -804, 680) root units in the bike's frame).
+Fallback limits: 2540 under an HCTP track keeps the position, not the wheels.
+
 States: **decoded** = we read it and a tool uses it or could; **partly** =
 layout known, some fields not; **unknown** = not looked at or not found.
 

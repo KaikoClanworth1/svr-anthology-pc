@@ -45,7 +45,7 @@ if ($WithModMaker) {
                      "model_budget.py", "xact.py", "svr07_char.py", "wwise.py",
                      "svr11_build.py", "svr11_skeleton.json", "rig_maps.json", "rig_maps.py", "svr11_skeleton.py",
                      "moveset_maps.py", "moveset_maps.json", "moveset_port.py", "fix_model.py", "gear_port.py",
-                     "ps2_char.py", "ps2_port.py", "ps2_media.py", "lone_pac.py",  # (FBX import: builder + skeleton / rig maps; ps2_char: PS2 superstar models, imports discfs + the builder; ps2_media: their themes / titantrons)
+                     "ps2_char.py", "ps2_port.py", "ps2_media.py", "lone_pac.py", "threads_parts.py", "entrance_props.py", "hctp_bike.py",  # (FBX import: builder + skeleton / rig maps; ps2_char: PS2 superstar models, imports discfs + the builder; ps2_media: their themes / titantrons)
                      "backstage_port.py")) {  # (backstage_port: HCTP backstage rooms - its scripts in hctp\ below)
         $f = Join-Path $PSScriptRoot $t
         if (Test-Path $f) { Copy-Item $f $mmtools } else { Write-Warning "Mod Maker Tools: no $t yet" }
@@ -80,7 +80,9 @@ if ($WithModMaker) {
             # (beside the script only counts when the script puts its own folder on sys.path: the Tools' embeddable
             # Python doesn't - 2.1.3's hctp_fake56.py: "Missing: hctp2jboy - install now?")
             if ((Test-Path (Join-Path $py.DirectoryName "$m.py")) -and
-                ((Get-Content $py.FullName -Raw) -match 'sys\.path\.insert\(0,\s*os\.path\.dirname\(os\.path\.abspath\(__file__\)\)\)')) { continue }
+                (((Get-Content $py.FullName -Raw) -match 'sys\.path\.insert\(0,\s*os\.path\.dirname\(os\.path\.abspath\(__file__\)\)\)') -or
+                 (((Get-Content $py.FullName -Raw) -match '(\w+)\s*=\s*os\.path\.dirname\(os\.path\.abspath\(__file__\)\)') -and
+                  ((Get-Content $py.FullName -Raw) -match ('sys\.path\.insert\(0,\s*' + $Matches[1] + '\)'))))) { continue }   # (or HERE = ...; sys.path.insert(0, HERE))
             $missing += "$($py.Name) imports $m (tools\$m.py)"
         }
     }
@@ -113,6 +115,30 @@ $vcrt = @("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140_at
 Get-ChildItem $build -Filter "*.dll" | Where-Object { $files -notcontains $_.Name -and $vcrt -notcontains $_.Name.ToLower() } |
     Copy-Item -Destination $stage
 Copy-Item (Join-Path $port "dist\Read Me.txt") $stage
+Copy-Item (Join-Path $port "dist\Third-party notices.txt") $stage   # (AMD FSR 1 / FSR 2: MIT)
+# NVIDIA DLSS (experimental): a build with the DLSS SDK (CMake SVR2011_DLSS_SDK) has nvngx_dlss.dll beside the exe -
+# copied above with the other DLLs. It ships only in this zip, never in the repository, with NVIDIA's licence
+# (the RTX SDKs licence from the same SDK folder) beside it.
+$dlssDll = Join-Path $stage "nvngx_dlss.dll"
+if (Test-Path $dlssDll) {
+    $sig = Get-AuthenticodeSignature $dlssDll
+    if ($sig.Status -ne "Valid" -or $sig.SignerCertificate.Subject -notmatch "O=NVIDIA Corporation") {
+        throw "nvngx_dlss.dll in $build isn't signed by NVIDIA ($($sig.Status))"
+    }
+    $sdk = ""
+    $cache = Join-Path $build "CMakeCache.txt"
+    if (Test-Path $cache) {
+        $line = Select-String -Path $cache -Pattern "^SVR2011_DLSS_SDK:PATH=(.*)$" | Select-Object -First 1
+        if ($line) { $sdk = $line.Matches[0].Groups[1].Value }
+    }
+    if (-not $sdk -and $env:DLSS_SDK) { $sdk = $env:DLSS_SDK }
+    $licence = if ($sdk) { Join-Path $sdk "LICENSE.txt" } else { "" }
+    if (-not $licence -or -not (Test-Path $licence)) { throw "nvngx_dlss.dll is in the build but NVIDIA's LICENSE.txt isn't (SDK: '$sdk')" }
+    Copy-Item $licence (Join-Path $stage "NVIDIA DLSS licence.txt")
+    Write-Host "DLSS: nvngx_dlss.dll $((Get-Item $dlssDll).VersionInfo.FileVersion) + NVIDIA DLSS licence.txt"
+} else {
+    Write-Warning "no nvngx_dlss.dll in $build - the release has no DLSS (built without the DLSS SDK)"
+}
 # The native renderer's shaders (converted from the game's by
 # tools/convert_shaders.py; without them it draws nothing).
 $shaders = Join-Path $port "runs\shaders_native\dxil"
@@ -177,6 +203,11 @@ if (Test-Path $apk) {
 } else {
     Write-Warning "no $apk (tools\build_apk.py) - this package has no Android app"
 }
+
+# Never the debug / test suite (docs/DEBUG_SUITE_PLAN.md): a debug-suite file or binary fails the package.
+. (Join-Path $PSScriptRoot "release_guard.ps1")
+Assert-NoDebugSuite $stage @($apk)
+"release guard: no debug / test suite in the package"
 
 # The release's file list (release_files.txt: size, SHA-256 and path of every file): the updater checks an
 # install against it after copying, and the launcher at every start, so a file an update or an unzip left

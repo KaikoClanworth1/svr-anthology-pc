@@ -34,6 +34,10 @@
 //     and motions, EVPE/EVTE <number>, or its pyro, prtcls.pac PCE6/LPE6 <0NNN>
 //     (4-character names in EPAC); added, or replacing the game's. The pac is
 //     copied to the overlay with the entries in - never written in place)
+//   propfallback <new prop id> <game prop id>
+//     (an entrance prop the pack adds to evt\evtobj.pac SOBJ, e.g. a ported bike:
+//     when that copy can't be made, the pack's entrance scripts use the game's
+//     prop instead and the other packs still play)
 // Keys the game already has are left as they are.
 //
 // The merged pacs go to <game>/Mods/PacOverlay with copies of pac/plist360.h
@@ -83,8 +87,9 @@ namespace {
 namespace fs = std::filesystem;
 using svrfmt::Bytes;
 
-constexpr const char* kFormat = "movepacks 11";  // (11: BATS / BATH INIT get the records themselves, not WAZA's tables - a DLC's differ; 2: banks whose sentinel points past the data; 3: WAZE category counts; 4: YMBs banks, record names; 6: WAZA records in id order; 7: of two packs' copies of a motion the first read is used; 8: pacentry lines; 9: YMBs motions appended after the stock ones; 10: pacentry into EPAC pacs (prtcls.pac pyro))
+constexpr const char* kFormat = "movepacks 12";  // (12: new pacentry names keep the others' places, propfallback; 11: BATS / BATH INIT get the records themselves, not WAZA's tables - a DLC's differ; 2: banks whose sentinel points past the data; 3: WAZE category counts; 4: YMBs banks, record names; 6: WAZA records in id order; 7: of two packs' copies of a motion the first read is used; 8: pacentry lines; 9: YMBs motions appended after the stock ones; 10: pacentry into EPAC pacs (prtcls.pac pyro))
 std::string g_folder;  // PacListFolder
+constexpr const char* kPropPac = "evt\\evtobj.pac";  // (entrance props: SOBJ <id>)
 
 struct Motion {
   uint16_t id = 0;
@@ -114,6 +119,7 @@ struct Packs {
     fs::path dir, file;
   };
   std::vector<EntryLine> entry_lines;
+  std::map<uint32_t, uint32_t> prop_fallback;  // (propfallback lines: an added evtobj prop -> the game's)
   size_t count = 0;
 };
 
@@ -255,6 +261,11 @@ void ReadPack(const fs::path& dir, Packs& p, std::string& stamp, bool data = tru
                std::to_string(static_cast<long long>(fs::last_write_time(dir / fs::u8path(file), ec).time_since_epoch().count())) + "\n";
       p.entries[pac].emplace(group + "/" + name, std::move(bytes));  // (the first pack's wins)
       p.entry_lines.push_back({pac, group, name, dir, dir / fs::u8path(file)});
+    } else if (kind == "propfallback") {
+      uint32_t id = 0, game_id = 0;
+      in >> id >> game_id;
+      if (!id || !game_id || id == game_id) continue;
+      p.prop_fallback.emplace(id, game_id);
     } else {
       continue;
     }
@@ -734,19 +745,40 @@ bool BuildEntryPac(const fs::path& game, const fs::path& overlay, const std::str
       continue;
     }
     bool bpe = !epac;
+    auto e = std::find_if(g->ents.begin(), g->ents.end(), [&](const E& x) { return x.name == name; });
     // (stored as the group's own entries are: evt's EPK8 entries are BPE-packed, a
-    // model pac's EMD entries plain PACHs - BPE-packed, the game couldn't load one)
-    if (!g->ents.empty()) {
+    // model pac's EMD entries plain PACHs - BPE-packed, the game couldn't load one. The
+    // entry it replaces, else the first numbered one: evtobj.pac's LIST is packed, its
+    // props plain PACHs, read in place - a packed prop crashed the entrance)
+    auto like = e != g->ents.end() ? e : std::find_if(g->ents.begin(), g->ents.end(), [](const E& x) {
+      return Epk8Order(x.name) < ~0ull - 1;
+    });
+    if (like == g->ents.end()) like = g->ents.begin();
+    if (like != g->ents.end()) {
       char magic[4] = {};
-      in.seekg(std::streamoff(0x4000 + uint64_t(g->ents[0].sector) * 0x800));
+      in.seekg(std::streamoff(0x4000 + uint64_t(like->sector) * 0x800));
       bpe = in.read(magic, 4) && !std::memcmp(magic, "BPE ", 4);
       in.clear();
     }
     const Bytes& data = packed[key] = bpe ? svrfmt::BpeEncode(raw) : raw;
-    auto e = std::find_if(g->ents.begin(), g->ents.end(), [&](const E& x) { return x.name == name; });
-    if (e == g->ents.end()) g->ents.push_back({name, 0, 0, &data});
-    else e->data = &data;
-    std::stable_sort(g->ents.begin(), g->ents.end(), [](const E& a, const E& b) { return Epk8Order(a.name) < Epk8Order(b.name); });
+    if (e != g->ents.end()) {
+      e->data = &data;
+      continue;
+    }
+    // a new name goes in among the numbers, before the first greater one (else after the last): the
+    // other entries keep their places (evtobj.pac: LIST first, F000.. after the numbers; EPK8: "65535" last)
+    const uint64_t order = Epk8Order(name);
+    auto at = g->ents.end();
+    for (auto it = g->ents.begin(); it != g->ents.end(); ++it) {
+      const uint64_t o = Epk8Order(it->name);
+      if (o >= ~0ull - 1 && o != ~0ull) continue;  // (a name that isn't a number)
+      if (o > order) {
+        at = it;
+        break;
+      }
+      at = std::next(it);
+    }
+    g->ents.insert(at, {name, 0, 0, &data});
   }
   in.seekg(0, std::ios::end);
   const uint64_t src_size = uint64_t(in.tellg()), src_end = 0x4000 + uint64_t(Le32(&head[8]));
@@ -815,6 +847,25 @@ bool BuildEntryPac(const fs::path& game, const fs::path& overlay, const std::str
   if (!Commit(part, dst)) return false;
   REXLOG_INFO("[svr2011] move packs: {}: {} entries added or replaced", pac, add.size());
   return true;
+}
+
+// An entrance script (EVP?: "0FOP", big-endian; object count +0x40 low half, table at +0x48 + 8, 32-byte
+// objects {u32 idx, u32 model, u32 type x2, ...}): its props (type 00000100 0) on an added evtobj id
+// moved to the game's (propfallback). -> how many.
+int FallBackProps(Bytes& d, const std::map<uint32_t, uint32_t>& fallback) {
+  const auto be32 = [&](size_t o) { return uint32_t(d[o] << 24 | d[o + 1] << 16 | d[o + 2] << 8 | d[o + 3]); };
+  if (d.size() < 0x4C || std::memcmp(d.data(), "0FOP", 4)) return 0;
+  const uint32_t n = be32(0x40) & 0xFFFF;
+  const size_t t = size_t(be32(0x48)) + 8;
+  int moved = 0;
+  for (uint32_t i = 0; i < n && t + 32 * (i + 1) <= d.size(); ++i) {
+    const size_t q = t + 32 * i;
+    const auto f = fallback.find(be32(q + 4));
+    if (f == fallback.end() || be32(q + 8) != 0x100 || be32(q + 12) != 0) continue;
+    for (int k = 0; k < 4; ++k) d[q + 4 + k] = uint8_t(f->second >> (24 - 8 * k));
+    ++moved;
+  }
+  return moved;
 }
 
 bool ReadEntry(const fs::path& pac, const std::string& type_name, Bytes& out) {
@@ -886,6 +937,16 @@ bool BuildMotionFile(const fs::path& src, const fs::path& dst, const std::string
   }
   if (changed_entries) *changed_entries = changed.size();
   if (dlc && changed.empty()) return true;  // (none of the packs' banks in this DLC pac)
+  // (mpsp.pac MOTP/GAME, 16.4 MB stock, is read whole into the file loader's cache - 20 MB, heap 16 - at the first
+  // match: grown past it by packs' motions the match load hung there in 2.1.4.1, 21 Oct report; model_mem.cpp
+  // gives it fallback memory now. The size in the log says so.)
+  for (const auto& [type_name, blob] : changed)
+    if (blob.size() >= (16u << 20))
+      REXLOG_INFO("[svr2011] move packs: {} {} is {:.1f} MB{}", pac, type_name, blob.size() / 1048576.0,
+                  type_name == "MOTP/GAME" && blob.size() >= (19u << 20)
+                      ? " - more than the game's 20 MB file cache can take beside the match's other files (it loads "
+                        "from the fallback memory)"
+                      : "");
   if (!WritePac(src, dst, changed)) return false;
   REXLOG_INFO("[svr2011] move packs: {}: {} motions added", pac, total);
   return true;
@@ -1254,24 +1315,47 @@ void LinkDlcCopies(rex::filesystem::VirtualFileSystem* vfs, const fs::path& over
 }
 
 // One merge at a time across games sharing the folder (Mods\PacOverlay\merge.lock, a folder: made or not, in
-// one step). A lock left by a game that died goes after 10 minutes.
+// one step; its owner.txt names the game's process). A lock whose game is gone - closed from Task Manager while
+// merging, a crash - is taken over at once: it used to hold every start on a black screen for up to 2 minutes
+// (report 2026-10-22 09:42: "another game is merging - waiting", closed, start after start). A lock with no
+// owner.txt (a game before this change, or one stopped between the two steps) counts as left after 15 s.
+bool ProcessRunning(uint32_t pid);  // (end of the file: the OS headers)
+uint32_t OwnPid();
+
 struct MergeLock {
   fs::path dir;
   bool held = false;
   explicit MergeLock(const fs::path& overlay) : dir(overlay / "merge.lock") {
     std::error_code ec;
     fs::create_directories(overlay, ec);
-    for (int t = 0; t < 1200; ++t) {  // (up to 2 minutes)
+    const auto start = std::chrono::steady_clock::now();
+    for (int t = 0; t < 1200; ++t) {  // (up to 2 minutes while its game runs)
       if (fs::create_directory(dir, ec)) {
         held = true;
+        std::ofstream(dir / "owner.txt", std::ios::binary) << OwnPid() << "\n";
+        if (t)
+          REXLOG_INFO("[svr2011] move packs: merge lock free after {} ms",
+                      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count());
         return;
       }
+      uint32_t owner = 0;
+      {
+        std::ifstream in(dir / "owner.txt", std::ios::binary);
+        if (!(in >> owner)) owner = 0;
+      }
       const auto age = fs::file_time_type::clock::now() - fs::last_write_time(dir, ec);
-      if (!ec && age > std::chrono::minutes(10)) {
-        fs::remove(dir, ec);
+      const bool old = !ec && age > std::chrono::minutes(10);
+      const bool gone = owner ? (owner == OwnPid() || !ProcessRunning(owner)) : (!ec && age > std::chrono::seconds(15));
+      if (old || gone) {
+        REXLOG_WARN("[svr2011] move packs: merge lock left by {} ({} s old) - taken over",
+                    owner ? "game process " + std::to_string(owner) + ", no longer running" : std::string("a game that stopped"),
+                    ec ? int64_t(-1) : int64_t(std::chrono::duration_cast<std::chrono::seconds>(age).count()));
+        fs::remove_all(dir, ec);
         continue;
       }
-      if (t == 0) REXLOG_INFO("[svr2011] move packs: another game is merging - waiting");
+      if (t == 0)
+        REXLOG_INFO("[svr2011] move packs: another game is merging ({}) - waiting",
+                    owner ? "process " + std::to_string(owner) : std::string("no owner yet"));
       svr2011::KeepWindowAlive();
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
@@ -1279,7 +1363,7 @@ struct MergeLock {
   }
   ~MergeLock() {
     std::error_code ec;
-    if (held) fs::remove(dir, ec);
+    if (held) fs::remove_all(dir, ec);
   }
 };
 
@@ -1630,8 +1714,30 @@ void InstallMovePacks(rex::filesystem::VirtualFileSystem* vfs, const fs::path& d
   svr2011::KeepWindowAlive();
   if (ok && pacs.count("misc.pac")) ok = BuildMisc(game, overlay, packs);
   fs::remove_all(overlay / "evt", ec);  // (entry pacs: copies of the game's with the packs' entries)
+  // the entrance props first: a copy of evtobj.pac that can't be made (its table full, the disk) leaves the
+  // packs' props out, and their entrance scripts use the game's props named by propfallback lines
+  if (const auto obj = packs.entries.find(kPropPac); ok && obj != packs.entries.end()) {
+    svr2011::KeepWindowAlive();
+    // (test aid SVR2011_TEST_NO_PROP_COPY: as if the copy couldn't be made)
+    if (std::getenv("SVR2011_TEST_NO_PROP_COPY") || !BuildEntryPac(game, overlay, kPropPac, obj->second)) {
+      if (packs.prop_fallback.empty()) {
+        ok = false;
+      } else {
+        int moved = 0;
+        for (auto& [pac, entries] : packs.entries)
+          for (auto& [key, data] : entries)
+            if (!key.compare(0, 3, "EVP")) moved += FallBackProps(data, packs.prop_fallback);
+        REXLOG_WARN("[svr2011] move packs: {} could not be copied with the packs' {} prop(s) - {} entrance prop(s) "
+                    "use the game's instead (propfallback)", kPropPac, obj->second.size(), moved);
+        fs::remove(overlay / PacPath(kPropPac), ec);
+        pacs.erase(kPropPac);
+        packs.entries.erase(obj);
+      }
+    }
+  }
   for (const auto& [pac, entries] : packs.entries) {
     svr2011::KeepWindowAlive();
+    if (pac == kPropPac) continue;
     ok = ok && BuildEntryPac(game, overlay, pac, entries);
   }
   fs::remove(overlay / "gm.pac", ec);  // (an older build served a whole gm.pac)
@@ -1925,3 +2031,43 @@ REX_HOOK_RAW(sub_82154F00) {
   static std::atomic<bool> told[0x8000] = {};
   if (!told[id].exchange(true)) REXLOG_INFO("[svr2011] move packs: motion {} streamed (YMBs, a pack's)", id);
 }
+
+// The merge lock's owner check (MergeLock above).
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <cerrno>
+#include <signal.h>
+#include <unistd.h>
+#endif
+
+namespace {
+
+uint32_t OwnPid() {
+#if defined(_WIN32)
+  return uint32_t(GetCurrentProcessId());
+#else
+  return uint32_t(getpid());
+#endif
+}
+
+bool ProcessRunning(uint32_t pid) {
+#if defined(_WIN32)
+  HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, DWORD(pid));
+  if (!h) return GetLastError() == ERROR_ACCESS_DENIED;  // (there, but not ours to look at: still running)
+  DWORD code = 0;
+  const bool running = GetExitCodeProcess(h, &code) && code == STILL_ACTIVE;
+  CloseHandle(h);
+  return running;
+#else
+  return kill(pid_t(pid), 0) == 0 || errno == EPERM;
+#endif
+}
+
+}  // namespace
