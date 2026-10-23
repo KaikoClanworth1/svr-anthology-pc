@@ -408,14 +408,15 @@ if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/launcher/svr2011_launcher.c")
     set_target_properties(svr2011_launcher PROPERTIES OUTPUT_NAME "SvR2011 Launcher")
     # The SvR Anthology launcher (branch anthology): SVR Anthology by Yumboy11 - his installer, then the game
     # with --game_data_root; no mods, no online (launcher/anthology_launcher.c).
-    add_executable(svr2011_anthology_launcher WIN32 launcher/anthology_launcher.c launcher/anthology_disc.c launcher/stfs.c launcher/launcher.rc src/utf8.manifest)
+    add_executable(svr2011_anthology_launcher WIN32 launcher/anthology_launcher.c launcher/anthology_disc.c launcher/stfs.c launcher/ui_theme.c launcher/launcher.rc src/utf8.manifest)
     set_target_properties(svr2011_anthology_launcher PROPERTIES OUTPUT_NAME "SvR Anthology Launcher")
     set_property(TARGET svr2011_anthology_launcher PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
     target_link_options(svr2011_anthology_launcher PRIVATE -Wl,/NODEFAULTLIB:libucrt.lib -Wl,/DEFAULTLIB:ucrt.lib
         -Wl,/ENTRY:wWinMainCRTStartup)
     target_compile_definitions(svr2011_anthology_launcher PRIVATE
         UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN SVR2011_RC_ANTHOLOGY)
-    target_link_libraries(svr2011_anthology_launcher PRIVATE comctl32 comdlg32 shell32 ole32 bcrypt)
+    target_link_libraries(svr2011_anthology_launcher PRIVATE comctl32 comdlg32 shell32 ole32 bcrypt gdiplus dwmapi uxtheme)
+    target_compile_definitions(svr2011_anthology_launcher PRIVATE "PORT_VERSION=L\"${SVR2011_PORT_VERSION}\"")
     # The hybrid CRT: the VC++ part (vcruntime) built in, the Universal CRT from Windows (ucrtbase.dll /
     # api-ms-win-crt-*, part of Windows 10+; Windows 7/8.1 with update KB2999226). The launcher starts
     # without the VC++ runtime, tells a player who has none / an old one where to get it (setup_tab.c), and
@@ -434,7 +435,7 @@ if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/launcher/svr2011_launcher.c")
     # The release version (VERSION.txt; package.ps1 names the zip after it and the
     # launcher's updater compares it with the newest GitHub release).
     file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION.txt" SVR2011_VERSION LIMIT_COUNT 1)
-    target_compile_definitions(svr2011_launcher PRIVATE "PORT_VERSION=L\"${SVR2011_VERSION}\"")
+    target_compile_definitions(svr2011_launcher PRIVATE "PORT_VERSION=L\"${SVR2011_PORT_VERSION}\"")
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION.txt")
     # The updater (launcher/updater_main.c): downloads a release and replaces the program files for the
     # launcher, which starts it and closes - so the launcher itself never swaps executables or restarts
@@ -446,7 +447,7 @@ if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/launcher/svr2011_launcher.c")
     target_link_options(svr2011_updater PRIVATE -Wl,/NODEFAULTLIB:libucrt.lib -Wl,/DEFAULTLIB:ucrt.lib
         -Wl,/ENTRY:wWinMainCRTStartup)
     target_compile_definitions(svr2011_updater PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN
-        SVR2011_RC_UPDATER "PORT_VERSION=L\"${SVR2011_VERSION}\"")
+        SVR2011_RC_UPDATER "PORT_VERSION=L\"${SVR2011_PORT_VERSION}\"")
     target_link_libraries(svr2011_updater PRIVATE comctl32 shell32 winhttp bcrypt)
     add_dependencies(svr2011_launcher svr2011_updater)
 endif()
