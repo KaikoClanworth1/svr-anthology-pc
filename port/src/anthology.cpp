@@ -14,10 +14,21 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <fmt/format.h>
+
+REXCVAR_DEFINE_STRING(anthology_version, "", "Game",
+                      "SVR Anthology version: \"\" (Anthology, default.xex), SVR07, SVR08, SVR09, SVR10, SVR11, LOWM or "
+                      "DIVAS - Yumboy11's default<version>.xex in his folder, read for its pac list, system sound pack "
+                      "and menu ids");
+
+// A8 (Yumboy11's versions): the 15 ids of sub_825A6810 / sub_825AAB10 (tools/anthology_redo.py), the
+// original disc's until a version is read.
+extern "C" uint32_t svr2011_anth_ids[15] = {1, 0, 17, 12, 16, 15, 14, 4, 6, 18, 7, 8, 9, 10, 11};
 
 namespace svr2011 {
 
@@ -89,6 +100,71 @@ void HideOnlineRows(uint8_t* table, uint32_t size) {
   REXLOG_INFO("[svr2011] anthology: the main menu's Xbox LIVE row hidden (no online in this build)");
 }
 
+namespace {
+// Yumboy11's eight programs are one build with a few bytes changed (all 14,856,192 bytes, at the same
+// places): A6 the pac list's name, A7 the system sound pack's name, A8 two lists of ids. The chosen one
+// is read from his folder (never written) and the same values are put into the original program.
+constexpr size_t kHisXexSize = 14856192;
+constexpr size_t kHisList = 0x336BB, kHisList2 = 0x336D3, kHisPck = 0x3866C;  // (in his file)
+constexpr size_t kHisIds = 0x5AA080, kHisIds2 = 0x5AE3A0;                    // (li r4 / li r31 runs)
+constexpr uint32_t kList = 0x820306F3, kList2 = 0x8203070B, kPck = 0x820356AC;  // (the original's)
+
+// The immediates of `li reg, n` in [from, from + 0x100) of his file.
+std::vector<uint32_t> LoadImmediates(const std::vector<uint8_t>& x, size_t from, uint32_t reg) {
+  std::vector<uint32_t> out;
+  for (size_t o = from; o + 4 <= from + 0x100; o += 4) {
+    const uint32_t w = Be32(x.data() + o);
+    if ((w >> 26) == 14 && ((w >> 16) & 31) == 0 && ((w >> 21) & 31) == reg) out.push_back(w & 0xFFFF);
+  }
+  return out;
+}
+
+void ApplyVersion(rex::memory::Memory* memory) {
+  std::string v = rex::cvar::Query<std::string>("anthology_version");
+  if (v.size() > 8 || v.find_first_of("./\\:") != std::string::npos) {
+    REXLOG_WARN("[svr2011] anthology: version \"{}\" is not one of Yumboy11's - the Anthology", v);
+    v.clear();
+  }
+  const std::string name = "default" + v + ".xex";
+  std::ifstream f(GameDataFolder() / name, std::ios::binary);
+  std::vector<uint8_t> x((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+  auto text = [&](size_t at, size_t n) { return std::string(reinterpret_cast<const char*>(x.data() + at), n); };
+  using namespace std::string_literals;
+  if (x.size() != kHisXexSize || text(kHisList - 7, 7) != "D:\\pac\\"s || text(kHisList + 8, 7) != "_4x3.h\0"s ||
+      text(kHisList2 - 7, 7) != "D:\\pac\\"s || text(kHisList2 + 8, 3) != ".h\0"s ||
+      text(kHisPck + 6, 16) != ".pck\0\0/YAFH/DUPL"s) {
+    REXLOG_WARN("[svr2011] anthology: {} in {} is not one of Yumboy11's 1.0 programs - the disc's lists",
+                name, GameDataFolder().string());
+    return;
+  }
+  // A8: his first function's 16 `li r4` (the third is always 2), his second's 15 `li r31` to check them
+  const std::vector<uint32_t> a = LoadImmediates(x, kHisIds, 4), b = LoadImmediates(x, kHisIds2, 31);
+  uint32_t ids[15];
+  bool ok = a.size() == 16 && a[2] == 2 && b.size() == 15 && b[13] == 20;
+  for (int i = 0, k = 0; ok && i < 16; ++i)
+    if (i != 2) ids[k++] = a[i];
+  for (int i = 0; ok && i < 15; ++i)
+    if (i != 13 && b[i] != ids[i]) ok = false;
+  if (!ok) {
+    REXLOG_WARN("[svr2011] anthology: {}'s menu ids not where they should be - the disc's lists", name);
+    return;
+  }
+  // (the strings are in the program's read-only data: its page made writable first)
+  auto put = [&](uint32_t at, size_t from, size_t n) {
+    if (auto* heap = memory->LookupHeap(at))
+      heap->Protect(at & ~0xFFFu, 0x1000, rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWrite);
+    std::memcpy(memory->TranslateVirtual<uint8_t*>(at), x.data() + from, n);
+  };
+  if (On("A6")) put(kList, kHisList, 8), put(kList2, kHisList2, 8);
+  if (On("A7")) put(kPck, kHisPck, 10);
+  if (On("A8")) std::memcpy(svr2011_anth_ids, ids, sizeof ids);
+  std::string list;
+  for (uint32_t id : ids) list += fmt::format(" {}", id);
+  REXLOG_INFO("[svr2011] anthology: version {} (Yumboy11's): pac\\{}.h, sound\\{}, menu ids{}", name,
+              text(kHisList2, 8), text(kHisPck, 10), list);
+}
+}  // namespace
+
 void InstallAnthology(rex::memory::Memory* memory) {
   g_memory = memory;
   if (kAnthology && memory && On("A2")) {
@@ -100,6 +176,7 @@ void InstallAnthology(rex::memory::Memory* memory) {
       REXLOG_INFO("[svr2011] anthology A2: memory table part 2 0x40 (Yumboy11's size)");
     }
   }
+  if (kAnthology && memory) ApplyVersion(memory);  // (A6-A8)
   // Test aid: SVR2011_ANTHOLOGY_STACKS=<seconds> - every guest thread's place in the log then.
   if (const char* v = std::getenv("SVR2011_ANTHOLOGY_STACKS"); v && *v) {
     const int s = std::atoi(v);

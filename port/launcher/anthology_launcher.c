@@ -86,7 +86,7 @@ enum {
     ID_GAME_EDIT, ID_GAME_BROWSE, ID_GAME_STATUS,
     ID_SAVES_OPEN, ID_SAVES_README, ID_OUR_FOLDERS,
     ID_PLAY, ID_CREDITS, ID_README, ID_STATUS, ID_SETUP_STATUS, ID_GO_SETUP, ID_CLOSE_ON_START,
-    ID_SKIP_INTROS, ID_SKIP_TRAINING,
+    ID_SKIP_INTROS, ID_SKIP_TRAINING, ID_VERSION,
     /* Settings */
     ID_WINDOWED, ID_FULLSCREEN, ID_FULLSCREEN_EX, ID_RESOLUTION, ID_FRAMERATE, ID_RENDER_RES, ID_UPSCALE, ID_VSYNC,
     ID_SHOWFPS, ID_MSAA, ID_RENDERER, ID_PREPARE, ID_TEXTURES, ID_INPUT, ID_AUDIO, ID_MUTE, ID_PRIORITY, ID_LANGUAGE,
@@ -263,6 +263,14 @@ static int toml_bool(const char *k, int def)
     char v[64];
     return get_toml(k, v, sizeof v) ? !strcmp(v, "true") : def;
 }
+
+/* Yumboy11's versions: his default<key>.xex in the Anthology's folder (the game's anthology_version). */
+static const struct { const char *key; const WCHAR *label; } k_versions[] = {
+    { "", L"SVR Anthology" }, { "SVR07", L"SmackDown vs. Raw 2007" }, { "SVR08", L"SmackDown vs. Raw 2008" },
+    { "SVR09", L"SmackDown vs. Raw 2009" }, { "SVR10", L"SmackDown vs. Raw 2010" },
+    { "SVR11", L"SmackDown vs. Raw 2011" }, { "LOWM", L"Legends of WrestleMania" }, { "DIVAS", L"Divas" },
+};
+#define N_VERSIONS ((int)(sizeof k_versions / sizeof k_versions[0]))
 
 /* The settings' choices: as the port's launcher's (svr2011_launcher.c k_res, k_render, k_languages). */
 static const struct { int w, h, scale; const WCHAR *label; } k_res[] = {
@@ -803,6 +811,22 @@ static void play(void)
             return;
         }
     }
+    {
+        /* (the version: Yumboy11's program for it must be in his folder) */
+        int v = (int)SendDlgItemMessageW(s_wnd, ID_VERSION, CB_GETCURSEL, 0, 0);
+        char q[16];
+        WCHAR file[40];
+        if (v < 0 || v >= N_VERSIONS) v = 0;
+        swprintf_s(file, 40, L"default%hs.xex", k_versions[v].key);
+        if (!join(m, s_game, file) || GetFileAttributesW(m) == INVALID_FILE_ATTRIBUTES) {
+            swprintf_s(m, 600, L"%s is not in the Anthology's folder, so the %s version can't start. Run "
+                               L"Yumboy11's installer again (Setup), or choose another version.", file, k_versions[v].label);
+            MessageBoxW(s_wnd, m, WINDOW_TITLE, MB_ICONINFORMATION);
+            return;
+        }
+        sprintf_s(q, sizeof q, "\"%s\"", k_versions[v].key);
+        set_toml("anthology_version", q);
+    }
     set_toml("skip_intros", checked(ID_SKIP_INTROS) ? "true" : "false");
     set_toml("skip_training", checked(ID_SKIP_TRAINING) ? "true" : "false");
     set_toml("online_enabled", "false");
@@ -849,6 +873,9 @@ static void build_window(void)
     /* Play: the Anthology's card (his cover art on the right), the state, the credit. */
     card(PAGE_PLAY, 0, 0, 724, 360, NULL);
     add(PAGE_PLAY, L"Button", L"Play", BS_DEFPUSHBUTTON | WS_TABSTOP, 28, 212, 190, 60, ID_PLAY);
+    add(PAGE_PLAY, L"Static", L"Version", SS_LEFT | SS_NOPREFIX, 238, 212, 200, 20, 0);
+    h = add(PAGE_PLAY, L"ComboBox", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 238, 236, 196, 300, ID_VERSION);
+    for (i = 0; i < N_VERSIONS; i++) SendMessageW(h, CB_ADDSTRING, 0, (LPARAM)k_versions[i].label);
     add(PAGE_PLAY, L"Button", L"Close on start", BS_AUTOCHECKBOX | WS_TABSTOP, 28, 300, 122, 24, ID_CLOSE_ON_START);
     add(PAGE_PLAY, L"Button", L"Skip intros", BS_AUTOCHECKBOX | WS_TABSTOP, 158, 300, 100, 24, ID_SKIP_INTROS);
     add(PAGE_PLAY, L"Button", L"Skip practice ring", BS_AUTOCHECKBOX | WS_TABSTOP, 266, 300, 150, 24, ID_SKIP_TRAINING);
@@ -1408,6 +1435,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR args, int show)
     make_fonts();
     build_window();
     check(ID_CLOSE_ON_START, GetPrivateProfileIntW(L"Anthology", L"CloseOnStart", 0, s_ini));
+    {
+        char v[16] = "";
+        int pick = 0, j;
+        get_toml("anthology_version", v, sizeof v);
+        for (j = 0; j < N_VERSIONS; j++)
+            if (!_stricmp(v, k_versions[j].key)) pick = j;
+        SendDlgItemMessageW(s_wnd, ID_VERSION, CB_SETCURSEL, (WPARAM)pick, 0);
+    }
     settings_load();
     /* (first start, or not set up: Setup) */
     {
