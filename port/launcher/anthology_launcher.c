@@ -1374,6 +1374,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR args, int show)
             capture_file = argv[3];
         }
     }
+    /* (a test aid with too few arguments, or an unknown one: never the window) */
+    if (argv && argc >= 2 && argv[1][0] == L'-' && argv[1][1] == L'-' && !capture_file)
+        return 2;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     InitCommonControls();
