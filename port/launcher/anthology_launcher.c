@@ -46,7 +46,7 @@
 #ifndef PORT_VERSION
 #define PORT_VERSION L"dev"
 #endif
-#define WINDOW_TITLE L"SVR Anthology by Yumboy11 - SvR 2011 PC recomp launcher - Version " PORT_VERSION
+#define WINDOW_TITLE L"SVR Anthology by Yumboy11 - SvR 2011 PC recomp by KaikoClanworth - Version " PORT_VERSION
 #define GAME_EXE L"svr2011.exe"
 #define ANTHOLOGY_GAME L"WWE SmackDown vs Raw Anthology"
 #define ANTHOLOGY_SAVES L"WWE SmackDown vs Raw Anthology Saves and DLC"
@@ -833,7 +833,7 @@ static void credits(void)
                 L"Mark/Rampage, Justyn, Sean O Connor, Wrestling Modders INC, RipZz (Sound Factory Tool), "
                 L"Obs Kenobs, WatchTheSmoke, and everyone who sent textures, suggestions and feedback - see his "
                 L"Readme.txt (the Readme button) for what each of them did.\n\n"
-                L"This launcher and the game program are the SvR 2011 PC recomp (" PORT_VERSION
+                L"This launcher and the game program are the SvR 2011 PC recomp by KaikoClanworth (" PORT_VERSION
                 L"), made with the permission of Yumboy11, who allows it to be used with his Anthology as "
                 L"long as players use their own ISO and his own installer, and he is fully credited.\n\n"
                 L"WWE SmackDown vs. Raw 2011 belongs to its owners.",
@@ -855,12 +855,13 @@ static void build_window(void)
     card(PAGE_PLAY, 0, 376, 724, 60, NULL);
     add(PAGE_PLAY, L"Static", L"", SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS, 52, 396, 480, 22, ID_STATUS);
     add(PAGE_PLAY, L"Button", L"Open Setup", BS_PUSHBUTTON | WS_TABSTOP, 552, 386, 160, 36, ID_GO_SETUP);
-    card(PAGE_PLAY, 0, 452, 724, 120, L"Credit");
+    card(PAGE_PLAY, 0, 452, 724, 146, L"Credit");
     add(PAGE_PLAY, L"Static",
         L"SVR Anthology is Yumboy11's mod for WWE SmackDown vs. Raw 2011 - all credit for it goes to Yumboy11 and "
         L"the people he thanks in his Readme. It is freeware: never buy or sell it. Nothing of it is in this "
-        L"download: you use your own SvR 2011 ISO and Yumboy11's own installer.",
-        SS_LEFT | SS_NOPREFIX, 18, 486, 500, 80, 0);
+        L"download: you use your own SvR 2011 ISO and Yumboy11's own installer. The PC recomp (this launcher and "
+        L"the game program): KaikoClanworth.",
+        SS_LEFT | SS_NOPREFIX, 18, 486, 500, 104, 0);
     add(PAGE_PLAY, L"Button", L"Credits", BS_PUSHBUTTON | WS_TABSTOP, 536, 470, 172, 38, ID_CREDITS);
     add(PAGE_PLAY, L"Button", L"Yumboy11's Readme", BS_PUSHBUTTON | WS_TABSTOP, 536, 518, 172, 38, ID_README);
 
@@ -1032,7 +1033,7 @@ static void paint_window(HDC dc)
     SelectObject(dc, s_font);
     SetTextColor(dc, RGB(150, 152, 162));
     r.left = S(20); r.right = S(SB_W - 10); r.top = cl.bottom - S(56); r.bottom = cl.bottom - S(34);
-    DrawTextW(dc, L"No mods, no online", -1, &r, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+    DrawTextW(dc, L"PC recomp: KaikoClanworth", -1, &r, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
     {
         RECT dot = { S(20), cl.bottom - S(28), S(28), cl.bottom - S(20) };
         theme_round_rect(dc, &dot, S(4), C_GOOD, THEME_NONE, 0);
@@ -1043,7 +1044,7 @@ static void paint_window(HDC dc)
     /* Top right: the version, the credit. */
     SelectObject(dc, s_font);
     SetTextColor(dc, C_MUTED);
-    swprintf_s(v, 96, L"SvR Anthology Launcher - Version %s", PORT_VERSION);
+    swprintf_s(v, 96, L"SvR Anthology Launcher - Version %s - PC recomp by KaikoClanworth", PORT_VERSION);
     r.left = S(SB_W); r.right = cl.right - S(24); r.top = S(12); r.bottom = S(32);
     DrawTextW(dc, v, -1, &r, DT_RIGHT | DT_SINGLELINE | DT_NOPREFIX);
     SetTextColor(dc, C_ACCENT);
@@ -1086,7 +1087,7 @@ static void paint_window(HDC dc)
         SelectObject(dc, s_font);
         SetTextColor(dc, C_MUTED);
         t = page_rect(28, 174, 440, 22);
-        DrawTextW(dc, L"His SVR Anthology 1.0 on the SvR 2011 PC recomp.", -1, &t, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+        DrawTextW(dc, L"His SVR Anthology 1.0 on KaikoClanworth's SvR 2011 PC recomp.", -1, &t, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
         /* the state's mark */
         SelectObject(dc, s_icons);
         SetTextColor(dc, s_ready ? C_GOOD : C_WARN);

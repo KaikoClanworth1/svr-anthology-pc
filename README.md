@@ -8,7 +8,8 @@ WatchTheSmoke, and everyone who sent textures, suggestions and feedback.
 
 SVR Anthology is freeware: never buy or sell it.
 
-This repository is the **Anthology version of the [SvR 2011 PC recomp](https://github.com/KaikoClanworth1/wwe-svr2011-pc)**:
+This repository is the **Anthology version of the [SvR 2011 PC recomp](https://github.com/KaikoClanworth1/wwe-svr2011-pc)
+by KaikoClanworth**:
 a launcher and the recompiled game program that run the Anthology **you install yourself**.
 
 > [!IMPORTANT]
@@ -48,5 +49,5 @@ As the main port ([its README](https://github.com/KaikoClanworth1/wwe-svr2011-pc
 `port/tools/package_anthology.ps1` makes the release zip.
 
 > [!NOTE]
-> Made with [Claude Code](https://claude.com/claude-code), working with the project's human author, on top of the
-> SvR 2011 PC recomp. *WWE SmackDown vs. Raw 2011* belongs to its owners; SVR Anthology belongs to Yumboy11.
+> The PC recomp (the launcher and the recompiled game program) is by **KaikoClanworth**, made with
+> [Claude Code](https://claude.com/claude-code). *WWE SmackDown vs. Raw 2011* belongs to its owners; SVR Anthology belongs to Yumboy11.
