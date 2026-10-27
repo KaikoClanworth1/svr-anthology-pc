@@ -29,3 +29,12 @@ int adb_find(const WCHAR *launcher_dir, WCHAR *out, int outn);
    phone's saves are kept once it has the game. Returns 1, or 0 with err. */
 int adb_install(const WCHAR *adb, const WCHAR *game_dir, const WCHAR *apk,
                 volatile LONG *cancel, apk_progress_fn progress, WCHAR *err, int errn);
+
+#ifdef SVR2011_RC_ANTHOLOGY
+/* The SvR Anthology app: the app, then into games/SVR Anthology the Anthology folder Yumboy11's installer
+   made (as "WWE SmackDown vs Raw Anthology", without @Alternate_Files), and from the launcher's folder
+   Original\default.xex, Saves (not over the phone's own) and DLC. Only what changed; the two
+   default.xex last. Returns 1, or 0 with err. */
+int adb_install_anthology(const WCHAR *adb, const WCHAR *anthology_dir, const WCHAR *launcher_dir,
+                          const WCHAR *apk, volatile LONG *cancel, apk_progress_fn progress, WCHAR *err, int errn);
+#endif

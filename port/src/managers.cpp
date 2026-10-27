@@ -28,6 +28,7 @@
 #include <rex/logging.h>
 #include <rex/ppc.h>
 
+#include "anthology.h"
 #include "generated/default/svr2011_init.h"
 #include "superstar_mods.h"
 
@@ -167,11 +168,14 @@ REX_HOOK_RAW(sub_824621F8) {
 // The list entry under the cursor (cursor): in the managers list every entry
 // is valid, the highlight stays on the "?" tile.
 REX_EXTERN(__imp__sub_8245F1C0);
+#ifdef SVR2011_ANTHOLOGY
+REX_EXTERN(anth_sub_8245F1C0);
+#endif
 REX_HOOK_RAW(sub_8245F1C0) {
   const uint32_t cursor = ctx.r3.u32;
   const uint32_t mode = Rd32(base, cursor + kListMode);
   if (!ManagersOpen(base, cursor) || mode < 1 || mode > 3) {
-    __imp__sub_8245F1C0(ctx, base);
+    SVR2011_IMP(sub_8245F1C0)(ctx, base);  // (anthology.h)
     return;
   }
   const uint32_t count = Rd32(base, cursor + kLists + kManagerList * kListSize);

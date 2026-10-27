@@ -77,7 +77,7 @@ public class LauncherActivity extends Activity {
         LinearLayout titles = new LinearLayout(this);
         titles.setOrientation(LinearLayout.VERTICAL);
         titles.setPadding(dp(12), 0, 0, 0);
-        TextView title = text("WWE SmackDown vs. Raw 2011", 22, kText);
+        TextView title = text(Flavor.ANTHOLOGY ? "SVR Anthology by Yumboy11" : "WWE SmackDown vs. Raw 2011", 22, kText);
         title.setTypeface(Typeface.DEFAULT_BOLD);
         titles.addView(title);
         titles.addView(credit());
@@ -104,6 +104,24 @@ public class LauncherActivity extends Activity {
 
         addPage(tabRow, content, "Play", playPage());
         addPage(tabRow, content, "Settings", settingsPage());
+        if (Flavor.ANTHOLOGY) {
+            // (SVR Anthology: as the PC Anthology launcher - no online, mods, Paint Tool, movies, installs or
+            // updates from the port's releases; the PC launcher copies the game and its updates here, or the
+            // Setup tab sets it up on the phone)
+            AnthologySetupPage setup = new AnthologySetupPage(this);
+            addPage(tabRow, content, "Setup", setup.view(), setup::refresh);
+            String tab = getIntent().getStringExtra("tab");
+            select(Math.max(0, tab == null ? 0 : names_.indexOf(tab)));
+            if (InstallActivity.installed()) background(() -> Shaders.install(this), null);
+            if (android.os.Build.VERSION.SDK_INT >= 30) root.setOnApplyWindowInsetsListener((v, insets) -> {
+                android.graphics.Insets bars = insets.getInsets(android.view.WindowInsets.Type.systemBars()
+                    | android.view.WindowInsets.Type.displayCutout());
+                v.setPadding(bars.left, bars.top, bars.right, bars.bottom);
+                return android.view.WindowInsets.CONSUMED;
+            });
+            setContentView(root);
+            return;
+        }
         addPage(tabRow, content, "Online", onlinePage());
         SavesPage saves = new SavesPage(this);
         addPage(tabRow, content, "Saves", saves.view(), saves::refresh);
@@ -152,7 +170,12 @@ public class LauncherActivity extends Activity {
     // Who made it and where it's free (above every tab): the link opens the
     // GitHub page in the browser.
     TextView credit() {
-        String s = "Launcher - Version " + versionName() + " - By KaikoClanworth - Download free at " + kSite;
+        if (Flavor.ANTHOLOGY) {
+            TextView t = text("All credit for SVR Anthology to Yumboy11 - Launcher Version " + versionName()
+                + " - PC recomp by KaikoClanworth", 13, kDim);
+            return t;
+        }
+        String s ="Launcher - Version " + versionName() + " - By KaikoClanworth - Download free at " + kSite;
         android.text.SpannableString span = new android.text.SpannableString(s);
         int at = s.indexOf(kSite);
         span.setSpan(new android.text.style.URLSpan("https://" + kSite), at, at + kSite.length(),
@@ -368,6 +391,7 @@ public class LauncherActivity extends Activity {
     // ── Play ─────────────────────────────────────────────────────────────
 
     View playPage() {
+        if (Flavor.ANTHOLOGY) return anthologyPlayPage();
         LinearLayout c = column();
         LinearLayout about = card(c, "Game");
         TextView desc = text("The PC port of the 2010 Xbox 360 game, statically recompiled from the original "
@@ -426,6 +450,45 @@ public class LauncherActivity extends Activity {
         auto.setThumbTintList(new android.content.res.ColorStateList(states, new int[] {kRed, 0xFFB0B0B8}));
         auto.setTrackTintList(new android.content.res.ColorStateList(states, new int[] {0x88C8102E, 0xFF4A4A54}));
         row(up, "Check when the launcher opens", null, auto);
+        return c;
+    }
+
+    // SVR Anthology's Play tab: his version to play, Play, the credit (as the PC Anthology launcher's).
+    View anthologyPlayPage() {
+        LinearLayout c = column();
+        LinearLayout about = card(c, "SVR Anthology");
+        TextView desc = text("Yumboy11's SVR Anthology on KaikoClanworth's SvR 2011 PC recomp - on your phone.",
+            15, kText);
+        desc.setPadding(0, dp(10), 0, dp(6));
+        about.addView(desc);
+        choice(about, "Version", "Which of Yumboy11's versions to play (at the next start)", "anthology_version",
+            Flavor.kVersionLabels, Flavor.kVersionKeys, true, "");
+        TextView folder = text("Game folder: games/" + InstallActivity.kFolderName, 13, kDim);
+        folder.setPadding(0, dp(6), 0, dp(10));
+        about.addView(folder);
+
+        Button play = button("Play", kRed);
+        play.setTextSize(22);
+        play.setTypeface(Typeface.DEFAULT_BOLD);
+        play.setMinHeight(dp(72));
+        play.setOnClickListener(v -> play());
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = dp(18);
+        c.addView(play, lp);
+
+        TextView tips = text("Play with a controller or the on-screen touch controls (Settings → Touch "
+            + "controls). Updates come from the SvR Anthology Launcher on your PC (Phone page).", 13, kDim);
+        tips.setPadding(dp(4), dp(14), dp(4), 0);
+        c.addView(tips);
+
+        LinearLayout credit = card(c, "Credit");
+        TextView ct = text("SVR Anthology is Yumboy11's mod for WWE SmackDown vs. Raw 2011 - all credit for it goes "
+            + "to Yumboy11 and the people he thanks in his Readme. It is freeware: never buy or sell it. This app "
+            + "contains nothing of it: it plays your own install, made with your own SvR 2011 ISO and Yumboy11's own "
+            + "installer. The PC recomp (this app and the game program): KaikoClanworth.", 14, kText);
+        ct.setPadding(0, dp(10), 0, dp(6));
+        credit.addView(ct);
         return c;
     }
 
@@ -519,6 +582,10 @@ public class LauncherActivity extends Activity {
         }
         if (drivers_ != null && !drivers_.readyToPlay(this::play)) return;  // (Mali: alpha mode first)
         settings_.save();
+        if (Flavor.ANTHOLOGY) {  // (no mods)
+            startActivity(new Intent(this, GameActivity.class));
+            return;
+        }
         String clash = ModsPage.attireGuard(null);  // (two attire mods on one attire: the newer one moves)
         if (!clash.isEmpty()) {
             new android.app.AlertDialog.Builder(this).setTitle("Attire mods").setMessage(clash)
@@ -687,7 +754,7 @@ public class LauncherActivity extends Activity {
         toggle(quality, "Prepare graphics", "Builds the graphics ahead in the menus: no stutter in matches",
             "native_prepare_pipelines", true);
 
-        texturePacks(c);
+        if (!Flavor.ANTHOLOGY) texturePacks(c);  // (texture packs are mods: none in SVR Anthology)
 
         LinearLayout audio = card(c, "Audio");
         toggle(audio, "Mute", null, "audio_mute", false);

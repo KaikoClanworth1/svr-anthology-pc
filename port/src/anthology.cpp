@@ -176,6 +176,17 @@ void InstallAnthology(rex::memory::Memory* memory) {
       REXLOG_INFO("[svr2011] anthology A2: memory table part 2 0x40 (Yumboy11's size)");
     }
   }
+  if (kAnthology && memory && On("A13")) {
+    // A13 (Yumboy11's change, with sub_824B8AB8 / sub_82776980's compares in tools/anthology_redo.py):
+    // the word at 0x82DAB600 3 -> 201.
+    uint8_t* p = memory->TranslateVirtual<uint8_t*>(0x82DAB600);
+    if (Be32(p) == 3) {
+      if (auto* heap = memory->LookupHeap(0x82DAB600))
+        heap->Protect(0x82DAB000, 0x1000, rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWrite);
+      SetBe32(p, 201);
+      REXLOG_INFO("[svr2011] anthology A13: 0x82DAB600 201 (Yumboy11's value)");
+    }
+  }
   if (kAnthology && memory) ApplyVersion(memory);  // (A6-A8)
   // Test aid: SVR2011_ANTHOLOGY_STACKS=<seconds> - every guest thread's place in the log then.
   if (const char* v = std::getenv("SVR2011_ANTHOLOGY_STACKS"); v && *v) {

@@ -38,8 +38,11 @@
 #include <wchar.h>
 
 #include "anthology_disc.h"
+#include "apk_package.h"
 #include "stfs.h"
 #include "ui_theme.h"
+#include "unzip.h"
+#include "updater.h"
 
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
@@ -78,7 +81,7 @@
 #define NAV_TOP  86
 #define NAV_H    42
 
-enum { PAGE_PLAY, PAGE_SETTINGS, PAGE_SETUP, PAGE_COUNT, PAGE_ALL = -1 };
+enum { PAGE_PLAY, PAGE_SETTINGS, PAGE_SETUP, PAGE_PHONE, PAGE_COUNT, PAGE_ALL = -1 };
 
 enum {
     ID_ISO_EDIT = 100, ID_ISO_FILE, ID_ISO_FOLDER,
@@ -90,9 +93,14 @@ enum {
     /* Settings */
     ID_WINDOWED, ID_FULLSCREEN, ID_FULLSCREEN_EX, ID_RESOLUTION, ID_FRAMERATE, ID_RENDER_RES, ID_UPSCALE, ID_VSYNC,
     ID_SHOWFPS, ID_MSAA, ID_RENDERER, ID_PREPARE, ID_TEXTURES, ID_INPUT, ID_AUDIO, ID_MUTE, ID_PRIORITY, ID_LANGUAGE,
-    ID_UNLOCK_ALL, ID_MATCH_CAMERA, ID_DEFAULTS, ID_SAVE, ID_SETTINGS_STATUS
+    ID_UNLOCK_ALL, ID_MATCH_CAMERA, ID_DEFAULTS, ID_SAVE, ID_SETTINGS_STATUS,
+    /* Phone */
+    ID_PHONE_INSTALL, ID_PHONE_CANCEL, ID_PHONE_PROGRESS, ID_PHONE_STATUS
 };
 #define WM_INSTALLER_DONE (WM_APP + 1)
+#define WM_PHONE (WM_APP + 2)        /* wParam: progress 0-1000, PHONE_OK / PHONE_FAILED; lParam: a text */
+#define PHONE_OK 2000
+#define PHONE_FAILED 2001
 
 static HWND s_wnd;
 static HINSTANCE s_hinst;
@@ -680,6 +688,127 @@ static void run_installer(void)
     refresh();
 }
 
+/* ---- Phone ---- */
+
+static volatile LONG s_phone_cancel;
+static int s_phone_busy;
+static WCHAR s_adb[MAX_PATH];
+
+static WCHAR *wdup(const WCHAR *s)
+{
+    size_t n = wcslen(s) + 1;
+    WCHAR *d = (WCHAR *)malloc(n * sizeof(WCHAR));
+    if (d) memcpy(d, s, n * sizeof(WCHAR));
+    return d;
+}
+
+static void phone_progress(int permille, const WCHAR *msg)
+{
+    PostMessageW(s_wnd, WM_PHONE, (WPARAM)permille, msg ? (LPARAM)wdup(msg) : 0);
+}
+
+/* (--adb-install: the console) */
+static void phone_console(int permille, const WCHAR *msg)
+{
+    (void)permille;
+    if (msg) wprintf(L"%ls\n", msg);
+}
+
+/* The app beside the launcher: Android\SvR Anthology.apk. */
+static int phone_apk(WCHAR *out)
+{
+    return join(out, s_dir, L"Android\\SvR Anthology.apk") && file_exists(out);
+}
+
+/* adb: beside the launcher, on PATH or in the Android SDK - else Google's platform tools, downloaded beside the
+   launcher (platform-tools). */
+static int phone_adb(apk_progress_fn progress, WCHAR *err, int errn)
+{
+    WCHAR tmp[MAX_PATH], dir[MAX_PATH];
+    if (adb_find(s_dir, s_adb, MAX_PATH)) return 1;
+    progress(0, L"Downloading Google's Android platform tools (adb)\x2026");
+    if (!GetTempPathW(MAX_PATH, dir) || !join(tmp, dir, L"svr-anthology-platform-tools.zip")) return 0;
+    if (!update_download(ADB_TOOLS_URL, tmp, NULL, 0, &s_phone_cancel, err, (size_t)errn)) return 0;
+    if (!unzip_file(tmp, s_dir)) {
+        DeleteFileW(tmp);
+        swprintf_s(err, errn, L"Could not unpack the platform tools into %s.", s_dir);
+        return 0;
+    }
+    DeleteFileW(tmp);
+    if (!adb_find(s_dir, s_adb, MAX_PATH)) {
+        swprintf_s(err, errn, L"The platform tools download has no adb.exe.");
+        return 0;
+    }
+    return 1;
+}
+
+static int phone_install(apk_progress_fn progress, WCHAR *err, int errn)
+{
+    WCHAR apk[MAX_PATH], m[MAX_PATH], why[300];
+    if (!check_game(s_game, why, 300)) {
+        swprintf_s(err, errn, L"Set SVR Anthology up on this PC first (Setup): %s", why);
+        return 0;
+    }
+    if (!join(m, s_dir, L"Original\\default.xex") || !anth_xex_ok(m)) {
+        swprintf_s(err, errn, L"Press PLAY once first: it copies the original program from your ISO.");
+        return 0;
+    }
+    if (!phone_apk(apk)) {
+        swprintf_s(err, errn, L"This download has no Android app (Android\\SvR Anthology.apk beside the launcher).");
+        return 0;
+    }
+    return phone_adb(progress, err, errn) &&
+           adb_install_anthology(s_adb, s_game, s_dir, apk, &s_phone_cancel, progress, err, errn);
+}
+
+static DWORD WINAPI phone_thread(LPVOID unused)
+{
+    WCHAR err[600];
+    int ok;
+    (void)unused;
+    err[0] = 0;
+    ok = phone_install(phone_progress, err, 600);
+    PostMessageW(s_wnd, WM_PHONE, ok ? PHONE_OK : PHONE_FAILED, (LPARAM)wdup(err));
+    return 0;
+}
+
+static void phone_start(void)
+{
+    HANDLE t;
+    if (s_phone_busy) return;
+    s_phone_busy = 1;
+    s_phone_cancel = 0;
+    EnableWindow(ctl(ID_PHONE_INSTALL), FALSE);
+    EnableWindow(ctl(ID_PHONE_CANCEL), TRUE);
+    SendMessageW(ctl(ID_PHONE_PROGRESS), PBM_SETPOS, 0, 0);
+    set_text(ID_PHONE_STATUS, L"Starting\x2026");
+    t = CreateThread(NULL, 0, phone_thread, NULL, 0, NULL);
+    if (t) CloseHandle(t);
+    else s_phone_busy = 0;
+}
+
+static void phone_message(WPARAM wp, WCHAR *text)
+{
+    if (wp == PHONE_OK || wp == PHONE_FAILED) {
+        WCHAR m[700];
+        s_phone_busy = 0;
+        EnableWindow(ctl(ID_PHONE_INSTALL), TRUE);
+        EnableWindow(ctl(ID_PHONE_CANCEL), FALSE);
+        if (wp == PHONE_OK) {
+            SendMessageW(ctl(ID_PHONE_PROGRESS), PBM_SETPOS, 1000, 0);
+            swprintf_s(m, 700, L"Done: SVR Anthology is %s on the phone. Open the SVR Anthology app there.",
+                       text && !wcscmp(text, L"updated") ? L"updated" : L"installed");
+        } else {
+            swprintf_s(m, 700, L"%s", text && text[0] ? text : L"It didn't work.");
+        }
+        set_text(ID_PHONE_STATUS, m);
+    } else {
+        SendMessageW(ctl(ID_PHONE_PROGRESS), PBM_SETPOS, wp, 0);
+        if (text) set_text(ID_PHONE_STATUS, text);
+    }
+    free(text);
+}
+
 static void installer_done(DWORD code)
 {
     WCHAR out[MAX_PATH], why[300], m[400];
@@ -974,6 +1103,33 @@ static void build_window(void)
     add(PAGE_SETUP, L"Button", L"His readme", BS_PUSHBUTTON | WS_TABSTOP, 258, 464, 150, 36, ID_SAVES_README);
     add(PAGE_SETUP, L"Button", L"This game's Saves and DLC", BS_PUSHBUTTON | WS_TABSTOP, 420, 464, 288, 36, ID_OUR_FOLDERS);
     add(PAGE_SETUP, L"Static", L"", SS_LEFT | SS_NOPREFIX, 0, 528, 724, 40, ID_SETUP_STATUS);
+
+    /* Phone: the app and the Anthology onto an Android phone over USB (apk_package.c adb_install_anthology). */
+    card(PAGE_PHONE, 0, 0, 724, 214, L"Play SVR Anthology on an Android phone");
+    add(PAGE_PHONE, L"Static",
+        L"1.  Set it up on this PC first (Setup) and press PLAY once: that copies the original program from your ISO.\n"
+        L"2.  On the phone: Settings \x2192 About phone \x2192 tap \"Build number\" seven times. Then in Developer "
+        L"options turn on USB debugging.\n"
+        L"3.  Connect the phone with a USB data cable, unlock it and tap Allow when it asks about this PC.\n"
+        L"4.  Install to phone. It installs the SVR Anthology app and copies the Anthology (about 28 GB, so the "
+        L"first time takes a while) into the phone's games/SVR Anthology folder. Later, only what changed is "
+        L"copied, and the phone's saves stay.",
+        SS_LEFT | SS_NOPREFIX, 18, 44, 690, 100, 0);
+    add(PAGE_PHONE, L"Button", L"Install to phone", BS_DEFPUSHBUTTON | WS_TABSTOP, 16, 152, 230, 44, ID_PHONE_INSTALL);
+    h = add(PAGE_PHONE, L"Button", L"Cancel", BS_PUSHBUTTON | WS_TABSTOP, 258, 152, 120, 44, ID_PHONE_CANCEL);
+    EnableWindow(h, FALSE);
+    h = add(PAGE_PHONE, PROGRESS_CLASSW, L"", 0, 0, 230, 724, 10, ID_PHONE_PROGRESS);
+    SendMessageW(h, PBM_SETRANGE32, 0, 1000);
+    SetWindowTheme(h, L"", L"");
+    SendMessageW(h, PBM_SETBARCOLOR, 0, C_ACCENT);
+    SendMessageW(h, PBM_SETBKCOLOR, 0, C_CARD);
+    add(PAGE_PHONE, L"Static", L"", SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS, 0, 248, 724, 22, ID_PHONE_STATUS);
+    card(PAGE_PHONE, 0, 286, 724, 110, L"On the phone");
+    add(PAGE_PHONE, L"Static",
+        L"The app is \"SVR Anthology\" (it sits beside SvR 2011 if you have that). It needs a phone with Vulkan; "
+        L"settings, the version and touch controls are in the app. The Anthology stays Yumboy11's: the phone gets "
+        L"a copy of your install, nothing else.",
+        SS_LEFT | SS_NOPREFIX, 18, 320, 690, 66, 0);
 }
 
 static void show_page(int page)
@@ -1011,8 +1167,8 @@ static RECT page_rect(int x, int y, int w, int h)
 static void paint_window(HDC dc)
 {
     static const struct { WCHAR icon; const WCHAR *name; } nav[PAGE_COUNT] = {
-        { 0xE768, L"Play" }, { 0xE713, L"Settings" }, { 0xE90F, L"Setup" } };
-    static const WCHAR *const titles[PAGE_COUNT] = { NULL, L"Settings", L"Setup" };
+        { 0xE768, L"Play" }, { 0xE713, L"Settings" }, { 0xE90F, L"Setup" }, { 0xE8EA, L"Phone" } };
+    static const WCHAR *const titles[PAGE_COUNT] = { NULL, L"Settings", L"Setup", L"Android phone" };
     RECT cl, r;
     HBRUSH sb = CreateSolidBrush(C_SIDEBAR);
     WCHAR v[96];
@@ -1211,6 +1367,8 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
             break;
         }
         case ID_GO_SETUP: show_page(PAGE_SETUP); break;
+        case ID_PHONE_INSTALL: phone_start(); break;
+        case ID_PHONE_CANCEL: InterlockedExchange(&s_phone_cancel, 1); break;
         case ID_SAVE:
             settings_save();
             set_text(ID_SETTINGS_STATUS, L"Saved - the game uses them at its next start.");
@@ -1222,6 +1380,7 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
     case WM_INSTALLER_DONE: installer_done((DWORD)wp); return 0;
+    case WM_PHONE: phone_message(wp, (WCHAR *)lp); return 0;
     case WM_LBUTTONDOWN: {
         const int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
         if (x < S(SB_W) && y >= S(NAV_TOP) && y < S(NAV_TOP + PAGE_COUNT * NAV_H))
@@ -1397,9 +1556,31 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR args, int show)
             return write_result(argv[3], cmd);
         }
         if (!wcscmp(argv[1], L"--capture")) {
-            capture_page = !wcscmp(argv[2], L"settings") ? PAGE_SETTINGS : !wcscmp(argv[2], L"setup") ? PAGE_SETUP : PAGE_PLAY;
+            capture_page = !wcscmp(argv[2], L"settings") ? PAGE_SETTINGS : !wcscmp(argv[2], L"setup") ? PAGE_SETUP
+                         : !wcscmp(argv[2], L"phone") ? PAGE_PHONE : PAGE_PLAY;
             capture_file = argv[3];
         }
+    }
+    /* Test aid: --adb-install <out file> - Install to phone without the window (the result in the file). */
+    if (argv && argc >= 3 && !wcscmp(argv[1], L"--adb-install")) {
+        WCHAR err[600] = L"";
+        int ok;
+        GetPrivateProfileStringW(L"Anthology", L"GameFolder", L"", s_game, MAX_PATH, s_ini);
+        ok = phone_install(phone_console, err, 600);
+        return write_result(argv[2], ok ? err : err[0] ? err : L"failed") || !ok;
+    }
+    /* Test aid: --phone-check <out file> - what Install to phone would need, without touching a phone. */
+    if (argv && argc >= 3 && !wcscmp(argv[1], L"--phone-check")) {
+        WCHAR apk[MAX_PATH], m[MAX_PATH], why[300], r[1200];
+        int game, xex, app, adb;
+        GetPrivateProfileStringW(L"Anthology", L"GameFolder", L"", s_game, MAX_PATH, s_ini);
+        game = check_game(s_game, why, 300);
+        xex = join(m, s_dir, L"Original\\default.xex") && anth_xex_ok(m);
+        app = phone_apk(apk);
+        adb = adb_find(s_dir, s_adb, MAX_PATH);
+        swprintf_s(r, 1200, L"game %d (%s)\r\nxex %d\r\napk %d (%s)\r\nadb %d (%s)", game, why, xex, app, apk, adb,
+                   adb ? s_adb : L"would download");
+        return write_result(argv[2], r) || !(game && xex && app);
     }
     /* (a test aid with too few arguments, or an unknown one: never the window) */
     if (argv && argc >= 2 && argv[1][0] == L'-' && argv[1][1] == L'-' && !capture_file)

@@ -35,6 +35,14 @@ NATIVE = PORT / "out" / "build" / "Android"
 OUT = PORT / "out" / "android"
 KEYSTORE = PORT / "android" / "svr2011.keystore"
 KEY_PASS = "svr2011"  # (not a secret: it only has to be the same key each build)
+# The SvR Anthology app (branch anthology, android/java/.../Flavor.java): its own app id, name, key and APK,
+# so it sits beside SvR 2011 on a phone.
+FLAVOR = PORT / "android" / "java" / "io" / "github" / "kaikoclanworth1" / "svr2011" / "Flavor.java"
+ANTHOLOGY = FLAVOR.exists() and "ANTHOLOGY = true" in FLAVOR.read_text(encoding="utf-8")
+if ANTHOLOGY:
+    KEYSTORE = PORT / "android" / "svr-anthology.keystore"
+APP_ID = "io.github.kaikoclanworth1.svranthology" if ANTHOLOGY else None
+APK_NAME = "SvR Anthology.apk" if ANTHOLOGY else "SvR2011.apk"
 
 
 def run(*args, **kw):
@@ -76,6 +84,9 @@ def main():
                     help="the debug / test suite (docs/DEBUG_SUITE_PLAN.md, tools/dev/svrtest_android.ps1): its own "
                          "build (out/build/DebugSuiteAndroid) and out/android-dbg/SvR2011-dbg.apk - never a release "
                          "(release_guard.ps1 refuses it)")
+    ap.add_argument("--assets-from", default="",
+                    help="an APK whose assets (shaders, drivers, button pictures) this one carries, in place of "
+                         "packing them here - the release APK of the same renderer")
     ap.add_argument("--version-code", type=int, default=0,
                     help="test installs on a player's phone: this version code (the installed one, so the "
                          "player's own APK can go back on - Android never downgrades a release app)")
@@ -97,8 +108,15 @@ def main():
 
     # Resources and manifest.
     run(BUILD_TOOLS / "aapt2.exe", "compile", "--dir", PORT / "android" / "res", "-o", OUT / "res.zip")
+    manifest = PORT / "android" / "AndroidManifest.xml"
+    if ANTHOLOGY:
+        text = manifest.read_text(encoding="utf-8")
+        assert 'android:label="SvR 2011"' in text
+        manifest = OUT / "AndroidManifest.xml"
+        manifest.write_text(text.replace('android:label="SvR 2011"', 'android:label="SVR Anthology"'),
+                            encoding="utf-8")
     run(BUILD_TOOLS / "aapt2.exe", "link", "-o", OUT / "base.apk", "-I", PLATFORM_JAR,
-        "--manifest", PORT / "android" / "AndroidManifest.xml",
+        "--manifest", manifest, *(["--rename-manifest-package", APP_ID] if APP_ID else []),
         "--version-name", version_name, "--version-code", str(version_code),
         "--min-sdk-version", "29", "--target-sdk-version", "36",
         *(["--debug-mode"] if args.debuggable else []), OUT / "res.zip")
@@ -152,6 +170,15 @@ def main():
     shaders = PORT / "runs" / "shaders_native"
     stage = OUT / "shaderpack"
     stage.mkdir()
+    if args.assets_from:
+        with zipfile.ZipFile(args.assets_from) as src:
+            for name in src.namelist():
+                if name.startswith("assets/") and not name.endswith("/"):
+                    dest = stage / "from" / name
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.write_bytes(src.read(name))
+                    assets.append((dest, name))
+        shaders = stage / "none"  # (the shaders, drivers and pictures come from that APK)
     # (.spvc: the compact-table build, for GPUs without descriptor indexing)
     for f in [*(shaders / "spirv").glob("*.spv"), *(shaders / "spirv").glob("*.spvc")]:
         if not f.name.startswith(("dbg_", "debug_")):
@@ -194,6 +221,10 @@ def main():
     else:
         print("warning: no pad_icons (tools/make_pad_icons.py) - Xbox button pictures only")
 
+    # (one file per name: with --assets-from, that APK's come first and stay)
+    seen = set()
+    assets = [(src, name) for src, name in assets if not (name in seen or seen.add(name))]
+
     with zipfile.ZipFile(OUT / "base.apk", "a", zipfile.ZIP_DEFLATED) as apk:
         apk.write(OUT / "classes.dex", "classes.dex")
         for name in libs:
@@ -208,7 +239,7 @@ def main():
             "-keyalg", "RSA", "-keysize", "2048", "-validity", "36500",
             "-storepass", KEY_PASS, "-keypass", KEY_PASS,
             "-dname", "CN=WWE SvR2011 PC port")
-    apk = OUT / ("SvR2011-dbg.apk" if args.debug_suite else "SvR2011.apk")
+    apk = OUT / ("SvR2011-dbg.apk" if args.debug_suite else APK_NAME)
     run(BUILD_TOOLS / "apksigner.bat", "sign", "--ks", KEYSTORE, "--ks-pass", f"pass:{KEY_PASS}",
         "--out", apk, OUT / "aligned.apk", env=env)
     for tmp in ("base.apk", "aligned.apk", "res.zip", "sources.txt", "classes.jar", "classes.dex"):

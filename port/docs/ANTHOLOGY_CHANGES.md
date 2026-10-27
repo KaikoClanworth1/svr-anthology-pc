@@ -24,8 +24,16 @@ lists it so it can be shown to him. Addresses are the original disc program's (h
 | A6 | His versions' pac lists: each of his eight programs (default.xex = SVR Anthology, defaultSVR07 / SVR08 / SVR09 / SVR10 / SVR11 / LOWM / DIVAS.xex) reads its own list, `pac\pliANTHO.h`, `pac\pliSVR07.h` ... (`_4x3.h` too) | the version chosen in the launcher (`anthology_version`): its name read from his program in his folder and put in the original's two strings (0x820306F3, 0x8203070B) at start-up | his folder: eight programs that differ in about 40 bytes |
 | A7 | His versions' system sound pack: `System.pck`, `SSVR07.pck` ... `SyLOWM.pck`, `SDIVAS.pck` | the same: the name from his program into the original's string 0x820356AC | (with A6) |
 | A8 | His versions' menu ids: 15 numbers in sub_825A6810 and sub_825AAB10 (the original disc's are SVR11's) | the two functions made at build time with the 15 from a table (tools/anthology_redo.py), filled from his chosen program at start-up | (with A6) |
-| A9 | sub_826533B0: a list on the stack for 206 entries (the original: 10) - its frame 928 → 4352 bytes, the clear 160 → 3296, the loop count 206 | the function made at build time with those four changes (tools/anthology_redo.py) | (found with A10) |
+| A9 | sub_826533B0: a list on the stack for 206 entries (the original: 10) - its frame 928 → 4352 bytes, the clear 160 → 3296, the loop count 206; and each id (from 50) is kept when it has a record (the plain lookup sub_828B53B8) instead of the original's record-and-available check (sub_828C1BD8) | the function made at build time with those changes (tools/anthology_redo.py) | (found with A10) |
 | A10 | sub_821E9700: an index read from an object (`lwz r7,64(r3)`) is always 0 (`li r7,0`) | the function made at build time with that line (tools/anthology_redo.py) | SvR 2007-2010, LOWM and Divas crashed loading a match: the original read past a table (a float as a pointer) |
+| A11 | sub_8245CB58: two checks removed (both branches to 0x8245CE88 are `nop` in his) | the function made at build time without them | a scan of instructions that change kind, not just a number (scratchpad opscan.py) |
+| A12 | sub_8245F1C0: an entry is skipped when its id is outside 0-49 - his own small function (1 for 0 ≤ id < 50) in place of the original's sub_8244C800(object, id) | the same test written into the function at build time | (scan); a tag match crashed until the call was seen to go to his code (callscan.py) |
+| A13 | Arenas: sub_824B8AB8 `== 3` → `>= 200`, sub_82776980 `!= 3` → `< 200`, and the word at 0x82DAB600 3 → 201 | the two functions at build time; the word set at start-up (anthology.cpp) | (scan) |
+| A14 | sub_82522450: mode `== 2` → `>= 2`, and that way builds mode 1's list (sub_825221F0) instead of the original's mode 2 list (sub_825222E0) | the function at build time | (scan, callscan.py) |
+| A15 | sub_825F9E68: an id of 100 or more takes the 50-59 way | the function at build time | (scan) |
+| A16 | sub_82734560: a call (sub_828B6950) replaced by 0 | the function at build time | (scan) |
+| A17 | sub_82331BE8: his jump over the original's 24 special ids (100, 101 ... 279), and the range 50-70 → 50-999 | the 24 branches left out and the compare changed at build time | (scan) |
+| A18 | sub_821B0EE8 / sub_821B0F18: two text ids swapped (0x8749 / 0x874D) | the two constants at build time | (scan) |
 
 The build also hides the main menu's Xbox LIVE row (no online in this version: anthology.cpp
 HideOnlineRows), which is the port's choice, not a change of his.
@@ -39,14 +47,14 @@ the game's own device calls (native_renderer.cpp NoteDevice).
 Changes found in his program that the port does not do, because nothing has needed them so far. Each
 waits for a test that shows it matters:
 
-- sub_824B8AB8, sub_82776980: a compare 3 → 200; the value at 0x82DAB600 3 → 201 (the same feature).
-- Other code changes of his (an instruction of another kind, not just a number): sub_8245CB58 (two
-  branches removed), sub_8245F1C0 (`lwz r3,272(r31)` → `mr r3,r29`, a condition turned round),
-  sub_82522450 (`beq` → `bge`), sub_825F9E68 (a limit of 100 added), sub_82734560 (a call replaced by
-  `li r3,0`), sub_82478B00 (a call of his own code).
-- The "Entrance FPS Switcher" programs in his @Alternate_Files (30 fps / 60 fps entrances): not compared yet.
-- sub_82331BE8, sub_82478C60: code of his own (a compare chain rewritten).
-- Two text ids swapped (0x8749 / 0x874D, sub_821B0EE8 / sub_821B0F18).
+- sub_82478B00: code of his own (a state 0-8 at +9584 stepped by his function at his 0x82479300, then 20
+  records 320 bytes apart at +3216 saved and restored by his code at his 0x82479400; scattered over
+  his 0x82479200-0x82479560). What it is for isn't known yet.
+- The "Entrance FPS Switcher" programs in his @Alternate_Files: not needed (the port has its own 60 fps
+  entrances setting).
+- Calls his program sends to other functions or to his own code are only partly checked: callscan.py
+  checks the redone functions; across the whole program most such differences are the later build's
+  (the compiler folds the same small functions differently).
 
 Many other differences come from the later build itself (compiler output: other registers, other
 addresses). They aren't his changes, and the port leaves them alone.

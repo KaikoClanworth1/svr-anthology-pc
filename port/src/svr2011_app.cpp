@@ -258,6 +258,14 @@ void Svr2011App::OnConfigurePaths(rex::PathConfig& paths) {
       std::exit(0);
     }
   }
+#else
+  // The SvR Anthology app (Android): the game folder holds Original/default.xex and Yumboy11's
+  // installed folder (the PC launcher's "Install to phone" puts both there).
+  if (svr2011::kAnthology && paths.game_data_root == exe_dir) {
+    const std::filesystem::path his = exe_dir / "WWE SmackDown vs Raw Anthology";
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(his / "default.xex", ec)) paths.game_data_root = his;
+  }
 #endif
   svr2011::SetGameDataFolder(paths.game_data_root);  // (anthology.h: the disc files the port reads itself)
   paths.user_data_root = exe_dir / "UserData";

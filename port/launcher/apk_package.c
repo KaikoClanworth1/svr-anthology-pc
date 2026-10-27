@@ -469,8 +469,13 @@ done:
 
 /* ── Install to phone (USB debugging, Google's adb) ─────────────────────── */
 
+#ifdef SVR2011_RC_ANTHOLOGY  /* (the SvR Anthology app: its own id and folder, beside SvR 2011's) */
+#define ADB_PACKAGE  L"io.github.kaikoclanworth1.svranthology"
+#define ADB_REMOTE   L"/storage/emulated/0/games/SVR Anthology"
+#else
 #define ADB_PACKAGE  L"io.github.kaikoclanworth1.svr2011"
 #define ADB_REMOTE   L"/storage/emulated/0/games/WWE SmackDown vs. Raw 2011"
+#endif
 #define ADB_CMD      32767
 #define ADB_OUT      16384
 
@@ -837,3 +842,189 @@ done:
     free(a.out);
     return ok;
 }
+
+#ifdef SVR2011_RC_ANTHOLOGY
+/* Adds local_root\rel (a file or a folder's tree) to p as prefix/rel, each file read from its own path. */
+static int add_tree(Pack *p, const WCHAR *local_root, const WCHAR *rel, const WCHAR *prefix)
+{
+    WCHAR path[MAX_PATH];
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    int i, first = p->n;
+    p->root = local_root;
+    swprintf_s(path, MAX_PATH, L"%s\\%s", local_root, rel);
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fa))
+        return 1;  /* (not there: nothing to copy) */
+    if (fa.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+        if (!add(p, rel, 0, &fa.ftLastWriteTime, 1) || !walk(p, rel))
+            return 0;
+    } else if (!add(p, rel, ((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow, &fa.ftLastWriteTime, 0)) {
+        return 0;
+    }
+    for (i = first; i < p->n; i++) {
+        Entry *e = &p->e[i];
+        WCHAR name[MAX_PATH], *c;
+        if (!e->dir) {
+            swprintf_s(e->src, MAX_PATH, L"%s\\%s", local_root, e->name);
+            for (c = e->src; *c; c++)
+                if (*c == L'/')
+                    *c = L'\\';
+        }
+        swprintf_s(name, MAX_PATH, L"%s%s", prefix, e->name);
+        wcscpy_s(e->name, MAX_PATH, name);
+    }
+    return 1;
+}
+
+#define ANTH_FOLDER L"WWE SmackDown vs Raw Anthology"
+
+int adb_install_anthology(const WCHAR *adb, const WCHAR *anthology_dir, const WCHAR *launcher_dir,
+                          const WCHAR *apk, volatile LONG *cancel, apk_progress_fn progress_fn, WCHAR *err, int errn)
+{
+    Adb a;
+    Pack p;
+    WCHAR line[512];
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    WCHAR pattern[MAX_PATH];
+    int i, ok = 0, has_game;
+    Entry *last[2] = { NULL, NULL };
+
+    memset(&a, 0, sizeof a);
+    memset(&p, 0, sizeof p);
+    a.adb = adb;
+    a.cancel = cancel;
+    a.cmd = (WCHAR *)malloc(ADB_CMD * sizeof(WCHAR));
+    a.out = (char *)malloc(ADB_OUT);
+    if (!a.cmd || !a.out) {
+        swprintf_s(err, errn, L"Out of memory.");
+        goto done;
+    }
+
+    progress_fn(0, L"Looking for the phone\x2026");
+    if (!adb_device(&a, err, errn))
+        goto done;
+
+    progress_fn(0, L"Installing the app on the phone\x2026");
+    adb_run(&a, L"shell am force-stop " ADB_PACKAGE);
+    if (adb_run(&a, L"install -r \"%s\"", apk) != 0 || !strstr(a.out, "Success")) {
+        last_line(a.out, line, 512);
+        if (strstr(a.out, "UPDATE_INCOMPATIBLE"))
+            swprintf_s(err, errn, L"The phone has SVR Anthology from a different build. Uninstall it on the phone "
+                                  L"(the game folder and saves stay) and try again.");
+        else if (*cancel)
+            swprintf_s(err, errn, L"Cancelled.");
+        else
+            swprintf_s(err, errn, L"The app did not install: %s", line);
+        goto done;
+    }
+    adb_run(&a, L"shell appops set " ADB_PACKAGE L" MANAGE_EXTERNAL_STORAGE allow");
+
+    /* A phone with the game already: the phone's saves stay (Saves is left out). */
+    has_game = adb_run(&a, L"shell ls '" ADB_REMOTE L"/Original/default.xex'") == 0;
+    p.update = has_game;
+    p.cancel = cancel;
+    p.progress = progress_fn;
+    p.last = -1;
+    progress_fn(0, L"Listing the Anthology's files\x2026");
+    /* His folder, one top-level entry at a time (his @Alternate_Files are for consoles: not copied). */
+    swprintf_s(pattern, MAX_PATH, L"%s\\*", anthology_dir);
+    h = FindFirstFileW(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        swprintf_s(err, errn, L"Could not read %s.", anthology_dir);
+        goto done;
+    }
+    {
+        WIN32_FILE_ATTRIBUTE_DATA fa;
+        if (GetFileAttributesExW(anthology_dir, GetFileExInfoStandard, &fa))
+            add(&p, ANTH_FOLDER, 0, &fa.ftLastWriteTime, 1);
+    }
+    do {
+        int dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..") || !_wcsicmp(fd.cFileName, L"@Alternate_Files"))
+            continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+            continue;
+        if (!dir) {
+            const WCHAR *ext = wcsrchr(fd.cFileName, L'.');
+            if (ext && (!_wcsicmp(ext, L".exe") || !_wcsicmp(ext, L".dll") || !_wcsicmp(ext, L".bat")))
+                continue;
+        }
+        if (!add_tree(&p, anthology_dir, fd.cFileName, ANTH_FOLDER L"/")) {
+            FindClose(h);
+            swprintf_s(err, errn, L"Out of memory listing the Anthology's files.");
+            goto done;
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    /* The launcher's folder: the original program, his saves and DLC as the launcher installed them. */
+    if (!add_tree(&p, launcher_dir, L"Original", L"") || !add_tree(&p, launcher_dir, L"DLC", L"") ||
+        (!has_game && !add_tree(&p, launcher_dir, L"Saves", L""))) {
+        swprintf_s(err, errn, L"Out of memory listing the files.");
+        goto done;
+    }
+    for (i = 0; i < p.n; i++) {
+        if (!_wcsicmp(p.e[i].name, L"Original/default.xex"))
+            last[0] = &p.e[i];
+        else if (!_wcsicmp(p.e[i].name, ANTH_FOLDER L"/default.xex"))
+            last[1] = &p.e[i];
+    }
+    if (!last[0] || !last[1]) {
+        swprintf_s(err, errn, !last[0] ? L"No Original\\default.xex beside the launcher: press PLAY once (it copies "
+                                         L"it from your ISO), then try again."
+                                       : L"%s has no default.xex: run Yumboy11's installer first.", anthology_dir);
+        goto done;
+    }
+    if (!has_game && adb_run(&a, L"shell df -k /storage/emulated/0") == 0) {
+        char *l2 = strchr(a.out, '\n');
+        unsigned long long blocks, used, avail;
+        if (l2 && sscanf_s(l2 + 1, "%*s %llu %llu %llu", &blocks, &used, &avail) == 3 &&
+            avail * 1024 < p.total + (512ull << 20)) {
+            swprintf_s(err, errn, L"The phone has %.1f GB free; SVR Anthology needs %.1f GB.",
+                       avail / 1048576.0, p.total / 1073741824.0);
+            goto done;
+        }
+    }
+    if (!make_folders(&a, &p, err, errn))
+        goto done;
+    {
+        Batch b;
+        memset(&b, 0, sizeof b);
+        b.a = &a;
+        b.p = &p;
+        b.files = (WCHAR *)malloc(ADB_CMD * sizeof(WCHAR));
+        if (!b.files) {
+            swprintf_s(err, errn, L"Out of memory.");
+            goto done;
+        }
+        b.files[0] = 0;
+        for (i = 0; i < p.n; i++) {
+            if (p.e[i].dir || &p.e[i] == last[0] || &p.e[i] == last[1])
+                continue;
+            if (!batch_add(&b, &p.e[i], launcher_dir, err, errn)) {
+                free(b.files);
+                goto done;
+            }
+        }
+        for (i = 1; i >= 0; i--)
+            if (!batch_push(&b, err, errn) || !batch_add(&b, last[i], launcher_dir, err, errn)) {
+                free(b.files);
+                goto done;
+            }
+        if (!batch_push(&b, err, errn)) {
+            free(b.files);
+            goto done;
+        }
+        free(b.files);
+    }
+
+    progress_fn(1000, L"Starting SVR Anthology on the phone\x2026");
+    adb_run(&a, L"shell am start -n " ADB_PACKAGE L"/io.github.kaikoclanworth1.svr2011.InstallActivity");
+    swprintf_s(err, errn, has_game ? L"updated" : L"installed");
+    ok = 1;
+done:
+    free(p.e);
+    free(a.cmd);
+    free(a.out);
+    return ok;
+}
+#endif

@@ -2666,9 +2666,12 @@ REX_HOOK_RAW(sub_82736E00) {
   ctx.r3.u64 = r3;
 }
 REX_EXTERN(__imp__sub_82734560);
+#ifdef SVR2011_ANTHOLOGY
+REX_EXTERN(anth_sub_82734560);
+#endif
 REX_HOOK_RAW(sub_82734560) {
   ModSortKeys(base, true);
-  __imp__sub_82734560(ctx, base);
+  SVR2011_IMP(sub_82734560)(ctx, base);  // (anthology.h)
   const auto r3 = ctx.r3.u64;
   ModSortKeys(base, false);
   ctx.r3.u64 = r3;

@@ -33,7 +33,8 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
 public class InstallActivity extends Activity {
-    static final String kFolderName = "WWE SmackDown vs. Raw 2011";
+    static final String kFolderName = Flavor.ANTHOLOGY ? "SVR Anthology" : "WWE SmackDown vs. Raw 2011";
+    static final String kAppName = Flavor.ANTHOLOGY ? "SVR Anthology" : "SvR 2011";
     static final String kPackageName = "SvR2011-Game.zip";
     static final String kTag = "SvR2011";
 
@@ -53,8 +54,16 @@ public class InstallActivity extends Activity {
     // storage when the game is there (an app moved to an SD card adopted as
     // internal storage: the shared storage stays on the full built-in memory).
     static File gameFolder() {
-        if (privateFolder_ != null && new File(privateFolder_, "default.xex").isFile()) return privateFolder_;
+        if (privateFolder_ != null && hasGame(privateFolder_)) return privateFolder_;
         return new File(new File(Environment.getExternalStorageDirectory(), "games"), kFolderName);
+    }
+
+    // A game folder with the game in it: default.xex - or for SVR Anthology the original program
+    // (Original/default.xex, from the player's ISO) and Yumboy11's installed folder beside it.
+    static boolean hasGame(File dir) {
+        if (!Flavor.ANTHOLOGY) return new File(dir, "default.xex").isFile();
+        return new File(dir, "Original/default.xex").isFile()
+            && new File(new File(dir, Flavor.kAnthologyData), "default.xex").isFile();
     }
 
     // An automated test's start (tools/phone_session.ps1, android_night.ps1): "args" or an SVR2011_* extra.
@@ -66,7 +75,7 @@ public class InstallActivity extends Activity {
     }
 
     static boolean installed() {
-        return new File(gameFolder(), "default.xex").isFile();
+        return hasGame(gameFolder());
     }
 
     // The package the launcher made, where the player may have copied it.
@@ -167,7 +176,7 @@ public class InstallActivity extends Activity {
             // Android 10: the old storage permission covers the games folder.
             if (checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
                     != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-                show("SvR 2011 keeps the game in the device's games folder:\n"
+                show(kAppName + " keeps the game in the device's games folder:\n"
                     + "games/" + kFolderName + "\n\nAllow access to files on the next screen.",
                     "Allow access", () -> requestPermissions(new String[] {
                         android.Manifest.permission.READ_EXTERNAL_STORAGE,
@@ -175,7 +184,7 @@ public class InstallActivity extends Activity {
                 return;
             }
         } else if (!Environment.isExternalStorageManager()) {
-            show("SvR 2011 keeps the game in the phone's games folder:\n"
+            show(kAppName + " keeps the game in the phone's games folder:\n"
                 + "games/" + kFolderName + "\n\nAllow access to all files on the next screen.",
                 "Allow access", () -> startActivity(new Intent(
                     Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
@@ -195,6 +204,14 @@ public class InstallActivity extends Activity {
                 next = new Intent(this, LauncherActivity.class);
             }
             startActivity(next);
+            finish();
+            return;
+        }
+        if (Flavor.ANTHOLOGY) {
+            // (the launcher's Setup tab: from the PC over USB, or the ISO and his folder copied to the phone)
+            Intent launcher = new Intent(this, LauncherActivity.class);
+            launcher.putExtra("tab", "Setup");
+            startActivity(launcher);
             finish();
             return;
         }

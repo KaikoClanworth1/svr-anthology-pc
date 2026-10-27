@@ -31,6 +31,11 @@ foreach ($f in @("nvngx_dlss.dll", "NVIDIA DLSS licence.txt")) {   # (DLSS, expe
     if (Test-Path (Join-Path $Base $f)) { Copy-Item (Join-Path $Base $f) $stage }
 }
 Copy-Item (Join-Path $port "dist\anthology\Read Me.txt") $stage
+# the Android app (tools/build_apk.py in this branch: the SvR Anthology app), for the launcher's Phone page
+$apk = Join-Path $port "out\android\SvR Anthology.apk"
+if (-not (Test-Path $apk)) { throw "$apk is missing - build the app first (tools\build_apk.py)" }
+New-Item -ItemType Directory -Force (Join-Path $stage "Android") | Out-Null
+Copy-Item $apk (Join-Path $stage "Android")
 # never: mods, the Mod Maker, the normal launcher / updater, the VC++ runtime, game files, Anthology files
 foreach ($bad in @("SvR2011 Launcher.exe", "SvR2011 Updater.exe", "SvR2011 Mod Maker.exe", "Mod Maker Tools", "Bundled Mods",
                    "default.xex", "pac", "Original", "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")) {
