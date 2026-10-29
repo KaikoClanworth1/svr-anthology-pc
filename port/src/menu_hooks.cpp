@@ -12,6 +12,7 @@
 #include "anthology.h"
 #include "frame_rate.h"
 #include "menu_hooks.h"
+#include "thread_cpu.h"
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -46,6 +47,8 @@
 #include "weapons_page.h"
 #include "discord_presence.h"
 #include "online.h"
+#include "caw_limits.h"
+#include "match_record.h"
 #include "match_types.h"
 #include "mystery_opponent.h"
 #include "superstar_mods.h"
@@ -353,6 +356,8 @@ void InstallMenuHooks(rex::memory::Memory* memory) {
   std::memcpy(memory->TranslateVirtual<char*>(g_weapons_label), l->weapons, n_weapons);
 }
 
+std::string GameString(PPCContext& ctx, uint8_t* base, uint32_t id) { return LabelText(ctx, base, id); }
+
 }  // namespace svr2011
 
 // String lookup: sub_82153EF8(manager, id) -> (r3) the string.
@@ -491,6 +496,7 @@ REX_HOOK_RAW(sub_82447210) {
       label = LabelText(ctx, base, it->second);
     REXLOG_INFO("[svr2011] menu select: {}{}group {:X} row {}{}", label, label.empty() ? "" : " (", group, cursor,
                 label.empty() ? "" : ")");
+    svr2011::LoadWatchMenuSelect(label.c_str());
     svr2011::TouchGameInMatch(false);  // (the touch controller's MENU layout)
     svr2011::SetFrameRateInMatch(false);  // (menus at 60 fps)
     svr2011::native::SetMatchScene(false);  // (wide screens: menus at 16:9)
@@ -577,12 +583,15 @@ REX_EXTERN(__imp__sub_823EEB98);
 REX_HOOK_RAW(sub_823EEB98) {
   svr2011::ArmMatchStart([] {
     REXLOG_INFO("[svr2011] match starts");
+    svr2011::NoteMatchLoading(false);  // (model_mem.cpp's load watch)
     svr2011::TouchGameInMatch(true);  // (the touch controller's MATCH layout)
     svr2011::native::SetMatchScene(true);  // (wide screens: full width)
     svr2011::SetDiscordScene(svr2011::DiscordScene::kMatch);
     svr2011::SetFrameRateInMatch(true);  // (the chosen frame rate)
     svr2011::MysteryOpponentReveal("the match runs");  // (mystery_opponent.h)
   });
+  svr2011::MatchRecordMatchLoads();  // (the match's rand() seed: match_record.h)
+  svr2011::NoteMatchLoading(true);    // (model_mem.cpp's load watch)
   __imp__sub_823EEB98(ctx, base);
 }
 

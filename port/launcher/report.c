@@ -658,8 +658,95 @@ int report_make(const WCHAR *game_dir, const WCHAR *version, WCHAR *out, int out
     return report_make_ex(game_dir, version, NULL, out, outn, logs, crashes);
 }
 
+/* The player's main save (with the "Include my main save" tick): save/SaveData.dat (story, Universe and Road to
+   WrestleMania progress, options), save/.info/SaveData.dat.header (the name the game finds it by) and
+   save/.universe/* (the mods' Universe data) - not the Created Superstars (*.cas), Paint Tool (*.pt, .paint,
+   .logos), highlight reels and replays, the online cache (.online) or backups. tools/report_save.py puts it in a
+   test user data (empties its Created Superstar records: their .cas files aren't sent). */
+static const WCHAR *const kMainSave[] = { L"SaveData.dat", L".info\\SaveData.dat.header" };
+
+static uint64_t main_save(Zip *z, const WCHAR *game_dir)
+{
+    WCHAR dir[MAX_PATH], path[MAX_PATH], pat[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    uint64_t total = 0;
+    int i;
+    saves_dir(game_dir, dir, MAX_PATH);
+    for (i = 0; i < 2; i++) {
+        size_t size = 0;
+        uint8_t *d;
+        char name[260];
+        swprintf_s(path, MAX_PATH, L"%s\\%s", dir, kMainSave[i]);
+        if (!(d = read_file(path, &size, 32u << 20)))
+            continue;
+        snprintf(name, sizeof name, "save/%ls", kMainSave[i]);
+        for (char *q = name; *q; q++) if (*q == '\\') *q = '/';
+        if (z) zip_add(z, name, d, size);
+        total += size;
+        free(d);
+    }
+    swprintf_s(pat, MAX_PATH, L"%s\\.universe\\*", dir);
+    if ((h = FindFirstFileW(pat, &fd)) != INVALID_HANDLE_VALUE) {
+        do {
+            size_t size = 0;
+            uint8_t *d;
+            char name[260];
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                continue;
+            swprintf_s(path, MAX_PATH, L"%s\\.universe\\%s", dir, fd.cFileName);
+            if (!(d = read_file(path, &size, 8u << 20)))
+                continue;
+            snprintf(name, sizeof name, "save/.universe/%ls", fd.cFileName);
+            if (z) zip_add(z, name, d, size);
+            total += size;
+            free(d);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    return total;
+}
+
+uint64_t report_main_save_size(const WCHAR *game_dir)
+{
+    return main_save(NULL, game_dir);
+}
+
+/* A recorded match's files (logs\matches\<name>\, a handful, under 5 MB) as match/<name>/... */
+static void add_match(Zip *z, const WCHAR *match_dir)
+{
+    WCHAR pat[MAX_PATH], path[MAX_PATH];
+    const WCHAR *name = wcsrchr(match_dir, L'\\');
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    name = name ? name + 1 : match_dir;
+    swprintf_s(pat, MAX_PATH, L"%s\\*", match_dir);
+    if ((h = FindFirstFileW(pat, &fd)) == INVALID_HANDLE_VALUE)
+        return;
+    do {
+        char zname[260];
+        size_t size = 0;
+        uint8_t *d;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            continue;
+        swprintf_s(path, MAX_PATH, L"%s\\%s", match_dir, fd.cFileName);
+        if (!(d = read_file(path, &size, 8u << 20)))
+            continue;
+        snprintf(zname, sizeof zname, "match/%ls/%ls", name, fd.cFileName);
+        zip_add(z, zname, d, size);
+        free(d);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
 int report_make_ex(const WCHAR *game_dir, const WCHAR *version, const char *description, WCHAR *out, int outn,
                    int *logs, int *crashes)
+{
+    return report_make_match(game_dir, version, description, NULL, 0, out, outn, logs, crashes);
+}
+
+int report_make_match(const WCHAR *game_dir, const WCHAR *version, const char *description, const WCHAR *match_dir,
+                      int with_save, WCHAR *out, int outn, int *logs, int *crashes)
 {
     WCHAR dir[MAX_PATH], sub[MAX_PATH];
     SYSTEMTIME st;
@@ -687,7 +774,8 @@ int report_make_ex(const WCHAR *game_dir, const WCHAR *version, const char *desc
                   "made: %04d-%02d-%02d %02d:%02d:%02d\r\n"
                   "contents: the newest game logs (logs/), crash reports (crashes/), svr2011.toml "
                   "(account token and password removed), saves_check.txt (the Created Superstar saves' "
-                  "checksums, not the saves) and mods_text.txt (the superstar mods' text files); "
+                  "checksums, not the saves), mods_text.txt (the superstar mods' text files), with its tick save/ "
+                  "(the main save SaveData.dat - no Created Superstars or Paint Tool); "
                   "IP addresses blanked (x.x.x.x)\r\n",
                   version, os.dwMajorVersion, os.dwMinorVersion, os.dwBuildNumber, st.wYear, st.wMonth, st.wDay,
                   st.wHour, st.wMinute, st.wSecond);
@@ -708,11 +796,16 @@ int report_make_ex(const WCHAR *game_dir, const WCHAR *version, const char *desc
     }
     swprintf_s(sub, MAX_PATH, L"%s\\logs", game_dir);
     *logs = add_logs(&z, sub, 16u << 20);
+    add_newest(&z, sub, L"matchbox_*.txt", 3, "logs", 1u << 20);  /* (the last matches' black boxes: match_box.h) */
     swprintf_s(sub, MAX_PATH, L"%s\\UserData\\crashes", game_dir);
     *crashes = add_newest(&z, sub, L"crash_*.txt", 3, "crashes", 1u << 20);
     add_settings(&z, game_dir);
     add_saves_check(&z, game_dir);
     add_mods_text(&z, game_dir);
+    if (match_dir && match_dir[0])
+        add_match(&z, match_dir);
+    if (with_save)
+        main_save(&z, game_dir);
     zip_finish(&z);
     fclose(z.f);
     return 1;

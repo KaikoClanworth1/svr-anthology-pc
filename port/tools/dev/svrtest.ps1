@@ -13,6 +13,8 @@
 #   svrtest.ps1 script <file> [--shot ..] [--quit ..]                        (script_input.h steps, one a line)
 # common: --exe release|dbg|<path>  --backend d3d12|vulkan|d3d11  --mods none|<folder>[,<folder>...]
 #         --userdata <dir>  --perf 0|1|2  --log-level info|debug  --name <run name>  --keep (leave it running)
+#         --fresh (the user data may have no save: a first-start test - else svrtest refuses one without
+#         Saves\SaveData.dat, the game would sit in its first-time screens)
 #         --arg "<game option>" (more of the game's --options, repeatable)
 #
 # Each run: refuses when the player's game runs or 4 test games already do (any chat); refreshes the private
@@ -53,7 +55,7 @@ public static class SvrTestWin {
 
 # ---- options
 $o = @{ p = @{}; exe = "release"; backend = ""; mods = "none"; perf = ""; loglevel = "info"; name = ""; keep = $false; args = @()
-        attire = ""; arena = ""; rule = ""; entrances = $false; shot = @(); every = ""; until = ""; quit = ""; userdata = ""; target = ""; state = @(); fast = ""; boot = $false; cpu = "" }
+        attire = ""; arena = ""; rule = ""; entrances = $false; shot = @(); every = ""; until = ""; quit = ""; userdata = ""; target = ""; state = @(); fast = ""; boot = $false; cpu = ""; fresh = $false }
 for ($i = 0; $i -lt $Rest.Count; $i++) {
     $a = $Rest[$i]; $v = if ($i + 1 -lt $Rest.Count) { $Rest[$i + 1] } else { "" }
     switch -regex ($a) {
@@ -69,6 +71,7 @@ for ($i = 0; $i -lt $Rest.Count; $i++) {
         '^--state$' { $o.state += $v; $i++; continue }
         '^--fast$' { $o.fast = $v; $i++; continue }
         '^--boot$' { $o.boot = $true; continue }
+        '^--fresh$' { $o.fresh = $true; continue }
         '^--cpu$' { $o.cpu = $v; $i++; continue }
         '^--exe$' { $o.exe = $v; $i++; continue }
         '^--backend$' { $o.backend = $v; $i++; continue }
@@ -173,6 +176,13 @@ $udFull = [IO.Path]::GetFullPath($userdata).TrimEnd('\')
 if ($udFull.StartsWith([IO.Path]::GetFullPath($gameFiles).TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)) { throw "svrtest: --userdata is inside Game Files - use a private copy" }
 $dlc = Join-Path $userdata "0000000000000000"
 if ((Test-Path $dlc) -and (Get-Item -LiteralPath $dlc -Force).LinkType) { throw "svrtest: $dlc is a link - give the test user data a private DLC copy" }
+# a user data with no save starts the game's first-time screens: no route gets past them ("fast start: gave up
+# skipping") - a worktree's own runs\univ_userdata is empty until one is copied in
+if (-not $o.fresh -and -not (Test-Path (Join-Path $userdata "Saves\SaveData.dat"))) {
+    throw ("svrtest: $userdata has no Saves\SaveData.dat - the game would stop at its first-time screens. Copy a test " +
+           "save in (real copies, not links): e.g. robocopy <main>\port\runs\test_userdata_thd\Saves and its " +
+           "0000000000000000 (the DLC) into it, or pass --userdata <a test user data>; --fresh for a first-start test")
+}
 # a tripwire: what the game patches at start, in Game Files, before the run (compared in result.json)
 $watched = @("pac\string.pac", "pac\menu\menu.pac") | ForEach-Object { Join-Path $gameFiles $_ } | Where-Object { Test-Path $_ }
 $watchedTimes = @{}; foreach ($w in $watched) { $watchedTimes[$w] = (Get-Item $w).LastWriteTimeUtc }
@@ -188,11 +198,16 @@ Set-Content $inputFile "" -NoNewline
 $env:SVR2011_INPUT_FILE = $inputFile
 $env:SVR2011_USER_DATA = $userdata
 $env:SVR2011_MUSIC = Join-Path $root "music"
+$env:SVR2011_AUDIO_MUTE = "1"  # (the game mutes even if its command line is lost: svr2011_app.cpp OnPreSetup)
 $env:SVR2011_MOVIES = Join-Path $root "movies"
 $env:SDL_WINDOW_ACTIVATE_WHEN_SHOWN = "0"; $env:SDL_WINDOW_ACTIVATE_WHEN_RAISED = "0"
 $env:SVR2011_NATIVE_WINDOW_POS = "-2600,0"
 foreach ($v in "SVR2011_TEST_MATCH", "SVR2011_TEST_RULE", "SVR2011_NATIVE_SHADERS") { [Environment]::SetEnvironmentVariable($v, $null, "Process") }
 $steps = @()
+if ($Command -eq "script" -and $o.p[1]) {  # (a script's "route match" with these people: test_match.cpp)
+    $env:SVR2011_TEST_MATCH = "people=" + (@(1..6 | Where-Object { $o.p[$_] } | ForEach-Object { $o.p[$_] }) -join ",") + " arena=" + $(if ($o.arena) { $o.arena } else { "1" })
+    if ($o.rule) { $env:SVR2011_TEST_RULE = $o.rule -replace '^0x', '' }
+}
 if ($Command -in "match", "entrance") {
     $people = @(1..6 | Where-Object { $o.p[$_] } | ForEach-Object { $o.p[$_] })
     if ($people.Count -lt 2 -and $Command -eq "match") { throw "svrtest match: --p1 and --p2 at least" }
@@ -212,6 +227,13 @@ if ($Command -in "match", "entrance") {
 } else {
     if (-not $o.target -or -not (Test-Path $o.target)) { throw "svrtest script <file>" }
     $steps = @(Get-Content $o.target)
+}
+# the test folder's settings file: muted, no keyboard / mouse - so even a game whose --options were all dropped
+# (a flag named twice) stays silent and leaves the player's mouse alone
+$toml = Join-Path $game "svr2011.toml"
+if (Test-Path $toml) {
+    $lines = @(Get-Content $toml | Where-Object { $_ -notmatch '^\s*(audio_mute|mnk_mode)\s*=' })
+    [IO.File]::WriteAllLines($toml, [string[]]($lines + @("audio_mute = true", "mnk_mode = false")))
 }
 $gameArgs = @("--log_file=`"$log`"", "--log_level=$($o.loglevel)", "--audio_mute=true", "--fullscreen=false", "--monitor=2",
               "--mnk_mode=false", "--p2p_port_mapping=false", "--p2p_port=$p2p")
@@ -247,11 +269,20 @@ if ($gameCues) {
     if ($o.quit) { $gameArgs += "--dbg_quit=$((Seconds $o.quit).ToString($inv))" }
 }
 if ($Command -eq "open") { $gameArgs += "--dbg_boot=`"$($o.target)`"" }
-$gameArgs += $o.args
+# (--arg: an option svrtest sets already is replaced - the game's parser drops every --option of a command line that
+# names one twice, --audio_mute=true with them: 27 Oct a test game was heard; --audio_mute stays true)
+foreach ($x in $o.args) {
+    $nm = ($x -replace '^(--[^=]+).*$', '$1')
+    if ($nm -eq "--audio_mute" -or $nm -eq "--no-audio_mute") { Write-Host "svrtest: --arg $x ignored - test games stay muted"; continue }
+    $gameArgs = @($gameArgs | Where-Object { ($_ -replace '^(--[^=]+).*$', '$1') -ne $nm })
+    $gameArgs += $x
+}
 
 # ---- run
 $t0 = Get-Date
+Use-SvrTestServer -GameDir $game -GameArgs $gameArgs | Out-Null
 $proc = Start-Process (Join-Path $game $exeName) -WorkingDirectory $game -ArgumentList $gameArgs -PassThru -WindowStyle Minimized
+Set-SvrTestPriority $proc
 for ($t = 0; $t -lt 100 -and -not $proc.HasExited; $t++) { $proc.Refresh(); if ($proc.MainWindowHandle -ne 0) { break }; Start-Sleep -Milliseconds 100 }
 if ($proc.MainWindowHandle -ne 0) {
     [void][SvrTestWin]::SetWindowPos($proc.MainWindowHandle, [IntPtr]1, $SvrParkX, 0, 0, 0, $SvrParkFlags)

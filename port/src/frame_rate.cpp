@@ -24,6 +24,8 @@
 // extra ones repeat the controller reading and leave the characters' job to
 // the frame's last update (below). Online lockstep: one update a frame.
 #include "frame_rate.h"
+#include "match_box.h"
+#include "match_record.h"
 #include "match_diag.h"
 #include "free_cam.h"
 #include "thread_cpu.h"
@@ -36,6 +38,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <map>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -62,10 +65,13 @@
 #include "generated/default/svr2011_init.h"
 #include "jukebox.h"
 #include "match_types.h"
+#include "rtwm_streak.h"
 #include "native/native_renderer.h"
 #include "online_overlay.h"
 #include "online_rules.h"
 #include "players.h"
+#include "android_perf.h"
+#include "mem_trace.h"
 #include "superstar_mods.h"
 #if SVR2011_DEBUG_SUITE
 #include "debug_suite/debug_suite.h"
@@ -210,11 +216,24 @@ namespace {
 Clock::time_point g_world_last;
 double g_world_acc = 0;  // 60 Hz ticks of real time not yet run
 int g_world_ticks = 1;   // update passes this frame
+int g_world_passes = 1;  // (the passes run: 0 while the free camera holds the match)
 
 constexpr int kMaxTicks = 2;  // (below 30 fps the game slows down rather than racing: 3-4 updates a frame - a
                                // window in the background, tabbing out - crashed a worker thread, sub_8281F5F0)
 
 uint32_t G32(uint8_t* base, uint32_t a) { return Rd32(base + a); }
+
+}  // namespace
+
+int svr2011::WorldPassesThisFrame() { return g_world_passes; }
+
+bool svr2011::GuestReadable(uint32_t a) {
+  if (!g_memory) return false;
+  auto* heap = g_memory->LookupHeap(a);
+  return heap && heap->QueryRangeAccess(a, a + 3) != rex::memory::PageAccess::kNoAccess;
+}
+
+namespace {
 void P32(uint8_t* base, uint32_t a, uint32_t v) { Wr32(base + a, v); }
 
 // What the world update is running: a watchdog logs it when the update is
@@ -431,7 +450,20 @@ void TestMatchTime(uint8_t* base) {
 // this frame runs (at least one).
 REX_EXTERN(__imp__sub_8269D768);
 REX_HOOK_RAW(sub_8269D768) {
+  svr2011::PerfHintThread();  // (android_perf.h: the world update's thread in the phone's hint session)
   if (!g_kernel) g_kernel = REX_KERNEL_STATE();  // (for the stuck-update thread dump)
+  // Test aid: SVR2011_TEST_GUEST_FAULT=<seconds> - that long after the first world update, one write to guest
+  // address 0 (unmapped: a fault no handler takes) - proves guest_faults.cpp: one log line with the place, then a
+  // crash report and the game closes (Android: no endless retry).
+  static const int fault_secs = [] { const char* v = std::getenv("SVR2011_TEST_GUEST_FAULT"); return v ? std::atoi(v) : 0; }();
+  if (fault_secs > 0) {
+    static const auto first = std::chrono::steady_clock::now();
+    if (std::chrono::steady_clock::now() - first >= std::chrono::seconds(fault_secs)) {
+      REXLOG_WARN("frame rate: SVR2011_TEST_GUEST_FAULT - writing guest address 0 now");
+      rex::FlushLogging();
+      *reinterpret_cast<volatile uint32_t*>(base) = 0x0DEFACED;
+    }
+  }
   // Test aid: SVR2011_TEST_SLOW_MS=<ms> - a slow PC (each frame that much longer).
   static const int slow_ms = [] { const char* v = std::getenv("SVR2011_TEST_SLOW_MS"); return v ? std::atoi(v) : 0; }();
   // (SVR2011_TEST_SLOW_IN_MATCH=1: only while a match runs - the menus at speed for the scripted route)
@@ -452,6 +484,7 @@ REX_HOOK_RAW(sub_8269D768) {
 #if SVR2011_DEBUG_SUITE
   if (const int n = svr2011::dbg::SpeedTicks(); n && !g_lockstep) g_world_ticks = n, g_world_acc = 0;  // (dbg_speed)
 #endif
+  if (const int n = svr2011::MatchReplayPasses(); n > 0) g_world_ticks = n, g_world_acc = 0;  // (a replay: as recorded)
   // 30 fps at 60 Hz (SetHalfFrames): while frames take two updates (a PC that
   // can't keep 60 Hz) every frame is shown - as 30 fps did before - and every
   // other one again once it keeps up (a running average of the updates).
@@ -470,6 +503,7 @@ REX_HOOK_RAW(sub_8269D768) {
     }
   }
   svr2011::HctpBeforeFrame(base);  // (match_types.h: a door's placements held)
+  svr2011::RtwmBeforeFrame(base);  // (rtwm_streak.h: test aids)
   __imp__sub_8269D768(ctx, base);
 #if SVR2011_DEBUG_SUITE
   svr2011::dbg::BootFrame(ctx, base);  // (dbg_boot: debug_suite.h)
@@ -509,6 +543,7 @@ REX_HOOK_RAW(sub_8269C728) {
   JobEv('F', uint32_t(g_world_ticks));
   // (free camera F8: the match held - no update passes, the frame drawn as it was; free_cam.h)
   const int passes = svr2011::FreeCamPaused() && !g_lockstep && svr2011::InMatch() ? 0 : g_world_ticks;
+  g_world_passes = passes;
   for (int i = 0; i < passes; ++i) {
     g_dbg_pass_now = 10 + i;
     g_dbg_pass = 10 + i;
@@ -617,7 +652,7 @@ REX_HOOK_RAW(sub_8269C728) {
             dumped_for = g_dbg_since.load();
             DumpGuestThreads(g_base);
             DumpJobEvents();
-            if (g_in_match.load()) svr2011::LogMatchState(g_base, "world update stuck");
+            if (g_in_match.load()) svr2011::LogMatchState(g_base, "world update stuck"), svr2011::MatchBoxLog("world update stuck");
           }
         }
       }
@@ -757,6 +792,10 @@ REX_HOOK_RAW(sub_82905058) {
     svr2011::OnlineRulesPad(b);  // (LB / RB: the PORT RULES row - online_rules.h)
   }
   if (out && ctx.r3.u32 == 0) svr2011::PadIconsInput(user, base + out);  // (who pressed last: pad_icons.h)
+  if (out) {  // (a replay: the recording's pad this frame - match_record.h)
+    uint32_t result = ctx.r3.u32;
+    if (svr2011::MatchReplayPad(user, result, base + out)) ctx.r3.u64 = result;
+  }
   if (r && out) {
     r->valid = true;
     r->result = ctx.r3.u32;
@@ -766,6 +805,7 @@ REX_HOOK_RAW(sub_82905058) {
                                                              (base[out + 7] > 0x40 ? 0x800 : 0))
                                                 : 0);  // (arena_mods.h: LB/RB, LT/RT as 0x400/0x800)
     if (user == 0) svr2011::CheckModProfiles(base);  // (superstar_mods.h)
+    svr2011::MatchRecordPad(user, ctx.r3.u32, base + out);  // (the match's inputs.bin: match_record.h)
   }
 }
 
@@ -1149,11 +1189,53 @@ void LatencyOnPublish() {
 // noted, and a free (operator delete: sub_8269B2D0(ptr, ?)) of a block
 // holding a pending type-24 command's object turns that command into type 0
 // (nothing). The free itself is made as always.
+namespace {
+uint32_t g_queue = 0;  // (the queue: its buffers and size read by sub_826DFFA0's hook)
+std::atomic<uint32_t> g_queue_peak{0};  // (the fullest thread part since RenderQueuePeakTake, %)
+}  // namespace
 REX_EXTERN(__imp__sub_826DFFA0);
 REX_HOOK_RAW(sub_826DFFA0) {
+  const uint32_t queue = ctx.r3.u32, desc = ctx.r4.u32;
   __imp__sub_826DFFA0(ctx, base);
+  if (!ctx.r3.u32) {  // (a thread's part of the buffer full: the caller writes to the 0 - logged)
+    static std::atomic<uint32_t> full{0};
+    if (const uint32_t n = ++full; n <= 5)
+      REXLOG_WARN("frame rate: render command queue {:08X} full ({} units a buffer, a command of {} units)", queue,
+                  Rd32(base + queue + 20), desc ? Rd32(base + desc + 8) + 1 : 0);
+  }
+  // (how full the buffer gets in a match: its record 0 - +0 buffer, +4 units used, +8 units - every 64th command;
+  // in menus and loads the records are laid out otherwise)
+  static std::atomic<uint32_t> calls{0};
+  if (queue == g_queue && ((++calls & 63) == 0 || !ctx.r3.u32) && svr2011::InMatch()) {
+    const uint32_t rec = Rd32(base + queue + 76);
+    const uint32_t used = rec ? Rd32(base + rec + 4) : 0, cap = rec ? Rd32(base + rec + 8) : 0;
+    if (cap) {
+      const uint32_t pct = uint32_t(std::min<uint64_t>(uint64_t(used) * 100 / cap, 100));
+      for (uint32_t was = g_queue_peak.load(); pct > was && !g_queue_peak.compare_exchange_weak(was, pct);) {
+      }
+      static std::atomic<uint32_t> step{0};  // (a new 10% step of the run: logged)
+      if (uint32_t was = step.load(); pct / 10 > was && step.compare_exchange_strong(was, pct / 10))
+        REXLOG_INFO("frame rate: render command queue {}% full in a match ({} of {} units)", pct, used, cap);
+    }
+  }
   if (ctx.r3.u32 && std::this_thread::get_id() == g_logic_thread.load() && g_frame_commands.size() < 100000)
     g_frame_commands.push_back(ctx.r3.u32);
+}
+
+uint32_t svr2011::RenderQueuePeakTake() { return g_queue_peak.exchange(0); }
+
+// The queue is made once (sub_826DF610, from sub_82578B80): r8 = its 16-byte units per buffer (393,216 on PC - 6 MB
+// a buffer; two buffers, +40 / +44). In a match record 0 (+76) is the whole buffer, at times the buffer is split in
+// 30,720-unit thread parts; a command takes one or more units. An arena with too many meshes ran a part full in a 6-man
+// (27 Oct: bg16 x5, 1,770 meshes; the caller wrote to the 0 it got - sub_826DE130 / sub_826DE0A8): the Mod Maker's and
+// the converters' mesh cap (svrfmt/arena.h kMaxArenaMeshesNew) keeps arenas under it. (A 3x buffer didn't help: the
+// parts stay 30,720 units.) Logged: its size, how full it gets in a match (sub_826DFFA0's hook).
+REX_EXTERN(__imp__sub_826DF610);
+REX_HOOK_RAW(sub_826DF610) {
+  const uint32_t q = ctx.r3.u32;
+  __imp__sub_826DF610(ctx, base);
+  g_queue = q;
+  REXLOG_INFO("frame rate: render command queue {:08X}: {} units per buffer", q, Rd32(base + q + 20));
 }
 
 // And where the render thread runs them (sub_826E02A8(?, command)): a
@@ -1193,6 +1275,7 @@ REX_HOOK_RAW(sub_826E02A8) {
 REX_EXTERN(__imp__sub_8269B2D0);
 REX_HOOK_RAW(sub_8269B2D0) {
   const uint32_t ptr = ctx.r3.u32;
+  if (svr2011::MemTraceOn()) svr2011::MemTraceDelete(ptr, uint32_t(ctx.lr));  // (test aid: mem_trace.h)
   if (svr2011::CawHeapFree(ptr)) return;  // (a CAW editor part from the fallback memory: caw_limits.h)
   if (ptr && !g_frame_commands.empty() && std::this_thread::get_id() == g_logic_thread.load()) {
     constexpr uint32_t kWithin = 0x4000;  // (the object: at or just after the block's start)
@@ -1271,6 +1354,7 @@ struct PinGuard {
   uint32_t start = 0;   // (match frame the referee's count motion began)
   bool broken = false;  // (the count dropped to 0: the timing rules)
   uint32_t motions = 0; // (the pinner's and his opponent's motions at the start)
+  int32_t voiced = 0;   // (the count the judge last called out: its +104 after the judge ran)
 };
 int32_t CountAt(uint32_t frames) { return frames >= 210 ? 3 : frames >= 140 ? 2 : frames >= 78 ? 1 : 0; }
 PinGuard g_pin;
@@ -1369,10 +1453,16 @@ REX_HOOK_RAW(sub_822446E0) {
       }
       g_pin.count = std::max(g_pin.count, CountAt(into));
       Wr32(base + judge + 100, uint32_t(g_pin.count));
+      // The lost step also takes the count the judge last called out (+104) back to 0, every update: with only
+      // +100 put back the judge saw a new count each update and said "two" again and again until the 3 - the
+      // loud repeating 2-count (report 2026-10-24: up to ~70 times at a lost 2). So the count already called
+      // out goes back too: the judge speaks only when the count goes up.
+      if (g_pin.voiced > 0) Wr32(base + judge + 104, uint32_t(std::min(g_pin.voiced, g_pin.count)));
     }
   }
   if (!LostTraceOn()) {
     __imp__sub_822446E0(ctx, base);
+    if (g_pin.judge == judge) g_pin.voiced = int32_t(Rd32(base + judge + 104));
     PinCountLog(base, judge, pinner, pin_on, frame);
     return;
   }
@@ -1384,8 +1474,20 @@ REX_HOOK_RAW(sub_822446E0) {
                 Rd32(base + judge + 116), Rd32(base + judge + 112), Rd32(base + pinner + 212),
                 ref ? Rd32(base + ref + 212) : 0, frame, g_extra_update ? " (extra update)" : "");
   __imp__sub_822446E0(ctx, base);
+  if (g_pin.judge == judge) g_pin.voiced = int32_t(Rd32(base + judge + 104));
   CheckLost(base, before, "sub_822446E0", lr);
   PinCountLog(base, judge, pinner, pin_on, frame);
+}
+// Problem reports: each count voice the pin judge plays (sub_82165AD8 called from sub_822446E0, its id
+// 0x20000 + count - 30863 / 30866) - a repeated "two" shows as repeated lines (200 a session).
+REX_EXTERN(__imp__sub_82165AD8);
+REX_HOOK_RAW(sub_82165AD8) {
+  static int lines = 0;
+  if (const uint32_t lr = uint32_t(ctx.lr); lr >= 0x822446E0 && lr < 0x82244C30 && lines < 200 && ++lines)
+    REXLOG_INFO("pin voice {:X} (count {} or {} by its bank), frame {}{}", ctx.r4.u32,
+                int32_t(ctx.r4.u32) - 0x20000 + 30863, int32_t(ctx.r4.u32) - 0x20000 + 30866,
+                Rd32(base + kMatchFrames), g_extra_update ? " (extra update)" : "");
+  __imp__sub_82165AD8(ctx, base);
 }
 SVR2011_LOST_TRACE(sub_82245DF8)
 SVR2011_LOST_TRACE(sub_82243660)

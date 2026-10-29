@@ -6,6 +6,7 @@
 #include "anthology.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
@@ -39,6 +40,7 @@
 #include "weapon_mods.h"
 #include "caw_logos.h"
 #include "paint_pages.h"
+#include "crowd_fight.h"
 #include "match_types.h"
 #include "online_rules.h"
 #include "port_map.h"
@@ -54,9 +56,12 @@
 #include "crowd_signs.h"
 #include "hd_movies.h"
 #include "media_mods.h"
+#include "vs_styles.h"
 #include "frame_rate.h"
+#include "guest_faults.h"
 #include "perf_hooks.h"
 #include "crash_report.h"
+#include "match_box.h"
 #include "dlc.h"
 #include "fps_overlay.h"
 #include "perf_stats.h"
@@ -76,6 +81,9 @@
 #include "keyboard_typing.h"
 #include "free_cam.h"
 #include "gpu_probe.h"
+#if SVR2011_DLSS
+#include "native/dlss.h"
+#endif
 #include "platform.h"
 #include "script_input.h"
 #include "touch_controls.h"
@@ -94,6 +102,7 @@
 #include "leaderboards.h"
 #include "online_mods.h"
 #include "online_chat.h"
+#include "mod_transfer.h"
 #include "p2p.h"
 #include "universe_mods.h"
 #include "universe_welcome.h"
@@ -211,6 +220,93 @@ std::string JoinBrokenTomlStrings(const std::string& text) {
   return out;
 }
 
+// A settings file's top-level `key = word` lines with the word not quoted
+// (true / false / inf / nan and numbers aside) quoted: 2.1.5's GRAPHICS ->
+// UPSCALING wrote native_upscale = off, not TOML - the file didn't parse and
+// every setting was back at its default at each start (VIBRATION off came
+// back on). As the Android launcher's GameSettings.Repaired.
+std::string QuoteBareTomlWords(const std::string& text, std::string* keys) {
+  const auto word = [](char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; };
+  std::string out;
+  bool section = false;
+  for (size_t pos = 0; pos <= text.size();) {
+    size_t nl = text.find('\n', pos);
+    if (nl == std::string::npos) nl = text.size();
+    std::string line = text.substr(pos, nl - pos);
+    const bool last = nl == text.size();
+    pos = nl + 1;
+    const bool cr = !line.empty() && line.back() == '\r';
+    if (cr) line.pop_back();
+    const size_t a = line.find_first_not_of(" \t");
+    const size_t eq = line.find('=');
+    if (a != std::string::npos && line[a] == '[') section = true;
+    if (!section && a != std::string::npos && line[a] != '#' && eq != std::string::npos && eq > a) {
+      std::string key = line.substr(a, eq - a), value = line.substr(eq + 1);
+      key.erase(key.find_last_not_of(" \t") + 1);
+      value.erase(0, value.find_first_not_of(" \t"));
+      value.erase(value.find_last_not_of(" \t") + 1);
+      const bool key_ok = !key.empty() && std::all_of(key.begin(), key.end(), word);
+      const bool bare = !value.empty() && (std::isalpha(static_cast<unsigned char>(value[0])) || value[0] == '_') &&
+                        std::all_of(value.begin(), value.end(),
+                                    [&](char c) { return word(c) || c == '.' || c == '-'; });
+      if (key_ok && bare && value != "true" && value != "false" && value != "inf" && value != "nan") {
+        line = key + " = \"" + value + "\"";
+        if (keys) *keys += (keys->empty() ? "" : ", ") + key;
+      }
+    }
+    out += line;
+    if (!last) out += cr ? "\r\n" : "\n";
+  }
+  return out;
+}
+
+// A settings file's top-level lines TOML can't read - no `=` (a file cut off
+// mid-line: "render_sc") or nothing after it - turned into comments: one such
+// line made the whole file unreadable, every setting back at its default at
+// each start (release test S5, 27 Oct). Lines inside a value over several lines
+// (an array or a """ string) are left alone.
+std::string SetAsideBrokenTomlLines(const std::string& text, std::string* lines) {
+  std::string out;
+  bool section = false, array = false, triple = false;
+  for (size_t pos = 0; pos <= text.size();) {
+    size_t nl = text.find('\n', pos);
+    if (nl == std::string::npos) nl = text.size();
+    std::string line = text.substr(pos, nl - pos);
+    const bool last = nl == text.size();
+    pos = nl + 1;
+    const bool cr = !line.empty() && line.back() == '\r';
+    if (cr) line.pop_back();
+    const size_t a = line.find_first_not_of(" \t");
+    const size_t eq = line.find('=');
+    size_t quotes = 0;  // (""" marks on the line)
+    for (size_t q = line.find("\"\"\""); q != std::string::npos; q = line.find("\"\"\"", q + 3)) ++quotes;
+    if (triple || array) {
+      if (triple && quotes % 2) triple = false;
+      if (array && line.find(']') != std::string::npos) array = false;
+    } else if (a != std::string::npos && line[a] == '[') {
+      section = true;
+    } else if (!section && a != std::string::npos && line[a] != '#') {
+      std::string value = eq == std::string::npos ? std::string() : line.substr(eq + 1);
+      value.erase(0, value.find_first_not_of(" \t"));
+      if (eq == std::string::npos || eq == a || value.empty() || value[0] == '#') {
+        if (lines) *lines += (lines->empty() ? "" : ", ") + line.substr(a);
+        line = "# (unreadable, set aside by the game) " + line.substr(a);
+      } else if (quotes % 2) {
+        triple = true;
+      } else if (value[0] == '[' && value.find(']') == std::string::npos) {
+        array = true;
+      }
+    }
+    out += line;
+    if (!last) out += cr ? "\r\n" : "\n";
+  }
+  return out;
+}
+
+// What the settings repairs above did: OnConfigurePaths runs before the log
+// file is open, so their lines are written at OnPreSetup.
+std::vector<std::string> g_settings_notes;
+
 // The runtime's user data (paths.user_data_root) and the saves folder.
 std::filesystem::path g_user_data;
 std::filesystem::path g_saves;
@@ -278,6 +374,7 @@ void Svr2011App::OnConfigurePaths(rex::PathConfig& paths) {
   g_saves = (Env("SVR2011_USER_DATA").empty() ? exe_dir : g_user_data) / "Saves";
   paths.cache_root = exe_dir / "UserData" / "cache";
   svr2011::InstallCrashReporter(exe_dir / "UserData" / "crashes");
+  svr2011::SetCrashTextHook(&svr2011::MatchBoxCrashText);  // (the match's black box in the report: match_box.h)
   // Online: where the game files checked against the launcher's list are (online_files.h; the check starts with online).
   svr2011::SetGameFilesPaths(paths.game_data_root, g_user_data);
 
@@ -320,7 +417,20 @@ void Svr2011App::OnConfigurePaths(rex::PathConfig& paths) {
     // at every save. The file no longer parsed - every setting ignored, no
     // gpu_plugin: a black screen at start (a 2.1.2 report).
     if (std::string fixed = JoinBrokenTomlStrings(text); fixed != text) {
-      REXLOG_WARN("settings: {} had a value broken over lines - joined again", paths.config_path.string());
+      g_settings_notes.push_back(
+          fmt::format("settings: {} had a value broken over lines - joined again", paths.config_path.string()));
+      text = std::move(fixed);
+      std::ofstream(paths.config_path, std::ios::binary | std::ios::trunc) << text;
+    }
+    if (std::string keys, fixed = QuoteBareTomlWords(text, &keys); fixed != text) {
+      g_settings_notes.push_back(fmt::format("settings: {} had words without quotes ({}) - quoted, so the file reads again",
+                                             paths.config_path.string(), keys));
+      text = std::move(fixed);
+      std::ofstream(paths.config_path, std::ios::binary | std::ios::trunc) << text;
+    }
+    if (std::string lines, fixed = SetAsideBrokenTomlLines(text, &lines); fixed != text) {
+      g_settings_notes.push_back(fmt::format("settings: {} had lines that can't be read ({}) - set aside as comments, "
+                                             "the other settings kept", paths.config_path.string(), lines));
       text = std::move(fixed);
       std::ofstream(paths.config_path, std::ios::binary | std::ios::trunc) << text;
     }
@@ -370,6 +480,15 @@ void Svr2011App::OnConfigurePaths(rex::PathConfig& paths) {
 }
 
 void Svr2011App::OnPreSetup(rex::RuntimeConfig& config) {
+  // Test games (tools/dev/svrtest.ps1 and the other test scripts): SVR2011_AUDIO_MUTE=1 mutes every sound path
+  // (they all read audio_mute) even when the command line was dropped - a flag given twice is a parse error that
+  // loses every --option, --audio_mute=true with them (27 Oct: a test game was heard).
+  if (const char* m = std::getenv("SVR2011_AUDIO_MUTE"); m && *m == '1') {
+    rex::cvar::SetFlagByName("audio_mute", "true");
+    REXLOG_INFO("settings: audio muted (SVR2011_AUDIO_MUTE)");
+  }
+  for (const auto& note : g_settings_notes) REXLOG_WARN("{}", note);  // (OnConfigurePaths' repairs)
+  g_settings_notes.clear();
   // A settings file that couldn't be read (every setting ignored) still draws.
   if (config.gpu_plugin.empty()) {
     rex::cvar::SetFlagByName("gpu_plugin", "xenos");
@@ -403,6 +522,17 @@ void Svr2011App::OnPreSetup(rex::RuntimeConfig& config) {
       REXLOG_INFO("graphics: Direct3D 12 ({:.0f} ms to check{})", ms, cached ? ", known for this GPU and driver" : "");
     }
   }
+  // DLSS on Vulkan: NGX's extensions on the SDK's Vulkan device - asked before it's made, when the game has DLSS
+  // (nvngx_dlss.dll beside it), so GRAPHICS can offer it. Only drivers that list them enable them (NVIDIA's
+  // VK_NVX_*; buffer device address only with VK_NVX_binary_import): AMD / Intel devices stay as they were.
+#if SVR2011_DLSS
+  {
+    std::error_code ec;
+    if (rex::cvar::Query<std::string>("gpu_backend") == "vulkan" &&
+        std::filesystem::exists(rex::filesystem::GetExecutableFolder() / "nvngx_dlss.dll", ec))
+      svr2011::dlss::RequestVulkanExtensions();
+  }
+#endif
 #endif
   // Automated tests: the only controller is one driven by a command file.
   if (std::string file = Env("SVR2011_INPUT_FILE"); !file.empty()) {
@@ -512,7 +642,7 @@ void Svr2011App::OnPostLoadXexImage() {
     static const char* const kGroups[][2] = {
         {"display", "fullscreen fullscreen_exclusive window_width window_height vsync show_fps perf_overlay perf_overlay_corner perf_log_seconds"},
         {"renderer", "native_renderer gpu_backend native_max_scale native_render_scale native_scene_height native_aa native_2x_msaa native_scale_effects "
-                     "native_texture_quality native_texture_packs native_dump_textures native_widescreen native_prepare_pipelines "
+                     "native_texture_quality native_mat_fix native_texture_packs native_dump_textures native_widescreen native_prepare_pipelines "
                      "frame_rate full_speed unlock_30fps "
                      "process_priority"},
         {"effects", "depth_of_field motion_blur soft_filter"},
@@ -660,11 +790,14 @@ void Svr2011App::OnPostLoadXexImage() {
     if (std::string t = Env("SVR2011_TEST_MOVIE"); t.size() > 4 && t.substr(t.size() - 4) == ".mp4")
       svr2011::PrepareHdMovie(movies, "hdtest.bik", t);  // (tests: user_movies.cpp)  // (arenas branch: superstar_mods.h)
     svr2011::CopyMediaMovies(movies);      // (arenas branch: media_mods.h)
+    // (before the mount too: its scan writes the folder's own .mp4s' stubs and
+    // renames accented names - files made after it don't open until the next
+    // start: a new USER MOVIES .mp4 stayed black)
+    svr2011::InstallUserMovies(runtime()->memory(), movies);
     auto device = std::make_unique<rex::filesystem::HostPathDevice>("\\USERMOVIES", movies, true);
     auto* fs = runtime()->file_system();
     if (device->Initialize() && fs->RegisterDevice(std::move(device))) {
       fs->RegisterSymbolicLink("umovie:", "\\USERMOVIES");
-      svr2011::InstallUserMovies(runtime()->memory(), movies);
     } else {
       REXLOG_WARN("could not mount the Custom Movies folder {}", movies.string());
     }
@@ -716,11 +849,13 @@ void Svr2011App::OnPostLoadXexImage() {
   svr2011::InstallJukebox(runtime()->memory());  // MY WWE -> JUKEBOX (jukebox.h)
   // Superstar mods: new characters in the free DLC slots (superstar_mods.h).
   svr2011::InstallMediaMods(runtime()->memory());  // (arenas branch: before the superstar mods mount its pac)
+  svr2011::InstallVsStyles(runtime()->memory());   // (the same: its overlay pac)
   svr2011::KeepWindowAlive();
 #ifndef SVR2011_D3D_TRACE
   svr2011::InstallModelMem(runtime()->memory());  // (model_mem.cpp)
 #endif
   svr2011::SetThreadsSaves(g_saves);  // (the mods' Superstar Threads slots, kept by folder)
+  svr2011::SetSuperstarModsSaves(g_saves);  // (a fetched mod's id as the save file has it)
   svr2011::InstallSuperstarMods(runtime()->memory(), runtime()->file_system());
   svr2011::InstallUniverseWelcome(g_saves, g_user_data);  // (the Universe welcome kept as seen once accepted)
   svr2011::InstallUniverseMods(runtime()->memory(), g_saves);  // (the mods' WWE Universe side table: after the mods)
@@ -728,6 +863,8 @@ void Svr2011App::OnPostLoadXexImage() {
   svr2011::InstallCrowdSigns(runtime()->memory());  // (after the superstar mods: their signs)
   svr2011::KeepWindowAlive();
   // The frame rate: 30 / 60 / 120 / 144 / 240 at the game's speed (frame_rate.h).
+  // (after the runtime's memory fault handler: faults it doesn't take are placed in the log, never retried forever)
+  svr2011::InstallGuestFaultLog();
   svr2011::InstallFrameRate(runtime()->memory());
   svr2011::InstallPerfSettings();  // (perf_hooks.h)
   if (imgui_drawer()) {
@@ -742,10 +879,11 @@ void Svr2011App::OnPostLoadXexImage() {
         imgui_drawer(), window(),
         static_cast<rex::input::InputSystem*>(runtime()->input_system()), g_config_path);
     // The on-screen controller (touch_controls.h).
-    svr2011::InstallTouchControls(imgui_drawer(), window(), g_user_data);
+    svr2011::InstallTouchControls(imgui_drawer(), window(), g_user_data, immediate_drawer());
     svr2011::InstallPaintPagesOverlay(imgui_drawer());
     svr2011::InstallSlobberKnockerOverlay(imgui_drawer());  // (match_types.h)
     svr2011::InstallHctpOverlay(imgui_drawer());            // (match_types.h: HCTP door prompts)
+    svr2011::InstallCrowdOverlay(imgui_drawer());           // (crowd_fight.h: the climb into the crowd)
     svr2011::InstallGauntletEliminatorOverlay(imgui_drawer());
     svr2011::InstallOnlineRulesOverlay(imgui_drawer());  // (online_rules.h)
     svr2011::InstallThreeStagesOverlay(imgui_drawer());
@@ -770,6 +908,7 @@ void Svr2011App::OnPostLoadXexImage() {
   // ... and the online leaderboards (leaderboards.h)
   svr2011::InstallLeaderboards(runtime()->memory(), runtime()->kernel_state());
   svr2011::InstallOnlineMods(runtime()->memory());  // (superstar / arena mods in online lobbies)
+  svr2011::InstallModTransfer();  // (the host's mods to joiners who lack them, P2P: mod_transfer.h)
   svr2011::InstallOnlineChat();  // (lobby chat longer than the game's)
 
   // Developer aid: SVR2011_DUMP_IMAGE=<file> writes the loaded (decrypted,

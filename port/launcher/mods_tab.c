@@ -30,7 +30,9 @@
 #include <wchar.h>
 
 #include "backgrounds.h"
+#include "move_warning.h"
 #include "movie_maker.h"
+#include "music_level.h"
 #include "unzip.h"
 
 enum { MODS_MAX = 512 };
@@ -39,6 +41,7 @@ typedef struct {
     WCHAR folder[MAX_PATH];  /* full path */
     WCHAR type[32], id[64], name[128], author[64], version[32];
     WCHAR made_with[64];  /* manifest made_with= (the Mod Maker stamps its mods); "" = not made with it */
+    WCHAR needs[32];      /* manifest needs= : the oldest game version that plays it ("" = any) */
     unsigned long long bytes;
     int enabled;
     int left_out;  /* a superstar mod over the game's ids (s_star_ids): not in the game (superstar_limit) */
@@ -51,9 +54,13 @@ static HWND s_list, s_status, s_wnd;
 static WCHAR s_game[MAX_PATH];
 static int s_filling;              /* (checkbox notifications while filling the list) */
 
-enum { M_LIST, M_ADD, M_REMOVE, M_FOLDER, M_MAKER, M_STATUS, M_BACKGROUND, M_ON, M_OFF };
+enum { M_LIST, M_ADD, M_REMOVE, M_FOLDER, M_MAKER, M_STATUS, M_BACKGROUND, M_ON, M_OFF, M_SHRINK, M_LEVEL };
 
-static void status(const WCHAR *t) { SetWindowTextW(s_status, t); }
+static void status(const WCHAR *t)
+{
+    if (s_status) SetWindowTextW(s_status, t);
+    else wprintf(L"%ls\n", t);  /* (the --mods-add tests: no window) */
+}
 
 /* The game has 137 ids for superstar mods (src/superstar_mods.cpp kPool; it
    writes the number to Mods\Superstars\limit.txt at each start), kept
@@ -143,6 +150,7 @@ static int read_manifest(const WCHAR *path, Mod *m)
         else if (!wcscmp(w, L"author")) wcsncpy_s(m->author, 64, eq, _TRUNCATE);
         else if (!wcscmp(w, L"version")) wcsncpy_s(m->version, 32, eq, _TRUNCATE);
         else if (!wcscmp(w, L"made_with")) wcsncpy_s(m->made_with, 64, eq, _TRUNCATE);
+        else if (!wcscmp(w, L"needs")) wcsncpy_s(m->needs, 32, eq, _TRUNCATE);
     }
     fclose(f);
     return m->type[0] && m->id[0];
@@ -166,6 +174,15 @@ static unsigned long long folder_bytes(const WCHAR *dir)
 }
 
 static int exists(const WCHAR *p) { return GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES; }
+
+/* a mod the game doesn't load whatever its switch: backstage mods (src/no_mods.h BackstageModsOff) and the removed
+   FREE-ROAMING BACKSTAGE match type (src/match_types.cpp MatchTypeSwitches) */
+static int removed_mod(const Mod *m)
+{
+    const WCHAR *leaf = wcsrchr(m->folder, L'\\');
+    return !_wcsicmp(m->type, L"backstage") || wcsstr(m->folder, L"\\Mods\\Backstage\\") ||
+           (leaf && !_wcsicmp(leaf + 1, L"free_roaming_backstage"));
+}
 static int maker_present(void);
 
 static void scan(void)
@@ -199,13 +216,20 @@ static void scan(void)
             }
             if (!m->name[0]) wcsncpy_s(m->name, 128, m->id, _TRUNCATE);
             swprintf_s(off, MAX_PATH, L"%s\\disabled", m->folder);
-            m->enabled = !exists(off);
+            /* backstage mods are switched off in the game (src/no_mods.h BackstageModsOff), and the FREE-ROAMING
+               BACKSTAGE match type is removed (src/match_types.cpp MatchTypeSwitches): shown off */
+            m->enabled = !exists(off) && !removed_mod(m);
             m->bytes = folder_bytes(m->folder);
             s_nmods++;
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
 }
+
+static int version_newer(const WCHAR *a, const WCHAR *b);
+/* The mod needs a newer game than this one (manifest needs=: a big model or arena, docs/SVRMOD_FORMAT.md). The
+   launcher installs the game of its own release, so its version is the game's. */
+static int needs_newer(const Mod *m) { return m->needs[0] && version_newer(m->needs, PORT_VERSION); }
 
 static void fill(void)
 {
@@ -222,7 +246,11 @@ static void fill(void)
         it.pszText = s_mods[i].name;
         it.lParam = i;
         ListView_InsertItem(s_list, &it);
-        ListView_SetItemText(s_list, i, 1, s_mods[i].left_out ? s_over_label : s_mods[i].type);
+        WCHAR type[96];
+        if (s_mods[i].left_out) wcsncpy_s(type, 96, s_over_label, _TRUNCATE);
+        else if (needs_newer(&s_mods[i])) swprintf_s(type, 96, L"%s - NEEDS GAME %s", s_mods[i].type, s_mods[i].needs);
+        else wcsncpy_s(type, 96, s_mods[i].type, _TRUNCATE);
+        ListView_SetItemText(s_list, i, 1, type);
         ListView_SetItemText(s_list, i, 2, s_mods[i].version);
         ListView_SetItemText(s_list, i, 3, s_mods[i].author);
         swprintf_s(size, 32, L"%.1f MB", s_mods[i].bytes / 1048576.0);
@@ -998,6 +1026,35 @@ static void rec_set_files(BundleRec *r, const WCHAR *dir)
     record_files(r, dir, L"", 1);
 }
 
+static volatile LONG s_bundled_running;   /* (mods_install_bundled: its record in use - Level music waits) */
+
+/* A bundled mod's manifest.txt changed by the launcher itself (Level music's theme_gain=): its record takes the new
+   file, so the copy still counts as unedited (updated at the next version, not asked about). */
+static void bundle_rerecord_manifest(const WCHAR *game, const WCHAR *dir)
+{
+    WCHAR mods[MAX_PATH], full[MAX_PATH];
+    const WCHAR *rel = wcsstr(dir, L"\\Mods\\");
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    int i, k;
+    if (!rel || !GetFileAttributesExW((swprintf_s(full, MAX_PATH, L"%s\\manifest.txt", dir), full), GetFileExInfoStandard, &a))
+        return;
+    swprintf_s(mods, MAX_PATH, L"%s\\Mods", game);
+    state_load(mods);
+    for (i = 0; i < s_n_recs; ++i) {
+        BundleRec *r = &s_recs[i];
+        if (_wcsicmp(r->folder, rel + 6)) continue;
+        for (k = 0; k < r->n_files; ++k)
+            if (!_wcsicmp(r->files[k].rel, L"manifest.txt")) {
+                r->files[k].size = (unsigned long long)a.nFileSizeHigh << 32 | a.nFileSizeLow;
+                r->files[k].time = (unsigned long long)a.ftLastWriteTime.dwHighDateTime << 32 | a.ftLastWriteTime.dwLowDateTime;
+                r->files[k].hash = file_hash(full);
+            }
+        state_save(mods);
+        break;
+    }
+    recs_free();
+}
+
 /* dir against r's files: *edited - a file changed, or one added (the Mod Maker's save, the player's own);
    *missing - files gone. A file whose size and time are the same is taken as unchanged (no rehash at every
    start); one whose time changed but not its content is too (its time is updated in r). */
@@ -1132,7 +1189,7 @@ static int bundle_install(const WCHAR *game_dir, const WCHAR *zip, const WCHAR *
     ok = mods_install(game_dir, zip) && s_installed[0];
     s_bundle_install = 0;
     if (!ok) return 0;
-    if ((fresh && _wcsicmp(bm->type, L"matchtype")) || was_off) {
+    if (fresh || was_off) {   /* (match types too: any mod that's on keeps a player out of online matches) */
         WCHAR off[MAX_PATH];
         FILE *f;
         swprintf_s(off, MAX_PATH, L"%s\\disabled", dir);
@@ -1148,8 +1205,8 @@ static int bundle_install(const WCHAR *game_dir, const WCHAR *zip, const WCHAR *
 
 /* Mods shipped with the port (<bundle_dir>\*.svrmod, the release's "Bundled Mods"), checked at each start against
  * Mods\.bundled_state (above) - nothing is installed again unless it's needed:
- * - not installed, and never: installed (switched off - "disabled" in its folder - except a match type, which the
- *   game had on before it became a mod);
+ * - not installed, and never: installed switched off ("disabled" in its folder) - match types too (24 Oct: a mod
+ *   that's on keeps the player out of online matches while the server doesn't allow mods);
  * - its folder gone (the player removed it): recorded as removed, never installed again;
  * - a newer version shipped: an unedited copy is updated (its on / off kept); an edited one is asked about
  *   (mods_bundled_questions: update - the player's copy to Mods\.backup - or keep theirs, not asked again for that
@@ -1157,7 +1214,15 @@ static int bundle_install(const WCHAR *game_dir, const WCHAR *zip, const WCHAR *
  * - files missing from an unedited copy (a damaged install): asked about (fix / not now) - never fixed silently;
  * - the player's copy a newer version than the shipped one: left alone.
  * The questions are answered (mods_bundled_answer) and acted on at the next call. */
+static void install_bundled(const WCHAR *game_dir, const WCHAR *bundle_dir);
 void mods_install_bundled(const WCHAR *game_dir, const WCHAR *bundle_dir)
+{
+    InterlockedIncrement(&s_bundled_running);
+    install_bundled(game_dir, bundle_dir);
+    InterlockedDecrement(&s_bundled_running);
+}
+
+static void install_bundled(const WCHAR *game_dir, const WCHAR *bundle_dir)
 {
     WCHAR pat[MAX_PATH], zip[MAX_PATH], list[MAX_PATH], mods[MAX_PATH], *legacy = NULL;
     WIN32_FIND_DATAW fd;
@@ -1383,40 +1448,289 @@ void mods_install_bundled(const WCHAR *game_dir, const WCHAR *bundle_dir)
     free(legacy);
 }
 
-/* A superstar / media mod's .mp4 entrance movies (movie= / video.<id>=) that
- * have no .bik of the same name beside them get one (1024 x 1024, the movie
- * on the big screen): the game plays the .bik where the platform can't decode
- * the .mp4 (Proton on the Steam Deck, Windows "N" editions). The Mod Maker
- * writes both; this covers mods made by hand. */
-static void make_movie_fallbacks(const WCHAR *dir)
+/* ── a mod's (and Custom Movies') Bink movies -> .mp4 (movie_maker.c movie_shrink; tools/movie_shrink.py
+ * with ffmpeg): about half the size, played by the game as HD movies (src/hd_movies.cpp). A mod's
+ * movie= / video.<id>= .bik becomes <name>.mp4 - the manifest line rewritten, the .bik deleted once the .mp4
+ * is checked. Where the PC can't play the .mp4 (Windows "N", Proton) the game shows the superstar's own movie
+ * (no .bik fallback is made: it would be the size saved). Not for the bundled mods (Mods\.bundled_state
+ * hashes their files: they come shrunk). After an install (a worker, a progress line) and the Shrink movies
+ * button (every mod and Custom Movies). ── */
+
+typedef struct { const WCHAR *what; unsigned long long before, after; int done, failed; WCHAR err[300]; } Shrink;
+
+static void shrink_progress(void *ctx, int pct)
 {
-    WCHAR man[MAX_PATH];
-    FILE *f;
+    WCHAR t[300];
+    if (!s_wnd) return;   /* (the console tests: the result only) */
+    swprintf_s(t, 300, L"Shrinking movies: %s %d%%\x2026", ((Shrink *)ctx)->what, pct);
+    status(t);
+}
+
+static unsigned long long file_size(const WCHAR *p)
+{
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    return GetFileAttributesExW(p, GetFileExInfoStandard, &a) ? (unsigned long long)a.nFileSizeHigh << 32 | a.nFileSizeLow : 0;
+}
+
+/* bik -> mp4 (same name), the .bik deleted (if the game holds it, kept: it is then the .mp4's fallback) */
+static int shrink_movie(const WCHAR *bik, Shrink *s)
+{
+    WCHAR mp4[MAX_PATH], err[300];
+    const unsigned long long before = file_size(bik);
+    wcscpy_s(mp4, MAX_PATH, bik);
+    wcscpy_s(mp4 + wcslen(mp4) - 4, 5, L".mp4");
+    if (!movie_shrink(bik, mp4, NULL, shrink_progress, s, err, 300)) {
+        s->failed++;
+        swprintf_s(s->err, 300, L"%s: %s", s->what, err);
+        return 0;
+    }
+    s->done++;
+    s->before += before;
+    s->after += file_size(mp4);
+    if (!DeleteFileW(bik)) s->after += before;
+    return 1;
+}
+
+static void shrink_mod(const WCHAR *dir, Shrink *s)
+{
+    WCHAR man[MAX_PATH], tmp[MAX_PATH];
+    FILE *f, *o;
     char line[1024];
+    int changed = 0;
     swprintf_s(man, MAX_PATH, L"%s\\manifest.txt", dir);
+    swprintf_s(tmp, MAX_PATH, L"%s\\manifest.new", dir);
     if (_wfopen_s(&f, man, L"rb") || !f) return;
+    if (_wfopen_s(&o, tmp, L"wb") || !o) { fclose(f); return; }
     while (fgets(line, sizeof line, f)) {
         char *v = strchr(line, '='), *e;
-        WCHAR file[MAX_PATH];
-        size_t n;
-        static MovieJob job;
-        if (!v || (strncmp(line, "movie=", 6) && strncmp(line, "video.", 6))) continue;
-        v++;
-        for (e = v + strlen(v); e > v && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' '); ) *--e = 0;
-        n = strlen(v);
-        if (n < 5 || _stricmp(v + n - 4, ".mp4")) continue;
-        if (!MultiByteToWideChar(CP_UTF8, 0, v, -1, file, MAX_PATH)) continue;
-        ZeroMemory(&job, sizeof job);
-        swprintf_s(job.video, MAX_PATH, L"%s\\%s", dir, file);
-        swprintf_s(job.out, MAX_PATH, L"%s\\%s", dir, file);
-        wcscpy_s(job.out + wcslen(job.out) - 4, 5, L".bik");
-        if (exists(job.out) || !exists(job.video)) continue;
-        job.fit = MOVIE_FIT;
-        job.size = 1024;
-        status(L"Making the mod's movie for PCs that can't play its MP4 (Steam Deck)...");
-        if (!movie_make(&job)) status(job.err);
+        WCHAR file[MAX_PATH], bik[MAX_PATH];
+        int n;
+        if (v && (!strncmp(line, "movie=", 6) || !strncmp(line, "video.", 6))) {
+            ++v;
+            for (e = v + strlen(v); e > v && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' '); ) --e;
+            if (e - v > 4 && !_strnicmp(e - 4, ".bik", 4) &&
+                (n = MultiByteToWideChar(CP_UTF8, 0, v, (int)(e - v), file, MAX_PATH - 1)) > 0) {
+                file[n] = 0;
+                swprintf_s(bik, MAX_PATH, L"%s\\%s", dir, file);
+                if (exists(bik) && shrink_movie(bik, s)) {
+                    memcpy(e - 4, ".mp4", 4);   /* (the rest of the line - its end - as it was) */
+                    changed = 1;
+                }
+            }
+        }
+        fputs(line, o);
     }
     fclose(f);
+    fclose(o);
+    if (changed) MoveFileExW(tmp, man, MOVEFILE_REPLACE_EXISTING);
+    else DeleteFileW(tmp);
+}
+
+/* Custom Movies\<name>.bik (the movie maker's older ones, downloads): <name>.mp4; the game lists it under the
+   same name, so entrances keep it (src/user_movies.cpp) */
+static void shrink_user_movies(const WCHAR *game, Shrink *s)
+{
+    WCHAR pat[MAX_PATH], bik[MAX_PATH], mp4[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    swprintf_s(pat, MAX_PATH, L"%s\\Custom Movies\\*.bik", game);
+    if ((h = FindFirstFileW(pat, &fd)) == INVALID_HANDLE_VALUE) return;
+    do {
+        const WCHAR *c;
+        int ascii = 1;
+        for (c = fd.cFileName; *c; ++c) ascii &= *c >= 32 && *c < 127;
+        swprintf_s(bik, MAX_PATH, L"%s\\Custom Movies\\%s", game, fd.cFileName);
+        wcscpy_s(mp4, MAX_PATH, bik);
+        wcscpy_s(mp4 + wcslen(mp4) - 4, 5, L".mp4");
+        if (!ascii || exists(mp4)) continue;   /* (an .mp4's .bik: its stub or fallback) */
+        s->what = fd.cFileName;
+        shrink_movie(bik, s);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+static int is_bundled(const WCHAR *game, const WCHAR *folder)
+{
+    WCHAR path[MAX_PATH], key[MAX_PATH + 4], *text;
+    const WCHAR *rel = wcsstr(folder, L"\\Mods\\");
+    int found;
+    if (!rel) return 0;
+    swprintf_s(path, MAX_PATH, L"%s\\Mods\\.bundled_state", game);
+    swprintf_s(key, MAX_PATH + 4, L"\t%s\t", rel + 6);
+    if (!(text = read_text(path))) return 0;
+    found = wcsstr(text, key) != NULL;   /* (both written by the launcher: same case) */
+    free(text);
+    return found;
+}
+
+static void shrink_report(const Shrink *s, int all)
+{
+    WCHAR t[600];
+    t[0] = 0;
+    if (s->done)
+        swprintf_s(t, 600, L"Movies shrunk: %d, %.1f MB -> %.1f MB (%.1f MB saved).%s%s", s->done, s->before / 1048576.0,
+                   s->after / 1048576.0, (s->before - s->after) / 1048576.0, s->failed ? L" Left as it was: " : L"",
+                   s->failed ? s->err : L"");
+    else if (s->failed)
+        swprintf_s(t, 600, L"No movie shrunk: %s", s->err);
+    else if (all)
+        wcscpy_s(t, 600, L"No movies to shrink: every mod and Custom Movies movie is an .mp4 already (bundled mods "
+                         L"come shrunk).");
+    if (t[0]) status(t);
+    if (s->done || s->failed) install_log(s_game, t);
+}
+
+/* the worker: one mod folder, or ("") every superstar / media mod and Custom Movies */
+static volatile LONG s_shrink_busy;
+static WCHAR s_shrink_dir[MAX_PATH];
+
+static void shrink_run(const WCHAR *dir)
+{
+    Shrink s;
+    ZeroMemory(&s, sizeof s);
+    if (dir[0]) {
+        s.what = wcsrchr(dir, L'\\') ? wcsrchr(dir, L'\\') + 1 : dir;
+        shrink_mod(dir, &s);
+    } else {
+        static const WCHAR *const kinds[] = { L"Superstars", L"Media" };
+        int k;
+        for (k = 0; k < 2; k++) {
+            WCHAR pat[MAX_PATH];
+            static WCHAR sub[MAX_PATH];
+            WIN32_FIND_DATAW fd;
+            HANDLE h;
+            swprintf_s(pat, MAX_PATH, L"%s\\Mods\\%s\\*", s_game, kinds[k]);
+            if ((h = FindFirstFileW(pat, &fd)) == INVALID_HANDLE_VALUE) continue;
+            do {
+                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == L'.') continue;
+                swprintf_s(sub, MAX_PATH, L"%s\\Mods\\%s\\%s", s_game, kinds[k], fd.cFileName);
+                if (is_bundled(s_game, sub)) continue;
+                s.what = fd.cFileName;
+                shrink_mod(sub, &s);
+            } while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+        shrink_user_movies(s_game, &s);
+    }
+    shrink_report(&s, !dir[0]);
+}
+
+static DWORD WINAPI shrink_thread(LPVOID arg)
+{
+    (void)arg;
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    shrink_run(s_shrink_dir);
+    CoUninitialize();
+    InterlockedExchange(&s_shrink_busy, 0);
+    return 0;
+}
+
+/* dir: one mod ("" = all). With a window: on a worker (not a second one while one runs - the button does the
+   rest later); without (the --mods-add / --mods-shrink tests): here. */
+static void shrink_start(const WCHAR *dir)
+{
+    if (!s_wnd) {
+        CoInitializeEx(NULL, COINIT_MULTITHREADED);
+        shrink_run(dir);
+        return;
+    }
+    if (InterlockedCompareExchange(&s_shrink_busy, 1, 0)) {
+        if (!dir[0]) status(L"Movies are being shrunk already.");
+        return;
+    }
+    wcscpy_s(s_shrink_dir, MAX_PATH, dir);
+    if (!dir[0]) status(L"Shrinking movies\x2026");
+    CloseHandle(CreateThread(NULL, 0, shrink_thread, NULL, 0, NULL));
+}
+
+int mods_shrink(const WCHAR *game_dir)
+{
+    wcsncpy_s(s_game, MAX_PATH, game_dir ? game_dir : L"", _TRUNCATE);
+    if (!s_game[0]) return 0;
+    shrink_start(L"");
+    return 1;
+}
+
+/* Level music: every superstar / media mod's theme whose gain the author left out (music_level.h; a bundled mod's
+   record takes its new manifest), then the Music folder's own songs. The dB per song in a window (and the log). */
+static volatile LONG s_level_busy;
+static WCHAR s_level_report[16384];
+
+static void level_run(void)
+{
+    static const WCHAR *const kinds[] = { L"Superstars", L"Media" };
+    WCHAR pat[MAX_PATH], sub[MAX_PATH], music[MAX_PATH], t[400];
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    int k, mods = 0, songs = 0, failed = 0, n;
+    s_level_report[0] = 0;
+    for (k = 0; k < 2; k++) {
+        swprintf_s(pat, MAX_PATH, L"%s\\Mods\\%s\\*", s_game, kinds[k]);
+        if ((h = FindFirstFileW(pat, &fd)) == INVALID_HANDLE_VALUE) continue;
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == L'.') continue;
+            swprintf_s(sub, MAX_PATH, L"%s\\Mods\\%s\\%s", s_game, kinds[k], fd.cFileName);
+            n = level_mod(sub, s_level_report, 16384);
+            if (n > 0) {
+                mods++;
+                songs += n;
+                if (is_bundled(s_game, sub)) bundle_rerecord_manifest(s_game, sub);
+            }
+            if (n < 0) failed++;
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    swprintf_s(music, MAX_PATH, L"%s\\Music", s_game);
+    n = level_music_folder(music, s_level_report, 16384);
+    if (n > 0) songs += n;
+    if (n < 0) failed++;
+    if (songs)
+        swprintf_s(t, 400, L"Music levelled: %d song%s (%d mod%s) at the Mod Maker's volume, -24 LUFS - the game "
+                           L"applies it, the files stay as they were.%s", songs, songs == 1 ? L"" : L"s", mods,
+                   mods == 1 ? L"" : L"s", failed ? L" Some manifests couldn't be written." : L"");
+    else
+        wcscpy_s(t, 400, L"Nothing to level: every theme and song has its volume already (an author's own is kept).");
+    status(t);
+    if (s_level_report[0]) {
+        for (n = (int)wcslen(s_level_report); n && (s_level_report[n - 1] == L'\n' || s_level_report[n - 1] == L'\r'); --n)
+            s_level_report[n - 1] = 0;
+        install_log(s_game, s_level_report);
+        if (s_wnd) MessageBoxW(s_wnd, s_level_report, L"Level music - the gain per song", MB_OK | MB_ICONINFORMATION);
+        else wprintf(L"%s\n", s_level_report);
+    }
+}
+
+static DWORD WINAPI level_thread(LPVOID arg)
+{
+    (void)arg;
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    level_run();
+    CoUninitialize();
+    InterlockedExchange(&s_level_busy, 0);
+    return 0;
+}
+
+/* With a window: on a worker (not while movies are shrunk: both write manifests); without (--mods-level): here. */
+static void level_start(void)
+{
+    if (!s_wnd) {
+        CoInitializeEx(NULL, COINIT_MULTITHREADED);
+        level_run();
+        return;
+    }
+    if (s_shrink_busy) { status(L"Movies are being shrunk - level the music when that's done."); return; }
+    if (s_bundled_running) { status(L"The bundled mods are being checked - level the music when that's done."); return; }
+    if (InterlockedCompareExchange(&s_level_busy, 1, 0)) { status(L"The music is being levelled already."); return; }
+    status(L"Measuring the mods' themes and the Music folder's songs\x2026");
+    CloseHandle(CreateThread(NULL, 0, level_thread, NULL, 0, NULL));
+}
+
+int mods_level(const WCHAR *game_dir)
+{
+    wcsncpy_s(s_game, MAX_PATH, game_dir ? game_dir : L"", _TRUNCATE);
+    if (!s_game[0]) return 0;
+    level_start();
+    return 1;
 }
 
 /* A line in <game>\Mods\.install.log (UTF-8): what an install or the bundle
@@ -1543,6 +1857,7 @@ static int swap_in(const WCHAR *tmp, const WCHAR *dst, const WCHAR *kind, const 
 static int install_file(const WCHAR *zip)
 {
     WCHAR tmp[MAX_PATH], man[MAX_PATH], dst[MAX_PATH], parent[MAX_PATH], t[512], kind[32];
+    int shrink_now = 0;
     Mod m;
     swprintf_s(tmp, MAX_PATH, L"%s\\Mods\\.incoming", s_game);
     remove_tree(tmp, 0);
@@ -1624,6 +1939,23 @@ static int install_file(const WCHAR *zip)
         wcsncpy_s(kind, 32, backstage ? L"Backstage" : arena ? L"Arenas" : L"Superstars", _TRUNCATE);
     }
 place:
+    /* (a mod with custom moves: asked first - move_warning.h; not the port's own bundled mods, and with no window to
+       ask in - a test, a command line - only logged) */
+    if (!s_bundle_install && move_warning_dir_has_moves(tmp)) {
+        const HWND top = s_wnd ? GetAncestor(s_wnd, GA_ROOT) : NULL;
+        const int headless = !top || !IsWindowVisible(top);
+        if (headless) {  /* (printed by --mods-add; the log line is move_warning's) */
+            swprintf_s(t, 512, L"Warning: \"%s\" has custom moves (ported or made by hand) - experimental and most likely "
+                               L"broken.", m.name[0] ? m.name : m.id);
+            status(t);
+        }
+        if (!move_warning_ask(top, s_game, m.name[0] ? m.name : m.id, headless)) {
+            swprintf_s(t, 512, L"\"%s\" was not installed (it has custom moves).", m.name[0] ? m.name : m.id);
+            status(t);
+            remove_tree(tmp, 0);
+            return 0;
+        }
+    }
     safe_id(m.id);
     swprintf_s(parent, MAX_PATH, L"%s\\Mods\\%s", s_game, kind);
     SHCreateDirectoryExW(NULL, parent, NULL);
@@ -1658,10 +1990,22 @@ place:
         }
     }
     wcscpy_s(s_installed, MAX_PATH, dst);
-    if (!wcscmp(kind, L"Superstars") || !wcscmp(kind, L"Media")) make_movie_fallbacks(dst);
+    /* (its .bik movies -> .mp4, after the status below; not a bundled mod's - they come shrunk) */
+    shrink_now = !s_bundle_install && (!wcscmp(kind, L"Superstars") || !wcscmp(kind, L"Media"));
+    if (!wcscmp(kind, L"Superstars") || !wcscmp(kind, L"Media")) {
+        /* its theme's volume levelled (a gain the author left out: theme_gain=), before the shrink - both write its
+           manifest; a bundled mod's too (its files are recorded after this: the levelled manifest is the shipped one) */
+        static WCHAR rep[2048];
+        size_t n;
+        rep[0] = 0;
+        if (level_mod(dst, rep, 2048) > 0) {
+            for (n = wcslen(rep); n && (rep[n - 1] == L'\n' || rep[n - 1] == L'\r'); --n) rep[n - 1] = 0;
+            install_log(s_game, rep);
+        }
+    }
     scan();
     fill();
-    swprintf_s(t, 512, !wcscmp(kind, L"Backstage") ? L"Installed \"%s\". It is played in that room's backstage brawls."
+    swprintf_s(t, 512, !wcscmp(kind, L"Backstage") ? L"Installed \"%s\". Backstage mods are switched off for now: Backstage Brawl plays the game's own backstage, so it isn't loaded."
                        : !wcscmp(kind, L"Media") ? L"Installed \"%s\". It takes effect the next time the game starts."
                        : !wcscmp(kind, L"Moves") ? L"Installed \"%s\". The game merges its moves into its files when it next starts (a few seconds)."
                        : !wcscmp(kind, L"MatchTypes") ? L"Installed \"%s\". The match type is in the game's menus the "
@@ -1676,6 +2020,12 @@ place:
                                                  : L"Installed \"%s\". It is on the arena select pages after the "
                                                    L"game's own arenas.",
                m.name[0] ? m.name : m.id);
+    if (needs_newer(&m)) {  /* (older games leave a big model out, and crash loading a big arena) */
+        WCHAR n[200];
+        swprintf_s(n, 200, L" It needs game version %s or newer - this one is %s: update the game first.", m.needs,
+                   PORT_VERSION);
+        wcsncat_s(t, 512, n, _TRUNCATE);
+    }
     if (!wcscmp(kind, L"Attires")) {  /* (two attire mods on one attire: the new one moves) */
         static WCHAR clash[2048];
         if (mods_attire_guard(s_game, dst, clash, 2048)) {
@@ -1687,6 +2037,7 @@ place:
         }
     }
     status(t);
+    if (shrink_now) shrink_start(dst);
     return 1;
 }
 
@@ -1771,6 +2122,12 @@ static void set_enabled(int i, int on)
 {
     WCHAR off[MAX_PATH];
     if (i < 0 || i >= s_nmods || s_mods[i].enabled == on) return;
+    if (on && removed_mod(&s_mods[i])) {  /* (switched off in the game: src/no_mods.h, src/match_types.cpp) */
+        status(!_wcsicmp(s_mods[i].type, L"backstage")
+                   ? L"Backstage mods are switched off for now: Backstage Brawl plays the game's own backstage."
+                   : L"FREE-ROAMING BACKSTAGE is removed from the game for now.");
+        return;
+    }
     swprintf_s(off, MAX_PATH, L"%s\\disabled", s_mods[i].folder);
     if (on) DeleteFileW(off);
     else {
@@ -1827,11 +2184,12 @@ void mods_build(HWND wnd, mods_add_fn add, int tab, int id_base, HFONT title_fon
     dpi = GetDeviceCaps(dc, LOGPIXELSX);
     ReleaseDC(wnd, dc);
     s_base = id_base;
-    h = add(tab, L"Static", L"Mods", SS_LEFT, 28, 54, 300, 28, 0);
-    if (title_font) SendMessageW(h, WM_SETFONT, (WPARAM)title_font, TRUE);
+    (void)h; (void)title_font;   /* (the page's title is the window's: "Mods" above the tab bar) */
     add(tab, L"Static", L"Arenas, superstars and more. + adds .svrmod files, \x2212 removes the selected mods, "
-                        L"On / Off or the tick turns them on or off (Ctrl / Shift + click: several, Ctrl+A: all).",
-        SS_LEFT, 28, 86, 560, 36, 0);
+                        L"On / Off or the tick turns them on or off (Ctrl / Shift + click: several, Ctrl+A: all).\n"
+                        L"Bundled mods are off at first - turn them on here. While the server doesn't allow mods "
+                        L"online, any mod that's on keeps you out of online matches (use Start Without Mods).",
+        SS_LEFT, 28, 50, 560, 72, 0);
     s_list = add(tab, WC_LISTVIEWW, L"", LVS_REPORT | LVS_SHOWSELALWAYS | LVS_EDITLABELS | WS_BORDER | WS_TABSTOP,
                  28, 126, 512, 250, id_base + M_LIST);
     ListView_SetExtendedListViewStyle(s_list, LVS_EX_FULLROWSELECT | LVS_EX_CHECKBOXES | LVS_EX_DOUBLEBUFFER);
@@ -1849,15 +2207,20 @@ void mods_build(HWND wnd, mods_add_fn add, int tab, int id_base, HFONT title_fon
     /* (the selected ones - several with Ctrl / Shift, all with Ctrl+A - on or off) */
     add(tab, L"Button", L"On", BS_PUSHBUTTON | WS_TABSTOP, 548, 214, 40, 34, id_base + M_ON);
     add(tab, L"Button", L"Off", BS_PUSHBUTTON | WS_TABSTOP, 548, 254, 40, 34, id_base + M_OFF);
+    /* (Shrink movies: the mods' and Custom Movies' .bik movies -> .mp4, shrink_start) */
+    /* (Level music: the mods' themes and the Music folder's songs at the Mod Maker's volume, level_start) */
     if (maker_present()) {
-        add(tab, L"Button", L"Open Mod Maker", BS_PUSHBUTTON | WS_TABSTOP, 28, 386, 170, 32, id_base + M_MAKER);
-        add(tab, L"Button", L"Open Mods folder", BS_PUSHBUTTON | WS_TABSTOP, 206, 386, 150, 32, id_base + M_FOLDER);
-        add(tab, L"Button", L"Add background picture\x2026", BS_PUSHBUTTON | WS_TABSTOP, 364, 386, 224, 32,
-            id_base + M_BACKGROUND);
+        add(tab, L"Button", L"Open Mod Maker", BS_PUSHBUTTON | WS_TABSTOP, 28, 386, 110, 32, id_base + M_MAKER);
+        add(tab, L"Button", L"Open Mods folder", BS_PUSHBUTTON | WS_TABSTOP, 142, 386, 112, 32, id_base + M_FOLDER);
+        add(tab, L"Button", L"Add background\x2026", BS_PUSHBUTTON | WS_TABSTOP, 258, 386, 112, 32, id_base + M_BACKGROUND);
+        add(tab, L"Button", L"Shrink movies", BS_PUSHBUTTON | WS_TABSTOP, 374, 386, 104, 32, id_base + M_SHRINK);
+        add(tab, L"Button", L"Level music", BS_PUSHBUTTON | WS_TABSTOP, 482, 386, 106, 32, id_base + M_LEVEL);
     } else {
-        add(tab, L"Button", L"Open Mods folder", BS_PUSHBUTTON | WS_TABSTOP, 28, 386, 150, 32, id_base + M_FOLDER);
-        add(tab, L"Button", L"Add background picture\x2026", BS_PUSHBUTTON | WS_TABSTOP, 186, 386, 224, 32,
+        add(tab, L"Button", L"Open Mods folder", BS_PUSHBUTTON | WS_TABSTOP, 28, 386, 130, 32, id_base + M_FOLDER);
+        add(tab, L"Button", L"Add background picture\x2026", BS_PUSHBUTTON | WS_TABSTOP, 164, 386, 176, 32,
             id_base + M_BACKGROUND);
+        add(tab, L"Button", L"Shrink movies", BS_PUSHBUTTON | WS_TABSTOP, 346, 386, 118, 32, id_base + M_SHRINK);
+        add(tab, L"Button", L"Level music", BS_PUSHBUTTON | WS_TABSTOP, 470, 386, 118, 32, id_base + M_LEVEL);
     }
     s_status = add(tab, L"Static", L"", SS_LEFT, 28, 428, 560, 40, id_base + M_STATUS);
 }
@@ -1871,6 +2234,8 @@ int mods_command(int id, int code)
     if (id == s_base + M_FOLDER) { open_folder(); return 1; }
     if (id == s_base + M_MAKER) { open_maker(); return 1; }
     if (id == s_base + M_BACKGROUND) { add_background(); return 1; }
+    if (id == s_base + M_SHRINK) { shrink_start(L""); return 1; }
+    if (id == s_base + M_LEVEL) { level_start(); return 1; }
     return 0;
 }
 
@@ -1966,6 +2331,8 @@ int mods_notify(const NMHDR *nm)
         {
             const int i = (int)lv->lParam, was = s_mods[i].enabled;
             set_enabled(i, ListView_GetCheckState(s_list, lv->iItem));
+            if (ListView_GetCheckState(s_list, lv->iItem) != s_mods[i].enabled)  /* (refused: a backstage mod) */
+                ListView_SetCheckState(s_list, lv->iItem, s_mods[i].enabled);
             if (was != s_mods[i].enabled && !_wcsicmp(s_mods[i].type, L"superstar")) {
                 const int out = s_stars_out;
                 superstar_limit();

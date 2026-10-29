@@ -11,6 +11,7 @@
 #include "caw_limits.h"
 
 #include <cstdint>
+#include <set>
 #include <cstdlib>
 #include <cstring>
 #include <atomic>
@@ -147,6 +148,23 @@ void LogFighter(uint8_t* base, uint32_t f) {
 // *0x82EC5F48, 36 bytes each: start, end) once, and every failed allocation
 // (sub_8269A8D8(size, align) for the thread's heap, sub_8269A478).
 bool g_heap_log = false;
+int g_heap_watch = -1;  // (SVR2011_TEST_HEAP_LOG=<heap 2-53>: every allocation in that heap too)
+
+// A failed allocation the hooks below had no fallback for: logged once per heap and caller (every one with the
+// test aid) - a player's crash report then names it (27 Oct: an Extreme Rules weapon load wrote to such a 0 at
+// lr 8215A008, now and then). The file cache's heap (16) fails on purpose while it frees old files: only with the aid.
+namespace {
+void NoteFailed(uint32_t heap, uint32_t size, uint32_t lr) {
+  static std::mutex m;
+  static std::set<uint64_t> seen;
+  if (heap == 16 && !g_heap_log) return;
+  {
+    std::lock_guard lock(m);
+    if (!g_heap_log && !seen.insert(uint64_t(heap) << 32 | lr).second) return;
+  }
+  REXLOG_WARN("[svr2011] heap {}: allocation of {} bytes FAILED (lr {:08X})", heap, size, lr);
+}
+}  // namespace
 
 REX_EXTERN(__imp__sub_8269A8D8);
 REX_HOOK_RAW(sub_8269A8D8) {
@@ -162,6 +180,24 @@ REX_HOOK_RAW(sub_8269A8D8) {
         ctx.r3.u64 = p;
         return;
       }
+    // (the stage's heap full - an arena with more 3D detail than the game's own: caw_limits.h kStageHeap; the
+    // match's weapons' heap - OPTIONS -> WEAPONS picks: kWeaponHeap)
+    if ((heap == svr2011::kStageHeap || heap == svr2011::kWeaponHeap) && svr2011::BigModelMemory())
+      if (const uint32_t p = svr2011::FallbackBlock(size, true)) {
+        ctx.r3.u64 = p;
+        static int told = 0;
+        if (told++ < 5 || told % 200 == 0)
+          REXLOG_INFO("[svr2011] model memory: the {} heap ({}) full - {} bytes from the fallback memory ({} so)",
+                      heap == svr2011::kStageHeap ? "stage's" : "weapons'", heap, size, told);
+        return;
+      }
+  }
+  if (ctx.r3.u32 == 0 && size) {
+    const auto saved = ctx;
+    sub_8269A478(ctx, base);
+    const uint32_t heap = ctx.r3.u32;
+    ctx = saved;
+    NoteFailed(heap, size, uint32_t(ctx.lr));
   }
   if (!g_heap_log) return;
   static bool listed = false;
@@ -172,13 +208,6 @@ REX_HOOK_RAW(sub_8269A8D8) {
       const uint32_t a = Rd32(base + table + i * 36), b = Rd32(base + table + i * 36 + 4);
       if (a || b) REXLOG_INFO("[svr2011] heap {}: {:08X}-{:08X} ({:.1f} MB)", i, a, b, (b - a) / 1048576.0);
     }
-  }
-  if (ctx.r3.u32 == 0 && size) {
-    const auto saved = ctx;
-    sub_8269A478(ctx, base);
-    const uint32_t heap = ctx.r3.u32;
-    ctx = saved;
-    REXLOG_WARN("[svr2011] heap {}: allocation of {} bytes FAILED (lr {:08X})", heap, size, uint32_t(ctx.lr));
   }
 }
 
@@ -196,21 +225,38 @@ REX_HOOK_RAW(sub_8269BA30) {
         ctx.r3.u64 = p;
         return;
       }
+    // (the match's weapons' heap full - OPTIONS -> WEAPONS picks: caw_limits.h kWeaponHeap; the stage's heap too:
+    // an arena about 5x the game's own 3D detail (654k vertices) asked it for 322,752 bytes this way, lr 8215140C -
+    // 0, the decoder then wrote to it from the arena load, sub_821878A0; and heap 53 - the game's 25 MB rest, where a
+    // character file is read whole (sub_826A1420, lr 826A14EC): a 547k-vertex superstar's 27 MB ch.pac didn't fit)
+    // (and the wrestlers' model heaps 17-20: the 547k-vertex superstar's model asked one for 28.7 MB this way - GPU
+    // data, so the physical fallback, as model_mem.cpp's model-heap one)
+    const bool model_heap = heap >= 17 && heap <= 20;
+    if ((heap == svr2011::kWeaponHeap || heap == svr2011::kStageHeap || heap == 53 || model_heap) && svr2011::BigModelMemory())
+      if (const uint32_t p = svr2011::FallbackBlock(units * 16, !model_heap)) {
+        ctx.r3.u64 = p;
+        static int told = 0;
+        if (told++ < 5 || told % 200 == 0)
+          REXLOG_INFO("[svr2011] model memory: the {} heap ({}) full - {} bytes from the fallback memory ({} so)",
+                      heap == svr2011::kStageHeap ? "stage's" : heap == 53 ? "file" : model_heap ? "model" : "weapons'", heap,
+                      units * 16, told);
+        return;
+      }
   }
-  if (g_heap_log && ctx.r3.u32 && units * 16 >= 256 * 1024) {
+  if (g_heap_log && ctx.r3.u32 && (units * 16 >= 256 * 1024 || g_heap_watch >= 0)) {
     const auto saved = ctx;
     sub_8269A478(ctx, base);
     const uint32_t heap = ctx.r3.u32;
     ctx = saved;
-    REXLOG_INFO("[svr2011] heap {}: {} bytes at {:08X} (lr {:08X})", heap, units * 16, ctx.r3.u32, uint32_t(ctx.lr));
+    if (units * 16 >= 256 * 1024 || int(heap) == g_heap_watch)
+      REXLOG_INFO("[svr2011] heap {}: {} bytes at {:08X} (lr {:08X})", heap, units * 16, ctx.r3.u32, uint32_t(ctx.lr));
   }
-  if (g_heap_log && ctx.r3.u32 == 0 && units) {
+  if (ctx.r3.u32 == 0 && units) {
     const auto saved = ctx;
     sub_8269A478(ctx, base);
     const uint32_t heap = ctx.r3.u32;
     ctx = saved;
-    REXLOG_WARN("[svr2011] heap {}: allocation of {} bytes FAILED (16-byte units, lr {:08X})", heap, units * 16,
-                uint32_t(ctx.lr));
+    NoteFailed(heap, units * 16, uint32_t(ctx.lr));
   }
 }
 
@@ -326,6 +372,7 @@ void InstallRingRules(rex::memory::Memory* memory) {
   g_memory = memory;
   g_test_run = std::getenv("SVR2011_TEST_RUN") != nullptr;
   g_heap_log = std::getenv("SVR2011_TEST_HEAP_LOG") != nullptr;
+  if (const char* v = std::getenv("SVR2011_TEST_HEAP_LOG"); v && std::atoi(v) > 1) g_heap_watch = std::atoi(v);  // (1: on)
   if (const char* v = std::getenv("SVR2011_TEST_STATE_LOG"); v && *v) {
     g_log_scan = std::string(v) == "scan";
     if (g_log_scan) g_log_fields.push_back(0);

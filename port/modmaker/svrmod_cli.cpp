@@ -19,6 +19,7 @@
 #include "svrfmt/arena.h"
 #include "svrfmt/arena_import.h"
 #include "svrfmt/jboy.h"
+#include "svrfmt/model_objects.h"
 #include "svrfmt/png.h"
 #include "svrfmt/ring_kit.h"
 #include "svrfmt/pac.h"
@@ -183,6 +184,20 @@ int Lights(const char* pac, const char* host_pac, const char* out) {
   return WriteFile(out, EpacWrite(e)) ? 0 : 1;
 }
 
+// tablelid <arena.pac> <out.pac>: the announce tables' black lid tinted (svrfmt LiftTableLids, as the WWE '13
+// converter does) - for arenas converted before it.
+int TableLid(const char* pac, const char* out) {
+  Arena a;
+  std::string err;
+  if (!a.Load(pac, &err)) { std::printf("%s: %s\n", pac, err.c_str()); return 1; }
+  const int n = LiftTableLids(a);
+  std::printf("lids tinted: %d\n", n);
+  if (!n) return 0;
+  const Bytes o = a.Save(&err);
+  if (o.empty()) { std::printf("save: %s\n", err.c_str()); return 1; }
+  return WriteFile(out, o) ? 0 : 1;
+}
+
 // move <arena.pac> <model name> <right m> <up m> <forward m> <yaw deg> <pitch deg> <roll deg> <out.pac> [vis]:
 // one model moved / turned on all three axes about its bottom centre (the editor's pivot), its meshes' bounding
 // spheres refitted; with "vis" its visibility-tree box (0xC364, metres, 3ds Max axes) is refitted and its parents
@@ -283,6 +298,109 @@ int Import(const char* pac, const char* fbx, const char* out) {
   if (!serr.empty()) { std::printf("  error: %s\n", serr.c_str()); return 1; }
   if (!WriteFile(out, data)) return 1;
   std::printf("wrote %s (%zu bytes)\n", out, data.size());
+  return 0;
+}
+
+// The objects of arena models (svrfmt/model_objects.h):
+//   objects <bg.pac> [model]                          every model (id, name, zone, objects) or one model's objects
+//   obj-add <in.pac> <out.pac> <model> <file.obj|fbx> [x y z] [scale] [yaw] [cm]
+//   obj-remove <in.pac> <out.pac> <model> [object]     (no object: the whole model)
+//   obj-export <in.pac> <model> <object[,object..]|all> <out dir>
+int SaveArena(Arena& a, const char* out) {
+  const int grown = RefreshBounds(a);
+  a.file_max = kArenaFileMax;  // (as the arena page's save: bigger than shipped needs 2.1.6)
+  for (const auto& t : a.FitFile({})) std::printf("  texture %s halved to fit the arena file\n", t.c_str());
+  std::string serr;
+  const Bytes data = a.Save(&serr);
+  if (!serr.empty()) { std::printf("  error: %s\n", serr.c_str()); return 1; }
+  if (!WriteFile(out, data)) return 1;
+  const ArenaGeometry g = GeometryOf(a);
+  std::printf("wrote %s (%zu bytes; %zu objects, %zu vertices, %zu indices; %d visibility boxes grown)\n", out,
+              data.size(), MeshCount(a), g.verts, g.indices, grown);
+  return 0;
+}
+
+int Objects(int argc, char** argv) {
+  Arena a;
+  std::string err;
+  if (!a.Load(argv[2], &err)) { std::printf("%s: %s\n", argv[2], err.c_str()); return 1; }
+  if (argc >= 4) {
+    const int m = FindModel(a, argv[3]);
+    if (m < 0) { std::printf("no model %s\n", argv[3]); return 1; }
+    const auto& am = a.models[size_t(m)];
+    std::printf("model %X %s (%s): %zu objects, %zu textures, %zu nodes\n", am.id, am.model.name.c_str(),
+                ZoneName(am.zone), am.model.meshes.size(), am.model.textures.size(), am.model.nodes.size());
+    for (const auto& o : ObjectsOf(am.model))
+      std::printf("  %3d  %-16s %6zu verts %6zu tris%s%s\n", o.mesh, o.texture.c_str(), o.verts, o.triangles,
+                  o.skinned ? "  rigged" : "", o.empty ? "  (empty)" : "");
+    return 0;
+  }
+  size_t meshes = 0;
+  for (const auto& am : a.models) {
+    size_t vis = 0;
+    for (const auto& o : ObjectsOf(am.model)) vis += !o.empty;
+    meshes += am.model.meshes.size();
+    std::printf("%6X %-16s %-9s %3zu objects (%zu visible)\n", am.id, am.model.name.c_str(), ZoneName(am.zone),
+                am.model.meshes.size(), vis);
+  }
+  const ArenaGeometry g = GeometryOf(a);
+  std::printf("%zu models, %zu meshes, %zu visible objects, %zu vertices, %zu indices\n", a.models.size(), meshes,
+              MeshCount(a), g.verts, g.indices);
+  return 0;
+}
+
+int ObjAdd(int argc, char** argv) {
+  Arena a;
+  std::string err;
+  if (!a.Load(argv[2], &err)) { std::printf("%s: %s\n", argv[2], err.c_str()); return 1; }
+  const int m = FindModel(a, argv[4]);
+  if (m < 0) { std::printf("no model %s\n", argv[4]); return 1; }
+  AddOptions opt;
+  int i = 6;
+  if (argc >= i + 3) {
+    for (int k = 0; k < 3; ++k) opt.pos[k] = float(std::atof(argv[i + k]));
+    i += 3;
+  }
+  if (argc > i) opt.scale = float(std::atof(argv[i++]));
+  if (argc > i) opt.yaw_degrees = float(std::atof(argv[i++]));
+  if (argc > i && !std::strcmp(argv[i], "cm")) opt.obj_unit_meters = 0.01f;
+  AddReport rep;
+  const bool ok = AddObjectFile(a, m, argv[5], opt, rep);
+  std::printf("%s: %d objects added to %s (first %d), %d textures added\n", ok ? "added" : "FAILED", rep.meshes_added,
+              a.models[size_t(m)].model.name.c_str(), rep.first_mesh, rep.textures_added);
+  for (const auto& w : rep.warnings) std::printf("  warning: %s\n", w.c_str());
+  for (const auto& e : rep.errors) std::printf("  error: %s\n", e.c_str());
+  return ok ? SaveArena(a, argv[3]) : 1;
+}
+
+int ObjRemove(int argc, char** argv) {
+  Arena a;
+  std::string err;
+  if (!a.Load(argv[2], &err)) { std::printf("%s: %s\n", argv[2], err.c_str()); return 1; }
+  const int m = FindModel(a, argv[4]);
+  if (m < 0) { std::printf("no model %s\n", argv[4]); return 1; }
+  const int mesh = argc >= 6 ? std::atoi(argv[5]) : -1;
+  if (!RemoveObject(a, m, mesh, &err)) { std::printf("FAILED: %s\n", err.c_str()); return 1; }
+  std::printf("removed %s of %s\n", mesh < 0 ? "every object" : ("object " + std::to_string(mesh)).c_str(),
+              a.models[size_t(m)].model.name.c_str());
+  return SaveArena(a, argv[3]);
+}
+
+int ObjExport(char** argv) {
+  Arena a;
+  std::string err, path;
+  if (!a.Load(argv[2], &err)) { std::printf("%s: %s\n", argv[2], err.c_str()); return 1; }
+  const int m = FindModel(a, argv[3]);
+  if (m < 0) { std::printf("no model %s\n", argv[3]); return 1; }
+  std::vector<int> meshes;
+  if (std::strcmp(argv[4], "all"))  // (a list: 0,2,3)
+    for (const char* p = argv[4]; *p;) {
+      meshes.push_back(std::atoi(p));
+      while (*p && *p != ',') ++p;
+      if (*p) ++p;
+    }
+  if (!ExportObjectObj(a, m, meshes, argv[5], &path, &err)) { std::printf("FAILED: %s\n", err.c_str()); return 1; }
+  std::printf("wrote %s\n", path.c_str());
   return 0;
 }
 
@@ -448,6 +566,15 @@ int Wwe13(int argc, char** argv) {
     std::printf("\n");
   }
   std::printf("wrote %s: %.2f MB (host %.2f MB)\n", argv[4], out.size() / 1048576.0, h.size() / 1048576.0);
+  {  // (what the Arena page's save writes in the manifest for it: svrfmt/arena.h ArenaNeedsNew)
+    Arena a, host;
+    if (a.LoadData(out) && host.LoadData(h)) {
+      a.original_file = host.original_file;
+      const ArenaGeometry g = GeometryOf(a);
+      std::printf("geometry %zu vertices %zu indices; needs: %s\n", g.verts, g.indices,
+                  ArenaNeedsNew(a, out.size()) ? "yes (a newer game: needs=)" : "no");
+    }
+  }
   return 0;
 }
 
@@ -639,8 +766,13 @@ int main(int argc, char** argv) {
     return WriteFile(argv[3], out) ? 0 : 1;
   }
   if (argc == 5 && !std::strcmp(argv[1], "import")) return Import(argv[2], argv[3], argv[4]);
+  if ((argc == 3 || argc == 4) && !std::strcmp(argv[1], "objects")) return Objects(argc, argv);
+  if (argc >= 6 && !std::strcmp(argv[1], "obj-add")) return ObjAdd(argc, argv);
+  if ((argc == 5 || argc == 6) && !std::strcmp(argv[1], "obj-remove")) return ObjRemove(argc, argv);
+  if (argc == 6 && !std::strcmp(argv[1], "obj-export")) return ObjExport(argv);
   if (argc == 4 && !std::strcmp(argv[1], "bpe")) return Bpe(argv[2], argv[3]);
   if ((argc == 11 || argc == 12) && !std::strcmp(argv[1], "move")) return Move(argc, argv);
+  if (argc == 4 && !std::strcmp(argv[1], "tablelid")) return TableLid(argv[2], argv[3]);
   if ((argc == 4 || argc == 5) && !std::strcmp(argv[1], "lights")) return Lights(argv[2], argv[3], argc == 5 ? argv[4] : nullptr);
   if (argc >= 3 && !std::strcmp(argv[1], "bpetest")) return BpeTest(argv[2], argc >= 4 ? argv[3] : nullptr);
   if (argc >= 3 && !std::strcmp(argv[1], "roundtrip")) return Roundtrip(argc - 2, argv + 2);
@@ -737,6 +869,7 @@ int main(int argc, char** argv) {
     return 0;
   }
   std::printf("usage: svrmod roundtrip <file.pac>... | export <bgNN.pac> <out dir> | import <bgNN.pac> <fbx> <out.pac>\n"
-              "       | banner <picture> <out.dds> | bpe <raw> <out> | bpetest <file.pac> [out.pac]\n");
+              "       | banner <picture> <out.dds> | bpe <raw> <out> | bpetest <file.pac> [out.pac]\n"
+              "       | tablelid <arena.pac> <out.pac>\n");
   return 2;
 }

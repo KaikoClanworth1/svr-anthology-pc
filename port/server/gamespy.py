@@ -48,11 +48,41 @@ LOG = None
 LOG_LOCK = threading.Lock()
 
 
+LOG_MAX = 50 << 20   # (--log rotates at this size: server.log -> .1 -> .2 -> .3, the oldest dropped)
+LOG_KEEP = 3
+
+
+def rotate_log():
+    """Caller holds LOG_LOCK. Copy-and-truncate (not rename): a supervisor and its child both hold the file
+    open, and Windows can't rename an open file; appends from either land at the new end."""
+    import shutil
+    try:
+        path = LOG.name
+        if os.fstat(LOG.fileno()).st_size < LOG_MAX:
+            return
+        for n in range(LOG_KEEP - 1, 0, -1):
+            if os.path.exists("%s.%d" % (path, n)):
+                os.replace("%s.%d" % (path, n), "%s.%d" % (path, n + 1))
+        shutil.copyfile(path, path + ".1")
+        LOG.seek(0)
+        LOG.truncate()
+        LOG.write(time.strftime("%H:%M:%S ") + "log: rotated (the earlier lines are in %s.1)\n" %
+                  os.path.basename(path))
+    except (OSError, AttributeError, ValueError):
+        pass
+
+
+_log_lines = [0]
+
+
 def log(*parts):
     line = time.strftime("%H:%M:%S ") + " ".join(str(p) for p in parts)
     print(line, flush=True)
     if LOG:
         with LOG_LOCK:
+            _log_lines[0] += 1
+            if _log_lines[0] % 500 == 1:   # (the size, now and then)
+                rotate_log()
             LOG.write(line + "\n")
             LOG.flush()
 
@@ -177,12 +207,73 @@ class LocalBlobs:
                 pass
         return None
 
+    def open(self, sha, start=0):
+        """-> (a file of the bytes as stored, packed, where it starts) or None: a big blob read as it is sent.
+        A stored one (not packed) starts at `start` (a download's Range); a packed one at 0 (unpacked, then skipped)."""
+        for packed in (False, True):
+            try:
+                f = open(self.path(sha, packed), "rb")
+            except OSError:
+                continue
+            if start and not packed:
+                f.seek(start)
+                return f, packed, start
+            return f, packed, 0
+        return None
+
     def delete(self, sha):
         for packed in (True, False):
             try:
                 os.remove(self.path(sha, packed))
             except OSError:
                 pass
+
+    def list(self):
+        """Every blob file here: [{sha, size (on disk), packed, mtime, kind, name}] (the audit). A zip's
+        manifest name / type / version are read from it, for the dashboard."""
+        out = []
+        for d in sorted(os.listdir(self.folder)) if os.path.isdir(self.folder) else []:
+            sub = os.path.join(self.folder, d)
+            if len(d) != 2 or not os.path.isdir(sub):
+                continue
+            for f in os.listdir(sub):
+                sha, _, ext = f.partition(".")
+                if ext not in ("bin", "xz") or len(sha) != 64:
+                    continue
+                path = os.path.join(sub, f)
+                try:
+                    st = os.stat(path)
+                    with open(path, "rb") as fh:
+                        head = fh.read(12)
+                except OSError:
+                    continue
+                kind = ("xz" if head[:6] == b"\xfd7zXZ\x00" else "zip" if head[:4] == b"PK\x03\x04" else
+                        "jpeg" if head[:3] == b"\xff\xd8\xff" else "mp4" if head[4:8] == b"ftyp" else
+                        "mp3" if head[:3] == b"ID3" or head[:2] in (b"\xff\xfb", b"\xff\xf3") else "other")
+                row = {"sha": sha, "size": st.st_size, "packed": ext == "xz", "mtime": st.st_mtime, "kind": kind}
+                if kind == "zip":
+                    row["name"] = zip_title(path)
+                out.append(row)
+        return out
+
+
+def zip_title(path):
+    """A .svrmod's "name version (type)" from its manifest.txt, or ''."""
+    import zipfile
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = [n for n in z.namelist() if n.replace("\\", "/").rsplit("/", 1)[-1].lower() == "manifest.txt"]
+            if not names:
+                return ""
+            text = z.read(sorted(names, key=len)[0])[:4096].decode("utf-8", "replace")
+    except (zipfile.BadZipFile, OSError, RuntimeError, ValueError):
+        return ""
+    m = {k.strip().lower(): v.strip() for k, v in (ln.split("=", 1) for ln in text.splitlines() if "=" in ln)}
+    return ("%s %s (%s)" % (m.get("name", "?"), m.get("version", ""), m.get("type", "?"))).replace("  ", " ")
+
+
+class StorageBusy(OSError):
+    """The storage node is up but didn't hand a blob over in time (a busy disk): worth asking again soon."""
 
 
 class RemoteBlobs:
@@ -195,10 +286,13 @@ class RemoteBlobs:
         self.key = key
         self.timeout = timeout
 
-    def _req(self, method, sha, data=None, packed=True):
+    def _req(self, method, sha, data=None, packed=True, start=0):
         import urllib.request
+        headers = {"X-Storage-Key": self.key}
+        if start:
+            headers["Range"] = "bytes=%d-" % start
         r = urllib.request.Request("%s/blob/%s?packed=%d" % (self.url, sha, 1 if packed else 0), data=data,
-                                   method=method, headers={"X-Storage-Key": self.key})
+                                   method=method, headers=headers)
         return urllib.request.urlopen(r, timeout=self.timeout)
 
     def exists(self, sha):
@@ -220,11 +314,67 @@ class RemoteBlobs:
         except Exception:
             return None
 
+    def _get(self, sha, start=0):
+        """A GET, tried twice when the node doesn't answer in time or answers 5xx (its disk busy: 27 Oct the
+        old HDD at 100% gave 50 s first bytes); then StorageBusy. A 404 / 416 raises as it is."""
+        import urllib.error
+        for attempt in (1, 2):
+            try:
+                return self._req("GET", sha, start=start)
+            except urllib.error.HTTPError as e:
+                if e.code < 500:
+                    raise
+                why = "it said %d" % e.code
+            except Exception as e:
+                why = str(e) or type(e).__name__
+        log("storage node busy for %s (%s)" % (sha[:12], why))
+        raise StorageBusy(why)
+
+    def open(self, sha, start=0):
+        """-> (the node's answer, read as it comes, packed, where it starts) or None. A stored blob starts at
+        `start` when the node answers its Range (206: aiohttp's FileResponse); a packed one is asked for whole
+        (its packed bytes from an offset are no use - past a small packed file's end the node says 416) and
+        starts at 0. StorageBusy when the node is there but too slow (the caller's 503 + Retry-After)."""
+        try:
+            f = self._get(sha, start)
+        except StorageBusy:
+            raise
+        except Exception:
+            if not start:
+                return None
+            try:
+                f = self._get(sha)
+            except StorageBusy:
+                raise
+            except Exception:
+                return None
+            return f, f.headers.get("X-Packed") == "1", 0
+        packed = f.headers.get("X-Packed") == "1"
+        if f.status == 206 and not packed:
+            return f, packed, start
+        if f.status == 206:
+            f.close()
+            try:
+                f = self._get(sha)
+            except StorageBusy:
+                raise
+            except Exception:
+                return None
+        return f, packed, 0
+
     def delete(self, sha):
         try:
             self._req("DELETE", sha).close()
         except Exception:
             pass
+
+    def list(self):
+        """The node's blob files (GET <url>/blobs): as LocalBlobs.list. Raises when the node can't answer."""
+        import json as _json
+        import urllib.request
+        r = urllib.request.Request(self.url + "/blobs", headers={"X-Storage-Key": self.key})
+        with urllib.request.urlopen(r, timeout=120) as f:
+            return _json.loads(f.read())
 
 
 class Store:
@@ -481,6 +631,71 @@ class Store:
                 while self.cache_bytes > self.cache_max and self.cache:
                     self.cache_bytes -= len(self.cache.popitem(last=False)[1])
         return data
+
+    def blob_size(self, sha):
+        """The content's size (as sent, unpacked), or None."""
+        with self.lock:
+            row = self.db.execute("SELECT size FROM blobs WHERE sha = ?", (sha,)).fetchone()
+        return row[0] if row else None
+
+    def blob_chunks(self, sha, chunk=1 << 20, start=0):
+        """The content in pieces as it is read (from the disk or the storage node) and unpacked: an iterator,
+        or None when it isn't there. A big download starts at once instead of after the whole file (a 217 MB
+        mod: 40 s+ before its first byte); a broken stream raises OSError / LZMAError part way.
+        start: from that byte (a download's Range) - a stored blob seeks there, a packed one is unpacked and
+        the bytes before it dropped."""
+        with self.lock:
+            data = self.cache.get(sha)
+        if data is not None:
+            return iter([data[i:i + chunk] for i in range(start, len(data), chunk)] or [b""])
+        src = self.blobs.open(sha, start)
+        if src is None:
+            return None
+        f, packed, at = src
+        if at >= start:
+            return self._pieces(sha, f, packed, chunk)
+        whole = self._pieces(sha, f, packed, chunk)
+
+        def skipped():   # (the bytes before start dropped as they come)
+            skip = start - at
+            try:
+                for piece in whole:
+                    if skip >= len(piece):
+                        skip -= len(piece)
+                        continue
+                    yield piece[skip:]
+                    skip = 0
+            finally:
+                whole.close()
+        return skipped()
+
+    def _pieces(self, sha, f, packed, chunk):
+        def pieces():
+            try:
+                d = lzma.LZMADecompressor() if packed else None
+                while True:
+                    raw = f.read(chunk)
+                    if not d:
+                        if not raw:
+                            return
+                        yield raw
+                        continue
+                    if not raw and d.needs_input:
+                        if not d.eof:
+                            raise lzma.LZMAError("the packed blob %s ends early" % sha[:12])
+                        return
+                    out = d.decompress(raw, max_length=chunk)
+                    if out:
+                        yield out
+                    while not d.needs_input and not d.eof:  # (more out of what came in)
+                        out = d.decompress(b"", max_length=chunk)
+                        if out:
+                            yield out
+                    if d.eof:
+                        return
+            finally:
+                f.close()
+        return pieces()
 
     def owner_bytes(self, ownerid):
         with self.lock:
@@ -952,6 +1167,8 @@ class Sake:
     # (set by the service: whether a Community Creations record without the game's "checked for mods"
     # mark - a build before the check - is refused (True) or only logged)
     refuse_unmarked = None
+    # (set by the service: name_check(owner, values) -> why a record's names are refused (the name filter), or None)
+    name_check = None
 
     def news_panel(self):
         """The NEWS panel's whole text as the game's fetch gets it (the prefix, then
@@ -1018,9 +1235,18 @@ class Sake:
                 out.append(rec)
         return out
 
-    def handle(self, func, call, owner, xuid, modfree=False):
-        """A Sake call from the player with profile `owner` and XUID `xuid`."""
+    def handle(self, func, call, owner, xuid, modfree=False, notes=None):
+        """A Sake call from the player with profile `owner` and XUID `xuid`. `notes` (a list) gets what the
+        player is told on screen (the server's X-Svr-Notice: a refused name)."""
         tableid = text_of(call, "tableid")
+
+        def names_refused(values):
+            why = self.name_check(owner, values) if self.name_check else None
+            if why:
+                log("sake: %s record from %d refused: %s %s" % (tableid, owner, why, short(values)))
+                if notes is not None:
+                    notes.append(why)
+            return why
         fields = [s.text or "" for s in (child(call, "fields") or [])]
 
         def reply(result, extra=""):
@@ -1036,6 +1262,8 @@ class Sake:
                 values["UserID"] = ["binaryDataValue", base64.b64encode(xuid.to_bytes(8, "big")).decode()]
             if self.store.count_owned(tableid, owner) >= RECORD_LIMIT:
                 return reply("RecordLimitReached")
+            if names_refused(values):
+                return reply("NoPermission")
             # a creation from a build that doesn't check for mods (no X-Svr-ModFree from the relay): it may
             # need mods others don't have
             if tableid == "UserContent" and not modfree:
@@ -1076,6 +1304,8 @@ class Sake:
             values = read_values(child(call, "values"))
             values.pop("AuthorName", None)
             values.pop("UserID", None)
+            if names_refused(values):
+                return reply("NoPermission")
             self.store.update(tableid, recordid, values)
             return reply("Success")
         if func == "DeleteRecord":

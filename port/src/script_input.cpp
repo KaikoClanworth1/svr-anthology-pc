@@ -82,6 +82,8 @@ constexpr Route kRoutes[] = {
     // (through the select screen and the match screen to the match loading:
     // with SVR2011_TEST_MATCH / SVR2011_TEST_RULE, the match a test asks for)
     {"match", "route normal\npressuntil A match: rule"},
+    // (the same, but the presses stop as the match loads: its entrances play - arena checks of ramps and screens)
+    {"match_entrances", "route normal\npressuntil A arena mods: a match loads"},
 };
 
 // "until": the text a step waits for in the log, and whether it has come.
@@ -430,12 +432,17 @@ bool ScriptInputDriver::RunSmart(Clock::time_point now, Step& out) {
   }
 
   if (current_.kind == Step::kUntil || current_.kind == Step::kPressUntil) {
+    // (test aid SVR2011_TEST_SCRIPT_WAIT=<s>: a longer give-up - whole matches played to their end, repeated)
+    static const double give_up = [] {
+      const char* e = std::getenv("SVR2011_TEST_SCRIPT_WAIT");
+      return e && std::atof(e) > 0 ? std::atof(e) : 180.0;
+    }();
     const bool hit = g_until_hit;
-    if (hit || waited > 180) {
+    if (hit || waited > give_up) {
       if (hit)
         REXLOG_INFO("script input: until \"{}\": seen after {:.1f} s", current_.arg, waited);
       else
-        REXLOG_WARN("script input: until \"{}\": not seen in 180 s - going on", current_.arg);
+        REXLOG_WARN("script input: until \"{}\": not seen in {:.0f} s - going on", current_.arg, give_up);
       std::lock_guard until(g_until_mutex);
       g_until_text.clear();
       return false;

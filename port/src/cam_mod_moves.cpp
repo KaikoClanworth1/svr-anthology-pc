@@ -23,6 +23,7 @@
 #include <rex/system/xmemory.h>
 
 #include "cam_mod_moves.h"
+#include "crowd_fight.h"
 #include "match_diag.h"
 #include "move_packs.h"
 #include "online_mods.h"
@@ -75,7 +76,8 @@ void InstallCamModMoves(rex::memory::Memory* memory) { g_memory = memory; }
 
 // CREATE A MOVE-SET's list rows (sub_82BA1AC8(page, tab, first row)): each of the 13 rows' text element
 // (*(*(page + 620) + 8) + ((row + *(page + 1112)) << 8)) keeps a pointer to its record's name at +216. A pack
-// move's row points to "MOD: <name>" instead (the record's own name - the match HUD's - stays as it is).
+// move's row points to "MOD: <name>" - unless the record's own name has it (move_packs.cpp names pack moves so
+// everywhere since 29 Oct, the match HUD too).
 REX_EXTERN(__imp__sub_82BA1AC8);
 REX_HOOK_RAW(sub_82BA1AC8) {
   const uint32_t page = ctx.r3.u32;
@@ -92,6 +94,8 @@ REX_HOOK_RAW(sub_82BA1AC8) {
     const uint32_t rec = name - 16;
     const uint16_t id = Rd16(base, rec + 0x90);
     if (!svr2011::PackMove(id)) continue;
+    // (the record's own name says it already - PatchWaze names pack moves "MOD: <name>": no "MOD: MOD: ")
+    if (!std::strncmp(reinterpret_cast<const char*>(base + name), "MOD: ", 5)) continue;
     uint32_t label = 0;
     {
       std::lock_guard lock(g_mutex);
@@ -177,13 +181,14 @@ uint32_t MatchMove(uint8_t* base, uint32_t slot, uint32_t got) {
     once = true;
     REXLOG_INFO("[svr2011] cam mods: match move getter active (slot {} move {})", slot, got & 0x7FFF);
   }
-  // Test aid: SVR2011_TEST_MOVE_LOG=1 logs the first 200 distinct (slot, move) pairs the match asks for.
+  // Test aid: SVR2011_TEST_MOVE_LOG=1 logs the first 2000 distinct (slot, move) pairs the match asks for (menus ask
+  // too: 200 ran out before a match).
   static const bool trace = [] { const char* v = std::getenv("SVR2011_TEST_MOVE_LOG"); return v && *v == '1'; }();
   if (trace) {
     static std::mutex tmu;
     static std::map<uint32_t, bool> seen;
     std::lock_guard lock(tmu);
-    if (seen.size() < 200 && !seen[slot << 16 | (got & 0xFFFF)]) {
+    if (seen.size() < 2000 && !seen[slot << 16 | (got & 0xFFFF)]) {
       seen[slot << 16 | (got & 0xFFFF)] = true;
       REXLOG_INFO("[svr2011] cam mods: match asks slot {} (category {}) -> move {}", slot, kSlotCategory[slot], got & 0x7FFF);
     }
@@ -224,6 +229,7 @@ REX_HOOK_RAW(sub_8218E600) {
   __imp__sub_8218E600(ctx, base);
   ctx.r3.u64 = MatchMove(base, slot, ctx.r3.u32);
   svr2011::NoteMove(fighter, slot, ctx.r3.u32);  // (a frozen match's report: match_diag.h)
+  svr2011::CrowdMoveAsked(fighter, slot);         // (a taunt by the barricade: crowd_fight.h)
 }
 REX_EXTERN(__imp__sub_8218E580);
 REX_HOOK_RAW(sub_8218E580) {
@@ -231,4 +237,5 @@ REX_HOOK_RAW(sub_8218E580) {
   __imp__sub_8218E580(ctx, base);
   ctx.r3.u64 = MatchMove(base, slot, ctx.r3.u32);
   svr2011::NoteMove(fighter, slot, ctx.r3.u32);
+  svr2011::CrowdMoveAsked(fighter, slot);
 }

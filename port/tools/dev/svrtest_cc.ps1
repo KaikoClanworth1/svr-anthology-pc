@@ -23,6 +23,7 @@
 # Example (the mod-move refusal: a jeff_hardy move planted into CAW slot 0's moveset, in memory):
 #   svrtest_cc.ps1 --mods "...\Game Files\Mods\Superstars\jeff_hardy" --env SVR2011_TEST_CC_MODMOVE=0:3575
 param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Rest)
+$env:SVR2011_AUDIO_MUTE = "1"  # (test games stay muted even if their command line is lost)
 $ErrorActionPreference = "Stop"
 $tools = Split-Path $PSScriptRoot -Parent
 $port = Split-Path $tools -Parent
@@ -95,7 +96,7 @@ $t = (Get-Content (Join-Path $src "test_config_ent_down.toml") -Raw) -replace '(
 # ---- the server, the game
 $py = "C:\Users\Ranger\AppData\Local\Programs\Python\Python311\python.exe"
 $srvLog = Join-Path $out "server.log"
-$srv = Start-Process $py -ArgumentList "`"$port\server\server.py`" --host 127.0.0.1 --port $sp --data `"$(Join-Path $root 'cc_srv\data')`" --log `"$srvLog`"" -PassThru -WindowStyle Hidden
+$srv = Start-Process $py -ArgumentList "`"$port\server\server.py`" --test-open-accounts --host 127.0.0.1 --port $sp --data `"$(Join-Path $root 'cc_srv\data')`" --log `"$srvLog`"" -PassThru -WindowStyle Hidden
 $log = Join-Path $out "game.log"
 $inputFile = Join-Path $out "input.txt"
 Set-Content $inputFile "" -NoNewline
@@ -130,6 +131,7 @@ try {
     foreach ($e in $o.env) { $n, $v = $e -split '=', 2; [Environment]::SetEnvironmentVariable($n, $v, "Process") }
     $gameArgs = @("--log_file=`"$log`"", "--log_level=info", "--audio_mute=true", "--fullscreen=false", "--monitor=2", "--mnk_mode=false",
                   "--p2p_port_mapping=false", "--p2p_relay=false", "--p2p_port=$p2p", "--dbg_out=`"$out`"")
+    Use-SvrTestServer -GameDir $game -GameArgs $gameArgs | Out-Null
     $proc = Start-Process $exe -WorkingDirectory $game -ArgumentList $gameArgs -PassThru -WindowStyle Minimized
     foreach ($e in $o.env) { [Environment]::SetEnvironmentVariable(($e -split '=', 2)[0], $null, "Process") }
     foreach ($v in "SVR2011_INPUT_FILE", "SVR2011_CONFIG", "SVR2011_USER_DATA") { [Environment]::SetEnvironmentVariable($v, $null, "Process") }

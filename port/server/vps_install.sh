@@ -36,8 +36,8 @@ etc=/etc/svr2011
 unit=/etc/systemd/system/svr2011.service
 ngx_dir=/etc/nginx/svr2011
 ngx_file=$ngx_dir/svr-location.conf
-files="server.py admin_auth.py gamespy.py leaderboards.py media.py relay.py relay_link.py thumbs.py lb_reset.py
-       discovery.py dashboard.html leaderboards.json requirements.txt"
+files="server.py admin_auth.py gamespy.py leaderboards.py match_names.py media.py relay.py relay_link.py thumbs.py lb_reset.py
+       signup.py namefilter.py discovery.py reports.py dashboard.html leaderboards.json requirements.txt"
 pw_tool=/usr/local/sbin/svr2011-admin-password
 
 # run CMD...: does it (or prints it with --dry-run)
@@ -246,6 +246,40 @@ location = /svr/api/mods {
     proxy_read_timeout 3600s;
     proxy_send_timeout 3600s;
     client_max_body_size 260m;
+}
+# ...and an owner's update of one (PUT /svr/api/mods/{id}/file: the same limit; GET downloads pass too)
+location ~ ^/svr/api/mods/[0-9]+/file$ {
+    proxy_pass http://127.0.0.1:8101;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Portal-Role "";
+    proxy_set_header X-Portal-Public "";
+    proxy_set_header X-Portal-User "";
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    client_max_body_size 260m;
+}
+
+# problem reports: a 25 MB zip, up to five 8 MB pictures, the match folder (5 MB) and the mods the check asked
+# for (300 MB a report) - streamed to the core, which writes the mods to disk as they come (reports.py)
+location = /svr/api/reports {
+    proxy_pass http://127.0.0.1:8101;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Portal-Role "";
+    proxy_set_header X-Portal-Public "";
+    proxy_set_header X-Portal-User "";
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_read_timeout 1800s;
+    proxy_send_timeout 1800s;
+    client_max_body_size 400m;
 }
 
 # entrance songs and movies are larger (--max-music-mb 512, --max-movie-mb 1024)

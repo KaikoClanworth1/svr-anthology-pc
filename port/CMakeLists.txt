@@ -26,10 +26,14 @@ set(SVR2011_SOURCES
     src/profiler.cpp
     src/fps_overlay.cpp
     src/perf_stats.cpp
+    src/guest_faults.cpp
+    src/android_perf.cpp
     src/achievements_page.cpp
     src/jukebox.cpp
     src/graphics_page.cpp
+    src/display_modes.cpp
     src/touch_controls.cpp
+    src/touch_icons.cpp
     src/discord_presence.cpp
     src/online.cpp
     src/online_net.cpp
@@ -37,6 +41,7 @@ set(SVR2011_SOURCES
     src/online_cpu.cpp
     src/online_cas.cpp
     src/online_mods.cpp
+    src/mod_transfer.cpp
     src/online_chat.cpp
     src/online_overlay.cpp
     src/leaderboards.cpp
@@ -57,6 +62,8 @@ set(SVR2011_SOURCES
     src/paint_pages.cpp
     src/match_types.cpp
     src/match_diag.cpp
+    src/match_box.cpp
+    src/match_record.cpp
     src/caw_check.cpp
     src/caw_limits.cpp
     src/match_hud.cpp
@@ -71,6 +78,7 @@ set(SVR2011_SOURCES
     src/backgrounds_page.cpp
     src/weapons_page.cpp
     src/weapon_mods.cpp
+    src/cpu_difficulty.cpp
     src/crowd_fight.cpp
     src/fast_start.cpp
     src/players.cpp
@@ -87,10 +95,12 @@ set(SVR2011_SOURCES
     src/universe_welcome.cpp
     src/crowd_signs.cpp
     src/media_mods.cpp
+    src/vs_styles.cpp
     src/move_packs.cpp
     modmaker/svrfmt/pac.cpp
     modmaker/svrfmt/texture.cpp
     modmaker/svrfmt/jboy.cpp
+    modmaker/svrfmt/mod_travel.cpp
     src/crowd_off.cpp
     src/frame_rate.cpp
     src/roster.cpp
@@ -132,7 +142,7 @@ if(SVR2011_D3D_TRACE)
 else()
     # Native renderer (native_renderer=main), drawing through plume. Its hooks
     # overlap the census hooks, so it is left out of census builds.
-    list(APPEND SVR2011_SOURCES src/model_mem.cpp)   # hooks sub_82914DD0, as the census does
+    list(APPEND SVR2011_SOURCES src/model_mem.cpp src/mem_trace.cpp)   # hooks sub_82914DD0, as the census does
     list(APPEND SVR2011_SOURCES
         src/native/gpu.cpp
         src/native/backend_vulkan.cpp
@@ -176,7 +186,7 @@ endif()
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
              "${CMAKE_CURRENT_SOURCE_DIR}/VERSION.txt" "${CMAKE_CURRENT_SOURCE_DIR}/BUILD_COMMIT.txt")
 # (online_files.cpp too: the online version gate compares it with the newest release)
-set_source_files_properties(src/svr2011_app.cpp src/online_files.cpp PROPERTIES COMPILE_DEFINITIONS
+set_source_files_properties(src/svr2011_app.cpp src/online_files.cpp src/match_record.cpp PROPERTIES COMPILE_DEFINITIONS
     "SVR2011_PORT_VERSION=\"${SVR2011_PORT_VERSION}\";SVR2011_BUILD_COMMIT=\"${SVR2011_BUILD_COMMIT}\"")
 
 # Windows only: XAudio2 audio, crash reports, PC music (XAudio2 + Media
@@ -377,16 +387,16 @@ if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/launcher/svr2011_launcher.c")
         set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${doc_path}")
     endforeach()
     add_executable(svr2011_modmaker WIN32
-        modmaker/app.cpp modmaker/arena_page.cpp modmaker/star_page.cpp modmaker/threads_page.cpp modmaker/simple_star.cpp modmaker/simple_steps.cpp modmaker/simple_arena.cpp modmaker/simple_port.cpp modmaker/disc_list.cpp modmaker/mod_check.cpp modmaker/signs_page.cpp modmaker/backgrounds_page.cpp
-        modmaker/media_page.cpp modmaker/full_preview.cpp modmaker/audio_out.cpp modmaker/video_mf.cpp modmaker/hair_sim.cpp modmaker/model_materials.cpp modmaker/material_panel.cpp modmaker/moves_page.cpp modmaker/anims_page.cpp modmaker/assets_page.cpp
+        modmaker/app.cpp launcher/report_send.c modmaker/arena_page.cpp modmaker/star_page.cpp modmaker/threads_page.cpp modmaker/simple_star.cpp modmaker/simple_steps.cpp modmaker/simple_arena.cpp modmaker/simple_port.cpp modmaker/disc_list.cpp modmaker/mod_check.cpp modmaker/signs_page.cpp modmaker/backgrounds_page.cpp
+        modmaker/media_page.cpp modmaker/full_preview.cpp modmaker/audio_out.cpp modmaker/video_mf.cpp modmaker/hair_sim.cpp modmaker/model_materials.cpp modmaker/material_panel.cpp modmaker/moves_page.cpp modmaker/move_check.cpp modmaker/anims_page.cpp modmaker/assets_page.cpp
         modmaker/icons_page.cpp modmaker/caw_page.cpp modmaker/help_page.cpp modmaker/other_page.cpp modmaker/match_page.cpp
-        modmaker/tool_run.cpp modmaker/session_log.cpp launcher/movie_maker.c launcher/bink_encode.c launcher/caw_import.c launcher/stfs.c
+        modmaker/tool_run.cpp modmaker/session_log.cpp launcher/movie_maker.c launcher/bink_encode.c launcher/caw_import.c launcher/stfs.c launcher/move_warning.c
         launcher/setup_tab.c launcher/updater.c
         modmaker/svrfmt/wwe13.cpp ${REXSDK_DIR}/thirdparty/libmspack/libmspack/mspack/lzxd.c modmaker/editor.cpp modmaker/char_preview.cpp modmaker/svrfmt/ring_kit.cpp modmaker/svrfmt/arena_build.cpp
-        modmaker/svrfmt/pac.cpp modmaker/svrfmt/archive.cpp modmaker/svrfmt/texture.cpp modmaker/svrfmt/jboy.cpp modmaker/svrfmt/disc.cpp modmaker/pac_editor.cpp modmaker/loudness.cpp modmaker/port_page.cpp modmaker/attire_page.cpp
+        modmaker/svrfmt/pac.cpp modmaker/svrfmt/archive.cpp modmaker/svrfmt/texture.cpp modmaker/svrfmt/jboy.cpp modmaker/svrfmt/mod_travel.cpp modmaker/svrfmt/disc.cpp modmaker/pac_editor.cpp modmaker/loudness.cpp modmaker/port_page.cpp modmaker/attire_page.cpp
         modmaker/pac_attires.cpp modmaker/installed_page.cpp modmaker/svrfmt/char_fbx.cpp modmaker/rig_map.cpp launcher/unzip.c
         modmaker/svrfmt/fbx_write.cpp modmaker/svrfmt/png.cpp modmaker/svrfmt/arena.cpp
-        modmaker/svrfmt/arena_import.cpp modmaker/svrfmt/zip_write.cpp
+        modmaker/svrfmt/arena_import.cpp modmaker/svrfmt/model_objects.cpp modmaker/svrfmt/zip_write.cpp
         modmaker/third_party/ufbx/ufbx.c launcher/bink_decode.c
         ${IMGUI_SRC}/imgui.cpp ${IMGUI_SRC}/imgui_draw.cpp ${IMGUI_SRC}/imgui_tables.cpp
         ${IMGUI_SRC}/imgui_widgets.cpp ${IMGUI_SRC}/backends/imgui_impl_win32.cpp
@@ -404,7 +414,7 @@ if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/launcher/svr2011_launcher.c")
     # (Media Foundation only when used: Windows "N" without the Media Feature Pack)
     target_link_options(svr2011_modmaker PRIVATE -Wl,/DELAYLOAD:mfplat.dll -Wl,/DELAYLOAD:mfreadwrite.dll)
     set_target_properties(svr2011_modmaker PROPERTIES OUTPUT_NAME "SvR2011 Mod Maker")
-    add_executable(svr2011_launcher WIN32 launcher/svr2011_launcher.c launcher/apk_package.c launcher/report.c launcher/stfs.c launcher/caw_import.c launcher/verify.c launcher/movie_maker.c launcher/bink_encode.c launcher/bink_decode.c launcher/updater.c launcher/release_check.c launcher/unzip.c launcher/mods_tab.c launcher/backgrounds.c launcher/music_tab.c launcher/roster_tab.c launcher/texpacks_tab.c launcher/ui_theme.c launcher/setup_tab.c launcher/discover_tab.c launcher/launcher.rc src/utf8.manifest)
+    add_executable(svr2011_launcher WIN32 launcher/svr2011_launcher.c launcher/move_warning.c launcher/apk_package.c launcher/report.c launcher/report_send.c launcher/report_match.c launcher/stfs.c launcher/caw_import.c launcher/verify.c launcher/movie_maker.c launcher/bink_encode.c launcher/bink_decode.c launcher/updater.c launcher/release_check.c launcher/unzip.c launcher/mods_tab.c launcher/backgrounds.c launcher/music_tab.c launcher/roster_tab.c launcher/texpacks_tab.c launcher/ui_theme.c launcher/setup_tab.c launcher/discover_tab.c launcher/music_level.c launcher/launcher.rc src/utf8.manifest)
     set_target_properties(svr2011_launcher PROPERTIES OUTPUT_NAME "SvR2011 Launcher")
     # The SvR Anthology launcher (branch anthology): SVR Anthology by Yumboy11 - his installer, then the game
     # with --game_data_root; no mods, no online (launcher/anthology_launcher.c).

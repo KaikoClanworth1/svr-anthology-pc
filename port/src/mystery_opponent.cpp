@@ -50,6 +50,7 @@
 #include <rex/ui/imgui_dialog.h>
 
 #include "generated/default/svr2011_init.h"
+#include "rtwm_streak.h"
 #include "superstar_mods.h"
 
 namespace {
@@ -129,7 +130,7 @@ uint32_t Choose(uint8_t* base, uint32_t player) {
     const uint8_t* rec = Record(base, id);
     if (rec && rec[kSelectable] == 1 && !rec[kDlc] && fits(id)) pool.push_back(id);
   }
-  for (uint32_t id : svr2011::SuperstarModIds())
+  for (uint32_t id : svr2011::SuperstarModIds(false))
     if (fits(id) && std::find(pool.begin(), pool.end(), id) == pool.end()) pool.push_back(id);
   if (rex::cvar::GetFlagByName("managers_tile") != "false")
     for (uint32_t id : kManagers)
@@ -394,7 +395,9 @@ REX_HOOK_RAW(sub_828C3AC8) {
 REX_EXTERN(__imp__sub_82465038);
 REX_HOOK_RAW(sub_82465038) {
   const uint32_t cursor = ctx.r3.u32;
+  const bool mod_shown = svr2011::RtwmShowModBegin(base);  // (RTWM's Streak list: its panel shows the mod)
   __imp__sub_82465038(ctx, base);
+  svr2011::RtwmShowModEnd(base, mod_shown);
   if (!g_on.load() || !cursor) return;
   if (!g_player_ready.load()) {
     g_auto_done = false;

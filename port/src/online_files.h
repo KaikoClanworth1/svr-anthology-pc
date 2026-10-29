@@ -28,12 +28,20 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 namespace svr2011 {
 
 // The app's paths (before the settings are read), then - with online on
 // (InstallOnline) - the checks start (threads).
 void SetGameFilesPaths(const std::filesystem::path& game_root, const std::filesystem::path& user_data);
+const std::filesystem::path& UserDataFolder();
+
+// A gameplay mod folder's CRC as the mod set has it (a downloaded copy is checked with it: mod_transfer.cpp),
+// and plain CRC-32 (a running value, start 0; a file's: false if unreadable).
+uint32_t ModFolderCrc(const std::filesystem::path& dir);
+uint32_t Crc32(uint32_t crc, const void* data, size_t n);
+bool FileCrc32(const std::filesystem::path& file, uint32_t* out);
 void StartGameFilesCheck();
 
 enum class GameFiles { kChecking, kClean, kModified };
@@ -64,6 +72,27 @@ uint64_t GameplayModSetHash();
 // and no mod superstar / arena can be picked online.
 void SetOnlineModsAllowed(bool on);
 bool OnlineModsAllowed();
+// The friends poll got no answer (no server, an error): as mods_online off
+// for ModsOnlineMessage until it answers again.
+void OnlineServerUnanswered();
+// The friends poll was refused for this account (2.1.6 servers: no re-activation code / confirmed email yet -
+// the launcher's Online tab does the steps): the server's reason, "" when it answers again. ModsOnlineMessage
+// says it first.
+void SetOnlineAccountBlock(const std::string& why);
+
+// The mods on in this run that change match data (Mods/<kind>/<folder>, not
+// "disabled"; the kinds: Superstars - their pack moves are merged into the
+// move tables -, Moves, Arenas, Backstage, Weapons, Attires, Media - an
+// entrance's length) and the restored match types switched on (Mods/MatchTypes:
+// on unless "disabled" - the user's call, 24 Oct). Cosmetic kinds (Backgrounds,
+// VsStyles, Signs, texture packs, music) don't count. None with Start Without
+// Mods (it turns the match types off too). Read once.
+const std::vector<std::string>& ActiveMatchMods();
+// Online matches with mods on while the server's mods_online is off (or
+// unknown: no answer) are off - the message for the player (their language),
+// "" when they may play. Asked where online is entered (GameFilesOnlineMessage:
+// the ONLINE menu's gate) and before an invite walks the game to a session.
+std::string ModsOnlineMessage();
 
 std::string ModSetDifference(const std::string& mine, const std::string& theirs, bool superstars = true);
 // A mod as the online checks know it (Mods/<kind>/<folder>, kind

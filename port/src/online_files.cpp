@@ -1,5 +1,8 @@
 // What online needs to trust - see online_files.h.
 #include "online_files.h"
+
+#include "../modmaker/svrfmt/mod_travel.h"
+#include "mod_transfer.h"
 #include "no_mods.h"
 
 #include <algorithm>
@@ -11,6 +14,7 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <set>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -24,6 +28,7 @@
 #include <sys/resource.h>
 #endif
 
+#include <rex/cvar.h>
 #include <rex/filesystem.h>
 #include <rex/logging.h>
 
@@ -261,14 +266,28 @@ std::string ManifestValue(const fs::path& manifest, const char* key) {
   return "";
 }
 
-// Pictures, sounds and movies: cosmetic (left out of a mod's CRC).
-bool Cosmetic(const fs::path& p) {
-  std::string e = p.extension().string();
-  std::transform(e.begin(), e.end(), e.begin(), [](unsigned char ch) { return char(std::tolower(ch)); });
-  for (const char* x : {".png", ".jpg", ".jpeg", ".bmp", ".dds", ".tga", ".ogg", ".wav", ".mp3", ".xma", ".bik",
-                        ".wmv", ".mp4", ".db", ".ini"})
-    if (e == x) return true;
-  return false;
+// Pictures, sounds and movies: cosmetic (left out of a mod's CRC). Dot files too: the Mod Maker's project settings
+// (.mm_project.txt) and local markers (.applied) aren't the mod.
+// (the files outside a mod's key: one rule with what may travel online - svrfmt/mod_travel.h)
+bool Cosmetic(const fs::path& p) { return svrfmt::CosmeticFile(p); }
+
+// A mod folder's CRC for the set: its files but the cosmetic ones in a stable order, each one's path and CRC
+// folded (the same for a downloaded copy: mod_transfer.cpp checks it against the host's).
+uint32_t FolderCrc(const fs::path& dir) {
+  std::error_code ec;
+  std::vector<fs::path> files;
+  for (const auto& f : fs::recursive_directory_iterator(dir, ec))
+    if (f.is_regular_file() && !Cosmetic(f.path())) files.push_back(f.path());
+  std::sort(files.begin(), files.end());
+  uint32_t crc = 0;
+  for (const fs::path& f : files) {
+    uint32_t c = 0;
+    if (!FileCrc(f, false, &c)) continue;
+    const std::string rel = fs::relative(f, dir, ec).generic_string();
+    crc = CrcUpdate(crc, reinterpret_cast<const uint8_t*>(rel.data()), rel.size());
+    crc = CrcUpdate(crc, reinterpret_cast<const uint8_t*>(&c), 4);
+  }
+  return crc;
 }
 
 std::string BuildModSet() {
@@ -277,24 +296,25 @@ std::string BuildModSet() {
   const fs::path mods = rex::filesystem::GetExecutableFolder() / "Mods";
   std::error_code ec;
   for (const char* kind : {"Superstars", "Moves", "Arenas", "Backstage"}) {
-    for (const auto& e : fs::directory_iterator(mods / kind, ec)) {
+    if (svr2011::BackstageModsOff() && std::string(kind) == "Backstage") continue;  // (no_mods.h: not loaded)
+    // (a run that loads the host's fetched mods: those too - <folder>@<crc>, its key the host's; only the kinds
+    // that load from there: superstar_mods.cpp)
+    std::vector<std::pair<fs::directory_entry, bool>> entries;  // (fetched: its folder is <id>@<crc>)
+    std::set<std::string> own;
+    for (const auto& e : fs::directory_iterator(mods / kind, ec))
+      entries.push_back({e, false}), own.insert(e.path().filename().string());
+    if (svr2011::OnlineModsLoad() && !std::strcmp(kind, "Superstars"))
+      for (const auto& e : fs::directory_iterator(svr2011::OnlineModsRoot() / kind, ec)) entries.push_back({e, true});
+    for (const auto& [e, fetched] : entries) {
       if (!e.is_directory() || fs::exists(e.path() / "disabled", ec)) continue;
-      // (the files in a stable order, then their CRCs folded)
-      std::vector<fs::path> files;
-      for (const auto& f : fs::recursive_directory_iterator(e.path(), ec))
-        if (f.is_regular_file() && !Cosmetic(f.path())) files.push_back(f.path());
-      std::sort(files.begin(), files.end());
-      uint32_t crc = 0;
-      for (const fs::path& f : files) {
-        uint32_t c = 0;
-        if (!FileCrc(f, false, &c)) continue;
-        const std::string rel = fs::relative(f, e.path(), ec).generic_string();
-        crc = CrcUpdate(crc, reinterpret_cast<const uint8_t*>(rel.data()), rel.size());
-        crc = CrcUpdate(crc, reinterpret_cast<const uint8_t*>(&c), 4);
+      std::string id = e.path().filename().string();
+      if (fetched) {
+        id = id.substr(0, id.rfind('@'));
+        if (own.count(id)) continue;  // (this game's own of that name plays: superstar_mods.cpp)
       }
+      const uint32_t crc = FolderCrc(e.path());
       const fs::path manifest = e.path() / "manifest.txt";
       std::string name = ManifestValue(manifest, "name"), version = ManifestValue(manifest, "version");
-      const std::string id = e.path().filename().string();
       if (name.empty()) name = id;
       if (version.empty()) version = "-";
       char hex[16];
@@ -355,6 +375,17 @@ void SetGameFilesPaths(const fs::path& game_root, const fs::path& user_data) {
   g_user_data = user_data;
 }
 
+const fs::path& UserDataFolder() { return g_user_data; }
+
+uint32_t ModFolderCrc(const fs::path& dir) { return FolderCrc(dir); }
+
+uint32_t Crc32(uint32_t crc, const void* data, size_t n) {
+  std::call_once(g_crc_once, CrcInit);
+  return CrcUpdate(crc, static_cast<const uint8_t*>(data), n);
+}
+
+bool FileCrc32(const fs::path& file, uint32_t* out) { return FileCrc(file, false, out); }
+
 void StartGameFilesCheck() {
   static std::once_flag once;
   std::call_once(once, [game_root = g_game_root, user_data = g_user_data] {
@@ -396,7 +427,7 @@ std::string GameFilesOnlineMessage() {
   }
   if (files == GameFiles::kChecking || g_version.load() == Version::kChecking)
     return "Checking your game files.\nOnline will be ready in a moment - please try again.";
-  return "";
+  return ModsOnlineMessage();
 }
 
 const std::string& PortVersion() {
@@ -417,10 +448,114 @@ std::string VersionDifference(const std::string& theirs) {
 }
 
 std::atomic<bool> g_mods_online{true};  // (the server's switch: SetOnlineModsAllowed)
+std::atomic<int> g_mods_server{0};       // (0: not asked yet, 1: it answered, 2: it didn't - OnlineServerUnanswered)
 
 void SetOnlineModsAllowed(bool on) {
+  g_mods_server = 1;
   if (g_mods_online.exchange(on) != on)
     REXLOG_WARN("online: mods in online sessions {} by the server", on ? "allowed again" : "switched off");
+}
+
+void OnlineServerUnanswered() { g_mods_server = 2; }
+
+std::mutex g_block_mutex;
+std::string g_account_block;  // (the server's reason this account can't play online; "" none)
+
+void SetOnlineAccountBlock(const std::string& why) {
+  std::lock_guard lock(g_block_mutex);
+  if (why != g_account_block && !why.empty()) REXLOG_WARN("online: the server keeps this account off online: {}", why);
+  g_account_block = why;
+}
+
+const std::vector<std::string>& ActiveMatchMods() {
+  static const std::vector<std::string> mods = [] {
+    std::vector<std::string> out;
+    if (NoMods()) return out;  // (Start Without Mods: none loaded - no_mods.h)
+    std::error_code ec;
+    const fs::path dir = rex::filesystem::GetExecutableFolder() / "Mods";
+    for (const char* kind : {"Superstars", "Moves", "Arenas", "Backstage", "Weapons", "Attires", "Media"}) {
+      if (BackstageModsOff() && std::string(kind) == "Backstage") continue;  // (no_mods.h: not loaded)
+      for (const auto& e : fs::directory_iterator(dir / kind, ec))
+        if (e.is_directory() && !fs::exists(e.path() / "disabled", ec))
+          out.push_back(std::string(kind) + "/" + e.path().filename().string());
+    }
+    for (const auto& [id, on] : MatchTypeSwitches())  // (the restored match types: on unless "disabled")
+      if (on) out.push_back("MatchTypes/" + id);
+    // (the online mod tests' extra mod, SVR2011_TEST_MOD_SET_EXTRA "<kind>|<id>|...": BuildModSet)
+    if (const char* v = std::getenv("SVR2011_TEST_MOD_SET_EXTRA"); v && *v) {
+      std::string l = v;
+      const size_t a = l.find('|'), b = a == std::string::npos ? a : l.find('|', a + 1);
+      if (b != std::string::npos) out.push_back(l.substr(0, a) + "/" + l.substr(a + 1, b - a - 1));
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+  }();
+  return mods;
+}
+
+std::string ModsOnlineMessage() {
+  {  // (the account first: the server's own words, in lines the dialog shows - about 56 characters)
+    std::lock_guard lock(g_block_mutex);
+    if (!g_account_block.empty()) {
+      std::string out = "Online is off for your account.\n", line;
+      std::istringstream words(g_account_block + " Use the launcher's Online tab.");
+      for (std::string w; words >> w;) {
+        if (!line.empty() && line.size() + 1 + w.size() > 56) out += line + "\n", line.clear();
+        line += (line.empty() ? "" : " ") + w;
+      }
+      return out + line;
+    }
+  }
+  const auto& mods = ActiveMatchMods();
+  const int server = g_mods_server.load();
+  const bool blocked = !mods.empty() && !(server == 1 && g_mods_online.load());
+  static std::atomic<int> said{-1};  // (the log: once per change)
+  const int now = blocked ? server : -2;
+  if (said.exchange(now) != now && blocked) {
+    std::string list;
+    for (size_t i = 0; i < mods.size() && i < 6; ++i) list += (i ? ", " : "") + mods[i];
+    if (mods.size() > 6) list += ", ... (" + std::to_string(mods.size()) + " in all)";
+    REXLOG_WARN("online: matches off - {} mod(s) on ({}) and the server's mods_online {}", mods.size(), list,
+                server == 1 ? "is off" : server == 2 ? "unknown (no answer: as off)" : "not known yet");
+  }
+  if (!blocked) return "";
+  if (server == 0)
+    return "Checking the online server.\nOnline will be ready in a moment - please try again.";
+  // (the launcher's button / the app's tab: their own English names in every language)
+  struct Text {
+    uint32_t language;
+    const char* text;
+  };
+#ifdef __ANDROID__  // (the phone has no Start Without Mods: the SvR 2011 app's Mods tab switches them off)
+  static const Text kTexts[] = {
+      {1, "You have mods enabled.\nPlease turn your mods off in the Mods tab of the SvR 2011 app, then restart the "
+          "game to play online matches."},
+      {4, "Vous avez des mods activ\xC3\xA9s.\nD\xC3\xA9sactivez vos mods dans l'onglet Mods de l'app SvR 2011, "
+          "puis relancez le jeu pour jouer des matchs en ligne."},
+      {3, "Du hast Mods aktiviert.\nSchalte deine Mods im Tab Mods der SvR 2011 App aus und starte das Spiel neu, um "
+          "Online-Matches zu spielen."},
+      {5, "Tienes mods activados.\nDesactiva tus mods en la pesta\xC3\xB1" "a Mods de la app SvR 2011 y vuelve a "
+          "iniciar el juego para jugar partidas en l\xC3\xADnea."},
+      {6, "Hai delle mod attive.\nDisattiva le mod nella scheda Mods dell'app SvR 2011, poi riavvia il gioco per "
+          "giocare partite online."},
+  };
+#else
+  static const Text kTexts[] = {
+      {1, "You have mods enabled.\nPlease relaunch the game with Start Without Mods in the launcher to play online "
+          "matches."},
+      {4, "Vous avez des mods activ\xC3\xA9s.\nRelancez le jeu avec Start Without Mods dans le lanceur pour jouer "
+          "des matchs en ligne."},
+      {3, "Du hast Mods aktiviert.\nStarte das Spiel im Launcher mit Start Without Mods neu, um Online-Matches zu "
+          "spielen."},
+      {5, "Tienes mods activados.\nVuelve a iniciar el juego con Start Without Mods en el launcher para jugar "
+          "partidas en l\xC3\xADnea."},
+      {6, "Hai delle mod attive.\nRiavvia il gioco con Start Without Mods nel launcher per giocare partite online."},
+  };
+#endif
+  const uint32_t language = rex::cvar::Query<uint32_t>("user_language");
+  for (const Text& t : kTexts)
+    if (t.language == language) return t.text;
+  return kTexts[0].text;
 }
 
 bool OnlineModsAllowed() { return g_mods_online.load(); }

@@ -2,6 +2,8 @@
 // Creations server (see online_net.h).
 
 #include "online_net.h"
+#include "fps_overlay.h"
+#include "online_overlay.h"
 
 #include <algorithm>
 #include <array>
@@ -455,6 +457,16 @@ void HandleHttp(Socket s) {
   if (Lower(target).find("/sakestorageserver/") != std::string::npos && body.find("CreateRecord") != std::string::npos &&
       body.find("UserContent") != std::string::npos)
     forward.emplace_back("x-svr-modfree", "1");
+  {  // (where the player is, for the presence poll: Community Creations' requests)
+    const std::string path = Lower(target);
+    if (path.find("/sakefileserver/upload.aspx") != std::string::npos ||
+        (path.find("/sakestorageserver/") != std::string::npos && body.find("CreateRecord") != std::string::npos))
+      NoteOnlineActivity(OnlineActivity::kCcUpload);
+    else if (path.find("/sakefileserver/download.aspx") != std::string::npos)
+      NoteOnlineActivity(OnlineActivity::kCcDownload);
+    else if (path.find("/sakestorageserver/") != std::string::npos && body.find("Newsfeed") == std::string::npos)
+      NoteOnlineActivity(OnlineActivity::kCcBrowse);  // (not the NEWS panel's read at every visit to ONLINE)
+  }
   const auto t0 = std::chrono::steady_clock::now();
   auto r = ServerRequest(method, "/game" + target, body, forward);
   const auto ms =
@@ -532,10 +544,14 @@ void HandleGp(Socket s) {
       data.erase(0, end + 7);
       const std::string id = GpValue(msg, "id").empty() ? "1" : GpValue(msg, "id");
       if (msg.rfind("\\login\\", 0) == 0) {
-        auto session = ServerRequest("GET", "/api/session");
+        // (client=2: the server's reason in this release's words - its re-activation code, an email to confirm)
+        auto session = ServerRequest("GET", "/api/session?client=2");
         if (!session || session->status != 200 || JsonField(session->body, "ok") != "true") {
           const std::string why = !session ? "the server didn't answer" : JsonField(session->body, "error");
           REXLOG_WARN("online: presence login refused: {}", why.empty() ? "not signed in" : why);
+          // (an account the server keeps off online: why, on screen - the launcher's Online tab does the steps)
+          if (session && session->status == 403 && !why.empty())
+            svr2011::ShowNotice("Online: " + why + " (the launcher's Online tab)", 12.0f);
           SendAll(s, "\\error\\\\err\\260\\fatal\\\\errmsg\\Sign in to Community Creations in the launcher.\\id\\" +
                          id + "\\final\\");
           continue;
@@ -899,7 +915,12 @@ std::optional<Response> ServerRequest(const std::string& method, const std::stri
                                       Headers headers) {
   const std::string token = rex::cvar::Query<std::string>("online_token");
   if (!token.empty()) headers.emplace_back("Authorization", "Bearer " + token);
-  return Request(method, ServerBase() + path, headers, body);
+  auto r = Request(method, ServerBase() + path, headers, body);
+  // (the server's word for the player - a Community Creations name its filter refused: on screen)
+  if (r)
+    if (auto it = r->headers.find("x-svr-notice"); it != r->headers.end() && !it->second.empty())
+      svr2011::ShowNotice(it->second, 8.0f);
+  return r;
 }
 
 void SetTransferListener(TransferListener listener) { g_transfer = listener; }

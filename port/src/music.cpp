@@ -8,6 +8,8 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <set>
@@ -50,9 +52,14 @@ namespace svr2011 {
 
 namespace {
 
-// Songs' gains (SetSongGain): by lower-case file name, as factors.
+// Songs' gains (SetSongGain): by lower-case file name, as factors. A mod's theme copy is in here even at 0 dB.
 std::mutex g_gain_mutex;
 std::map<std::u16string, float> g_gains;
+// The player's own songs' levels: <Music>/.levels.txt, "<file name>\t<dB>" lines the launcher writes (its Music
+// tab's Level volume: the Mod Maker's -24 LUFS). Read again when the file changes.
+std::filesystem::path g_levels_path;
+std::filesystem::file_time_type g_levels_time;
+std::map<std::u16string, float> g_levels;
 
 std::u16string GainKey(const std::filesystem::path& file) {
   std::u16string k = file.filename().u16string();
@@ -61,10 +68,35 @@ std::u16string GainKey(const std::filesystem::path& file) {
   return k;
 }
 
+void ReadLevels() {  // (under g_gain_mutex)
+  std::error_code ec;
+  if (g_levels_path.empty()) return;
+  const auto t = std::filesystem::last_write_time(g_levels_path, ec);
+  if (ec) {
+    g_levels.clear();
+    return;
+  }
+  if (t == g_levels_time && !g_levels.empty()) return;
+  g_levels_time = t;
+  g_levels.clear();
+  std::ifstream in(g_levels_path, std::ios::binary);
+  std::string line;
+  while (std::getline(in, line)) {
+    const size_t tab = line.find('\t');
+    if (tab == std::string::npos || !tab) continue;
+    const std::string name = line.substr(0, tab);
+    const float db = std::clamp(float(std::atof(line.c_str() + tab + 1)), -20.0f, 6.0f);
+    g_levels[GainKey(std::filesystem::path(std::u8string(name.begin(), name.end())))] = std::pow(10.0f, db / 20.0f);
+  }
+}
+
 float SongGain(const std::filesystem::path& file) {
   std::lock_guard lock(g_gain_mutex);
-  const auto g = g_gains.find(GainKey(file));
-  return g == g_gains.end() ? 1.0f : g->second;
+  const auto key = GainKey(file);
+  if (const auto g = g_gains.find(key); g != g_gains.end()) return g->second;
+  ReadLevels();
+  const auto l = g_levels.find(key);
+  return l == g_levels.end() ? 1.0f : l->second;
 }
 
 using rex::kernel::xam::apps::XmpApp;
@@ -128,6 +160,15 @@ class Player {
   }
   // A song is playing or paused (not yet at its end, for a clip).
   bool Active() const { return active_; }
+  // As Play, at `gain` (a factor) for this file only - a clip's own level, whatever its name (every mod's
+  // announcer call is voice.mp3).
+  void PlayAt(std::filesystem::path path, float gain) {
+    {
+      std::lock_guard lock(mutex_);
+      pending_gain_ = gain;
+    }
+    Play(std::move(path));
+  }
   void Play(std::filesystem::path path) {
     active_ = !path.empty();
     std::lock_guard lock(mutex_);
@@ -176,6 +217,7 @@ class Player {
                        [&] { return has_request_ || (voice_ && paused_ != voice_paused_); });
         has_request = std::exchange(has_request_, false);
         request = request_;
+        clip_gain_ = std::exchange(pending_gain_, 0.0f);
         paused = paused_;
       }
       if (has_request) {
@@ -260,7 +302,7 @@ class Player {
   }
 
   bool Open(const std::filesystem::path& path) {
-    song_gain_ = SongGain(path);
+    song_gain_ = clip_gain_ > 0.0f ? clip_gain_ : SongGain(path);
     if (song_gain_ != 1.0f)
       REXLOG_INFO("user music: {} at {:.1f} dB (theme_gain)", path.filename().string(), 20.0f * std::log10(song_gain_));
     ComPtr<IMFSourceReader> reader;
@@ -384,6 +426,8 @@ class Player {
   bool paused_ = false;
   float game_volume_ = 1.0f;
   float song_gain_ = 1.0f;
+  float pending_gain_ = 0.0f;  // (PlayAt's, until the player thread takes the request)
+  float clip_gain_ = 0.0f;     // (the player thread's: the request's PlayAt gain, 0 = SongGain)
   std::atomic<bool> log_volume_{false};  // (the user-music player: LogVolume)
 
   // The player thread's own.
@@ -421,6 +465,15 @@ class Player {
   }
   // A song is playing or paused (not yet at its end, for a clip).
   bool Active() const { return active_; }
+  // As Play, at `gain` (a factor) for this file only - a clip's own level, whatever its name (every mod's
+  // announcer call is voice.mp3).
+  void PlayAt(std::filesystem::path path, float gain) {
+    {
+      std::lock_guard lock(mutex_);
+      pending_gain_ = gain;
+    }
+    Play(std::move(path));
+  }
   void Play(std::filesystem::path path) {
     active_ = !path.empty();
     std::lock_guard lock(mutex_);
@@ -456,6 +509,7 @@ class Player {
                        [&] { return has_request_ || (codec_ && paused_ != stream_paused_); });
         has_request = std::exchange(has_request_, false);
         request = request_;
+        clip_gain_ = std::exchange(pending_gain_, 0.0f);
         paused = paused_;
       }
       if (has_request) {
@@ -499,7 +553,7 @@ class Player {
 
  private:
   bool Open(const std::filesystem::path& path) {
-    song_gain_ = SongGain(path);
+    song_gain_ = clip_gain_ > 0.0f ? clip_gain_ : SongGain(path);
     if (song_gain_ != 1.0f)
       REXLOG_INFO("user music: {} at {:.1f} dB (theme_gain)", path.filename().string(), 20.0f * std::log10(song_gain_));
     fd_ = open(path.c_str(), O_RDONLY);
@@ -661,6 +715,8 @@ class Player {
   bool paused_ = false;
   float game_volume_ = 1.0f;
   float song_gain_ = 1.0f;
+  float pending_gain_ = 0.0f;  // (PlayAt's, until the player thread takes the request)
+  float clip_gain_ = 0.0f;     // (the player thread's: the request's PlayAt gain, 0 = SongGain)
   std::atomic<bool> log_volume_{false};  // (the user-music player: LogVolume)
 
   // The player thread's own.
@@ -689,8 +745,8 @@ Player* g_clips = nullptr;   // short clips, played once (PlayClip)
 
 std::filesystem::path UserMusicFolder() { return g_folder; }
 
-void PlayClip(const std::filesystem::path& file) {
-  if (g_clips) g_clips->Play(file);
+void PlayClip(const std::filesystem::path& file, float db) {
+  if (g_clips) g_clips->PlayAt(file, std::pow(10.0f, std::clamp(db, -40.0f, 12.0f) / 20.0f));
 }
 
 // Host sounds (media mods): a pool of players, each one sound at a time.
@@ -751,8 +807,7 @@ std::vector<std::filesystem::path> UserMusicSongs() {
 void SetSongGain(const std::filesystem::path& file, float db) {
   db = std::clamp(db, -20.0f, 6.0f);
   std::lock_guard lock(g_gain_mutex);
-  if (db == 0.0f) g_gains.erase(GainKey(file));
-  else g_gains[GainKey(file)] = std::pow(10.0f, db / 20.0f);
+  g_gains[GainKey(file)] = std::pow(10.0f, db / 20.0f);   // (0 dB kept too: a mod's theme copy isn't levelled again)
 }
 
 std::filesystem::path UserMusicSong(const std::string& name) {
@@ -764,6 +819,10 @@ std::filesystem::path UserMusicSong(const std::string& name) {
 
 void InstallUserMusic(const std::filesystem::path& folder) {
   g_folder = folder;
+  {
+    std::lock_guard lock(g_gain_mutex);
+    g_levels_path = folder / ".levels.txt";
+  }
   std::error_code ec;
   std::filesystem::create_directories(folder, ec);  // so players can find it
   g_player = new Player();

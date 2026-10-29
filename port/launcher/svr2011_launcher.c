@@ -17,11 +17,14 @@
  *
  * Command line (tests):  --capture <play|settings|install|dlc|saves|paint|mods> <file.bmp> [--paint-page <1-10>]
  *                          [--report-window <1|2>]  (Report a problem's window instead: questions / where to post)
+ *                          [--online-mods show | <share 0|1> <KB/s> <joiners> <mod MB> <session MB>]  (online: the
+ *                          Mod sharing fold open - as loaded, or those rows filled and saved first)
  *                        --paint-export <file.pt> <slot> <out.png>  /  --paint-import <file.pt> <slot> <image>
  *                          (slot 1-200: 1-20 page 1, 21-40 page 2, ...)
  *                        --install <image> <folder>   (no window; exit code)
  *                        --apk-package <game folder> <out folder>   (Create APK Package, no window)
  *                        --report <game folder> [description]   (Report a problem: the zip, no window)
+ *                        --report-send <game folder> <answers file>   (Report a problem: zip + send to the server, no window)
  *                        --import-360 <360 save folder> <saves folder>   (Xbox 360 saves -> port saves)
  *                        --import-caw <saves folder> <file.cas>...   (Created Superstars + their logos)
  *                        --adb-install <game folder>   (Install to phone over USB, no window)
@@ -66,6 +69,8 @@ static void setup_console_progress(int permille, const WCHAR *text);
 #include "roster_tab.h"
 #include "ui_theme.h"
 #include "report.h"
+#include "report_match.h"
+#include "report_send.h"
 #include "movie_maker.h"
 #include "ascii_fold.h"
 #include "unzip.h"
@@ -129,8 +134,11 @@ enum {
     ID_FULLSCREEN_EX, ID_RENDER_RES, ID_RES_HINT,
     /* online */
     ID_ON_ENABLE, ID_ON_NAME, ID_ON_SERVER, ID_ON_SERVER_KIND, ID_ON_SAVE, ID_ON_STATUS,
-    ID_ON_PASSWORD, ID_ON_SIGNIN, ID_ON_REGISTER, ID_ON_SIGNOUT, ID_ON_ACCOUNT, ID_ON_SERVER_LABEL, ID_ON_PEERS,
-    ID_FR_LIST, ID_FR_NAME, ID_FR_ADD, ID_FR_REMOVE, ID_FR_STATUS,
+    ID_ON_PASSWORD, ID_ON_SIGNIN, ID_ON_REGISTER, ID_ON_SIGNOUT, ID_ON_ACCOUNT, ID_ON_SERVER_LABEL, ID_ON_PEERS, ID_ON_ROUTE,
+    ID_FR_LIST, ID_FR_NAME, ID_FR_ADD, ID_FR_REMOVE, ID_FR_STATUS, ID_FR_GROUP, ID_FR_INFO,
+    ID_ON_SHARE, ID_ON_MODS_FOLD, ID_ON_MODS_GROUP, ID_ON_UP_KBS, ID_ON_UP_PEERS, ID_ON_MOD_MB, ID_ON_MODS_MB,
+    ID_ON_MODS_L1, ID_ON_MODS_L2, ID_ON_MODS_L3, ID_ON_MODS_L4, ID_ON_MODS_INFO,
+    ID_ON_L_NAME, ID_ON_L_PASS, ID_ON_L_CODE, ID_ON_CODE, ID_ON_STEP, ID_ON_BACK, ID_ON_FORGOT, ID_ON_INFO,
     /* install */
     ID_IMAGE, ID_IMAGE_BROWSE, ID_TARGET, ID_TARGET_BROWSE, ID_FREE, ID_INSTALL, ID_CANCEL,
     ID_PROGRESS, ID_INSTALL_STATUS, ID_VERIFY, ID_VERIFY_REPAIR, ID_VERIFY_MARK, ID_VERIFY_STATUS,
@@ -220,20 +228,107 @@ typedef struct { HWND h; int x, y, w, hh, big; } Placed;
 static Placed s_placed[192];
 static int    s_nplaced;
 
-static const struct { int w, h, scale; const WCHAR *label; } k_res[] = {
-    { 1280,  720, 1, L"1280 \x00D7 720  (the console's)" },
-    { 1600,  900, 2, L"1600 \x00D7 900" },
-    { 1920, 1080, 2, L"1920 \x00D7 1080" },
-    { 2560, 1440, 2, L"2560 \x00D7 1440" },
-    { 3840, 2160, 3, L"3840 \x00D7 2160  (4K)" },
-};
-#define N_RES ((int)(sizeof k_res / sizeof k_res[0]))
+/* Window sizes: the ones the screen reports to Windows (EnumDisplaySettings on the launcher's monitor: distinct,
+   at least 854 x 480, at most the desktop's, and the desktop's own) - 5K, 8K and ultrawide where the screen has
+   them, as the game's GRAPHICS -> RESOLUTION row (display_modes.cpp); else (Proton, fewer than two) this fixed
+   list. Test aid: SVR2011_TEST_DISPLAY_MODES=7680x4320,5120x2880,... */
+static const int k_res_fixed[][2] = { { 1280, 720 }, { 1600, 900 }, { 1920, 1080 }, { 2560, 1440 }, { 3840, 2160 } };
+typedef struct { int w, h, scale; WCHAR label[48]; } ResRow;
+static ResRow k_res[64];
+static int N_RES;
+
+static int res_cmp(const void *a, const void *b)
+{
+    const ResRow *x = (const ResRow *)a, *y = (const ResRow *)b;
+    long long ax = (long long)x->w * x->h, ay = (long long)y->w * y->h;
+    return ax != ay ? (ax < ay ? -1 : 1) : x->w - y->w;
+}
+
+/* Adds w x h (once); its label and the emulated renderer's scale for it. */
+static void res_add(int w, int h)
+{
+    int i;
+    for (i = 0; i < N_RES; i++)
+        if (k_res[i].w == w && k_res[i].h == h)
+            return;
+    if (N_RES >= (int)(sizeof k_res / sizeof k_res[0]))
+        return;
+    k_res[N_RES].w = w;
+    k_res[N_RES].h = h;
+    k_res[N_RES].scale = h <= 720 ? 1 : h <= 1440 ? 2 : 3;
+    swprintf_s(k_res[N_RES].label, 48, L"%d \x00D7 %d%s", w, h,
+               w == 1280 && h == 720 ? L"  (the console's)" : w == 3840 && h == 2160 ? L"  (4K)"
+               : w == 5120 && h == 2880 ? L"  (5K)" : w == 7680 && h == 4320 ? L"  (8K)" : L"");
+    N_RES++;
+}
+
+static void res_list_build(HWND near_wnd)
+{
+    static const POINT k_origin = { 0, 0 };
+    char test[512];
+    size_t n = 0;
+    N_RES = 0;
+    if (!getenv_s(&n, test, sizeof test, "SVR2011_TEST_DISPLAY_MODES") && n > 1) {
+        char *ctx = NULL, *tok = strtok_s(test, ",", &ctx);
+        for (; tok; tok = strtok_s(NULL, ",", &ctx)) {
+            int w = 0, h = 0;
+            if (sscanf_s(tok, "%dx%d", &w, &h) == 2 && w >= 640 && h >= 360)
+                res_add(w, h);
+        }
+    } else if (!GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version")) {
+        HMONITOR mon = near_wnd ? MonitorFromWindow(near_wnd, MONITOR_DEFAULTTONEAREST)
+                                : MonitorFromPoint(k_origin, MONITOR_DEFAULTTOPRIMARY);
+        MONITORINFOEXW mi;
+        DEVMODEW dm;
+        ZeroMemory(&mi, sizeof mi);
+        mi.cbSize = sizeof mi;
+        ZeroMemory(&dm, sizeof dm);
+        dm.dmSize = sizeof dm;
+        if (mon && GetMonitorInfoW(mon, (MONITORINFO *)&mi) &&
+            EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmPelsWidth) {
+            const int dw = (int)dm.dmPelsWidth, dh = (int)dm.dmPelsHeight;
+            DWORD i;
+            for (i = 0;; i++) {
+                DEVMODEW m;
+                ZeroMemory(&m, sizeof m);
+                m.dmSize = sizeof m;
+                if (!EnumDisplaySettingsW(mi.szDevice, i, &m))
+                    break;
+                if ((int)m.dmPelsWidth >= 854 && (int)m.dmPelsHeight >= 480 && (int)m.dmPelsWidth <= dw &&
+                    (int)m.dmPelsHeight <= dh)
+                    res_add((int)m.dmPelsWidth, (int)m.dmPelsHeight);
+            }
+            res_add(dw, dh);
+        }
+        if (N_RES < 2)
+            N_RES = 0;
+    }
+    if (!N_RES) {
+        int i;
+        for (i = 0; i < (int)(sizeof k_res_fixed / sizeof k_res_fixed[0]); i++)
+            res_add(k_res_fixed[i][0], k_res_fixed[i][1]);
+    }
+    qsort(k_res, (size_t)N_RES, sizeof k_res[0], res_cmp);
+    {  /* (test: SVR2011_TEST_RES_LIST=<file> - the list's entries written there, one a line) */
+        WCHAR path[MAX_PATH];
+        if (GetEnvironmentVariableW(L"SVR2011_TEST_RES_LIST", path, MAX_PATH)) {
+            FILE *f = NULL;
+            if (!_wfopen_s(&f, path, L"w, ccs=UTF-8") && f) {
+                int i;
+                for (i = 0; i < N_RES; i++)
+                    fwprintf(f, L"%s\n", k_res[i].label);
+                fclose(f);
+            }
+        }
+    }
+}
 /* The render resolution: the game's GRAPHICS -> RENDER RESOLUTION steps (graphics_page.cpp kScales), saved
    in the same keys - native_max_scale, native_render_scale, native_scene_height. */
 static const struct { int max_scale; double res; int height; const WCHAR *label; } k_render[] = {
-    { 4, 1.0, 0, L"Auto (follows the window)" }, { 1, 0.5, 0, L"360p" }, { 1, 2.0 / 3.0, 0, L"480p" },
+    { 8, 1.0, 0, L"Auto (follows the window)" }, { 1, 0.5, 0, L"360p" }, { 1, 2.0 / 3.0, 0, L"480p" },
     { 1, 1.0, 0, L"720p (Xbox 360)" }, { 2, 1.0, 900, L"900p" }, { 2, 1.0, 1080, L"1080p" },
-    { 2, 1.0, 0, L"1440p" }, { 3, 1.0, 0, L"2160p (4K)" },
+    { 2, 1.0, 0, L"1440p" }, { 3, 1.0, 0, L"2160p (4K)" }, { 4, 1.0, 2880, L"2880p" },
+    { 6, 1.0, 4320, L"4320p (8K)" },
 };
 #define N_RENDER ((int)(sizeof k_render / sizeof k_render[0]))
 
@@ -1321,6 +1416,73 @@ static int toml_read(const WCHAR *path, Lines *l)
 
 /* "key = value" at the top level: the key (lowercase-sensitive, as TOML) and value text. */
 static int toml_get(const char *key, char *out, size_t n);
+
+/* The last online match's connection, from the game's log (p2p.cpp: "p2p: session <id> plays direct" / "plays
+   through the relay (direct failed)" / "(set so)", once a session): the newest such line in the newest logs
+   (<game>\logs\svr2011_*.log, newest first). s_route_kind: 1 direct, 2 relay - direct failed, 3 relay - the
+   server's choice, 0 none (no line shown). */
+static int s_route_kind;
+static void online_route_show(void)
+{
+    typedef struct { WCHAR name[MAX_PATH]; ULONGLONG t; } Log;
+    static Log logs[64];
+    WCHAR pat[MAX_PATH], path[MAX_PATH], t[400];
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    int n = 0, i, k;
+    s_route_kind = 0;
+    swprintf_s(pat, MAX_PATH, L"%s\\logs\\svr2011_*.log", s_game_dir);
+    h = s_game_dir[0] ? FindFirstFileW(pat, &fd) : INVALID_HANDLE_VALUE;
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (n < 64 && !(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                wcscpy_s(logs[n].name, MAX_PATH, fd.cFileName);
+                logs[n].t = (ULONGLONG)fd.ftLastWriteTime.dwHighDateTime << 32 | fd.ftLastWriteTime.dwLowDateTime;
+                n++;
+            }
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    for (i = 0; i < n; i++)   /* (newest first) */
+        for (k = i + 1; k < n; k++)
+            if (logs[k].t > logs[i].t) { Log x = logs[i]; logs[i] = logs[k]; logs[k] = x; }
+    for (i = 0; i < n && i < 6 && !s_route_kind; i++) {
+        FILE *f = NULL;
+        char *buf;
+        long size;
+        swprintf_s(path, MAX_PATH, L"%s\\logs\\%s", s_game_dir, logs[i].name);
+        if (_wfopen_s(&f, path, L"rb") || !f) continue;
+        fseek(f, 0, SEEK_END);
+        size = ftell(f);
+        if (size > (8l << 20)) { fseek(f, size - (8l << 20), SEEK_SET); size = 8l << 20; } else fseek(f, 0, SEEK_SET);
+        if ((buf = (char *)malloc((size_t)size + 1)) != NULL) {
+            const char *p, *last = NULL;
+            size = (long)fread(buf, 1, (size_t)size, f);
+            buf[size] = 0;
+            for (p = buf; (p = strstr(p, "p2p: session ")) != NULL; p++) {
+                const char *e = strchr(p, '\n'), *pl = strstr(p, " plays ");
+                if (pl && (!e || pl < e)) last = pl + 7;
+            }
+            if (last)
+                s_route_kind = !strncmp(last, "direct", 6) ? 1 : strstr(last, "(set so)") && (!strchr(last, '\n') ||
+                               strstr(last, "(set so)") < strchr(last, '\n')) ? 3 : 2;
+            free(buf);
+        }
+        fclose(f);
+    }
+    if (s_route_kind == 1)
+        wcscpy_s(t, 400, L"Last online match: direct connection");
+    else if (s_route_kind == 2) {
+        char port[16] = "";
+        if (!toml_get("p2p_port", port, sizeof port) || !port[0]) strcpy_s(port, sizeof port, "36000");
+        swprintf_s(t, 400, L"Last online match: through the relay - a direct connection failed (open UDP %S on your "
+                           L"router or turn on ROUTER PORT (UPNP) in the game's OPTIONS > GRAPHICS)", port);
+    } else if (s_route_kind == 3)
+        wcscpy_s(t, 400, L"Last online match: through the relay (the server's choice)");
+    else
+        t[0] = 0;
+    set_text(ID_ON_ROUTE, t);
+}
 static int toml_set(const char *key, const char *value);
 
 static int toml_kv(const char *line, char *key, size_t kn, char *val, size_t vn)
@@ -1418,24 +1580,81 @@ static void toml_quote_ctl(int id, int max, char *out, size_t n)
 static char s_online_token[128], s_online_xuid[32];
 static int s_tab_visible_online;  /* (the Online tab is showing) */
 
+/* The account box's modes: sign in, create an account (name, password, invite code), forgot password (the name,
+   the reset code the server owner made for it, a new password), signed in. Signed in, an account the server keeps
+   off online (2.1.6 with its account checks on, server.py signup.py) shows its step instead: the re-activation code
+   from the server owner (accounts from before 2.1.6). Codes only - no email. */
+enum { ON_SIGNIN, ON_SIGNUP, ON_FORGOT };
+static int s_on_mode;
+static int s_on_needs_code;   /* (signed in: the server's answer) */
+static WCHAR s_on_note[300];  /* (the status line, kept across a re-layout) */
+
+static void on_place(int id, int x, int y, int w, int h);  /* (below: the layout's X0, as add()) */
+
 static void online_account_show(void)
 {
-    WCHAR name[64], text[160];
-    int signed_in = s_online_token[0] != 0;
+    static const int box[] = { ID_ON_L_NAME, ID_ON_NAME, ID_ON_L_PASS, ID_ON_PASSWORD, ID_ON_L_CODE, ID_ON_CODE,
+                               ID_ON_SIGNIN, ID_ON_REGISTER, ID_ON_SIGNOUT, ID_ON_STEP, ID_ON_BACK, ID_ON_FORGOT,
+                               ID_ON_INFO };
+    WCHAR name[64], text[300];
+    const WCHAR *info = L"";
+    const int signed_in = s_online_token[0] != 0;
+    int bx = 0;  /* (a button in the box's last row from this x: the status line takes two lines left of it) */
+    size_t i;
+    for (i = 0; i < sizeof box / sizeof box[0]; i++)
+        ShowWindow(ctl(box[i]), SW_HIDE);
     GetWindowTextW(ctl(ID_ON_NAME), name, 64);
-    if (signed_in)
-        swprintf_s(text, 160, L"Signed in as %s.", name);
-    else
-        wcscpy_s(text, 160, L"Not signed in. Sign in, or create an account with the name you want.");
-    set_text(ID_ON_ACCOUNT, text);
+    text[0] = 0;
+    if (signed_in && s_on_needs_code) {
+        set_text(ID_ON_L_CODE, L"Re-activation code");
+        on_place(ID_ON_L_CODE, 16, 144, 130, 20), on_place(ID_ON_CODE, 150, 140, 220, 24);
+        set_text(ID_ON_STEP, L"Re-activate");
+        on_place(ID_ON_STEP, 384, 139, 162, 26);
+        on_place(ID_ON_SIGNOUT, 384, 199, 162, 24), bx = 384;
+        swprintf_s(text, 300, L"Signed in as %s. Online needs the re-activation code the server owner made for your "
+                              L"account.", name);
+    } else if (signed_in) {
+        set_text(ID_ON_L_NAME, L"Name");
+        on_place(ID_ON_L_NAME, 16, 144, 130, 20), on_place(ID_ON_NAME, 150, 140, 220, 24);
+        on_place(ID_ON_SIGNOUT, 384, 139, 162, 26);
+        swprintf_s(text, 300, L"Signed in as %s.", name);
+        info = L"The name is what other players see. The same account works on any PC or phone.";
+    } else if (s_on_mode == ON_SIGNUP || s_on_mode == ON_FORGOT) {
+        const int signup = s_on_mode == ON_SIGNUP;
+        set_text(ID_ON_L_NAME, L"Name"), set_text(ID_ON_L_PASS, signup ? L"Password" : L"New password");
+        set_text(ID_ON_L_CODE, signup ? L"Invite code" : L"Reset code");
+        on_place(ID_ON_L_NAME, 16, 144, 60, 20), on_place(ID_ON_NAME, 80, 140, 160, 24);
+        on_place(ID_ON_L_CODE, 252, 144, 76, 20), on_place(ID_ON_CODE, 330, 140, 216, 24);
+        on_place(ID_ON_L_PASS, 16, 174, 90, 20), on_place(ID_ON_PASSWORD, 110, 170, 130, 24);
+        set_text(ID_ON_STEP, signup ? L"Create" : L"Set password");
+        on_place(ID_ON_STEP, 346, 199, 108, 24), on_place(ID_ON_BACK, 460, 199, 86, 24), bx = 346;
+        wcscpy_s(text, 300, signup ? L"An invite code from the server owner. Name: 3-15 characters (what players "
+                                     L"see); password: 8 or more."
+                                   : L"Ask the server owner for a reset code for your account (it works once, for 24 "
+                                     L"hours), then choose a new password.");
+    } else {
+        set_text(ID_ON_L_NAME, L"Name"), set_text(ID_ON_L_PASS, L"Password");
+        on_place(ID_ON_L_NAME, 16, 144, 130, 20), on_place(ID_ON_NAME, 150, 140, 220, 24);
+        on_place(ID_ON_L_PASS, 16, 174, 130, 20), on_place(ID_ON_PASSWORD, 150, 170, 220, 24);
+        on_place(ID_ON_SIGNIN, 384, 139, 162, 26), on_place(ID_ON_REGISTER, 384, 169, 162, 26);
+        on_place(ID_ON_FORGOT, 384, 199, 162, 24), bx = 384;
+        wcscpy_s(text, 300, L"Not signed in. Sign in, or create an account (it needs an invite code). The same "
+                            L"account works on any PC or phone.");
+    }
+    if (bx) {
+        on_place(ID_ON_ACCOUNT, 16, 200, bx - 28, 38);
+    } else {
+        on_place(ID_ON_ACCOUNT, 16, 200, 530, 18);
+        on_place(ID_ON_INFO, 16, 219, 530, 18);
+    }
+    set_text(ID_ON_ACCOUNT, s_on_note[0] ? s_on_note : text);
+    set_text(ID_ON_INFO, info);
     EnableWindow(ctl(ID_ON_NAME), !signed_in);
     EnableWindow(ctl(ID_ON_PASSWORD), !signed_in);
     /* (an account is its server's: sign out to change the server) */
     EnableWindow(ctl(ID_ON_SERVER_KIND), !signed_in);
     EnableWindow(ctl(ID_ON_SERVER), !signed_in);
-    ShowWindow(ctl(ID_ON_SIGNIN), s_tab_visible_online && !signed_in ? SW_SHOW : SW_HIDE);
-    ShowWindow(ctl(ID_ON_REGISTER), s_tab_visible_online && !signed_in ? SW_SHOW : SW_HIDE);
-    ShowWindow(ctl(ID_ON_SIGNOUT), s_tab_visible_online && signed_in ? SW_SHOW : SW_HIDE);
+    InvalidateRect(s_wnd, NULL, TRUE);
 }
 
 /* The server: Default (ONLINE_DEFAULT_SERVER, its address not shown) or
@@ -1576,12 +1795,19 @@ static void discover_server(WCHAR *out, int n)
     }
 }
 
-static void discover_account(char *token, size_t token_n, WCHAR *name, size_t name_n)
+static void discover_account(char *token, size_t token_n, WCHAR *name, size_t name_n, long long *id)
 {
     strcpy_s(token, token_n, s_online_token);
     name[0] = 0;
+    *id = -1;
     if (s_online_token[0] && name_n > 1)
         GetWindowTextW(ctl(ID_ON_NAME), name, (int)name_n);
+    /* (the account's id: its XUID less the server's base, server.py XUID_BASE 0x0009000100000000) */
+    if (s_online_token[0] && s_online_xuid[0]) {
+        const unsigned long long x = _strtoui64(s_online_xuid, NULL, 16);
+        if (x > 0x0009000100000000ull && x < 0x0009000200000000ull)
+            *id = (long long)(x - 0x0009000100000000ull);
+    }
 }
 
 static int online_post(const char *path, const char *body, const char *token, char *out, size_t outn)
@@ -1611,23 +1837,68 @@ static int settings_save(void);
 static void friends_enable(void);
 static void friends_fetch(const char *body);
 
-/* Sign in (register: create the account first) with the name and password typed. */
+static int json_true(const char *text, const char *key)
+{
+    const char *p = json_find(text, key);
+    return p && !strncmp(p, "true", 4);
+}
+
+/* The status line (kept until the mode changes: "" clears it). */
+static void online_note(const WCHAR *t)
+{
+    wcscpy_s(s_on_note, 300, t ? t : L"");
+    set_text(ID_ON_ACCOUNT, s_on_note);
+}
+
+/* The server's error (UTF-8 JSON) as the status line; "what" when it has none. */
+static void online_note_answer(int status, const char *answer, const WCHAR *what)
+{
+    char error[300];
+    WCHAR msg[300];
+    json_copy(answer, "error", error, sizeof error);
+    if (!error[0])
+        json_copy(answer, "message", error, sizeof error);
+    if (!status)
+        wcscpy_s(msg, 300, L"The server didn't answer. Check the address below and your connection.");
+    else if (error[0])
+        MultiByteToWideChar(CP_UTF8, 0, error, -1, msg, 300);
+    else if (what)
+        wcscpy_s(msg, 300, what);
+    else
+        swprintf_s(msg, 300, L"The server refused (HTTP %d). Is the address right?", status);
+    online_note(msg);
+}
+
+/* An account answer's step (api/login, api/account, ...): the account still needs its re-activation code. */
+static void online_steps_read(const char *answer)
+{
+    s_on_needs_code = json_true(answer, "needs_code");
+}
+
+/* Sign in (register: create the account - name, password, invite code) with what's typed. */
 static void online_sign_in(int register_account)
 {
-    WCHAR name[64], password[128], msg[300];
-    char qname[160], qpass[300], body[512], answer[2048], error[256], token[128], xuid[32], account[64];
+    WCHAR name[64], password[128], code[32];
+    char qname[160], qpass[300], qcode[80], body[700], answer[2048], token[128], xuid[32], account[64];
     HCURSOR old;
     int status;
     GetWindowTextW(ctl(ID_ON_NAME), name, 64);
     GetWindowTextW(ctl(ID_ON_PASSWORD), password, 128);
-    if (!name[0] || !password[0]) {
-        set_text(ID_ON_ACCOUNT, L"Type your account's name and password.");
+    GetWindowTextW(ctl(ID_ON_CODE), code, 32);
+    if (!name[0] || !password[0] || (register_account && !code[0])) {
+        online_note(register_account ? L"Type a name, a password and your invite code."
+                                     : L"Type your account's name and password.");
         return;
     }
     json_quote(name, qname, sizeof qname);
     json_quote(password, qpass, sizeof qpass);
-    sprintf_s(body, sizeof body, "{\"name\": %s, \"password\": %s}", qname, qpass);
-    set_text(ID_ON_ACCOUNT, register_account ? L"Creating the account\x2026" : L"Signing in\x2026");
+    json_quote(code, qcode, sizeof qcode);
+    /* ("client": 2 - this launcher walks the account's step; older ones get a text to update) */
+    if (register_account)
+        sprintf_s(body, sizeof body, "{\"name\": %s, \"password\": %s, \"invite\": %s, \"client\": 2}", qname, qpass, qcode);
+    else
+        sprintf_s(body, sizeof body, "{\"name\": %s, \"password\": %s, \"client\": 2}", qname, qpass);
+    online_note(register_account ? L"Creating the account\x2026" : L"Signing in\x2026");
     old = SetCursor(LoadCursor(NULL, IDC_WAIT));
     status = online_post(register_account ? "/api/register" : "/api/login", body, NULL, answer, sizeof answer);
     SetCursor(old);
@@ -1635,14 +1906,7 @@ static void online_sign_in(int register_account)
     SecureZeroMemory(body, sizeof body);
     json_copy(answer, "token", token, sizeof token);
     if (status != 200 || !token[0]) {
-        json_copy(answer, "error", error, sizeof error);
-        if (!status)
-            swprintf_s(msg, 300, L"The server didn't answer. Check the address below and your connection.");
-        else if (error[0])
-            swprintf_s(msg, 300, L"%S", error);
-        else
-            swprintf_s(msg, 300, L"The server refused (HTTP %d). Is the address right?", status);
-        set_text(ID_ON_ACCOUNT, msg);
+        online_note_answer(status, answer, NULL);
         return;
     }
     json_copy(answer, "xuid", xuid, sizeof xuid);
@@ -1652,11 +1916,91 @@ static void online_sign_in(int register_account)
     MultiByteToWideChar(CP_UTF8, 0, account, -1, name, 64);
     set_text(ID_ON_NAME, name);
     set_text(ID_ON_PASSWORD, L"");
+    set_text(ID_ON_CODE, L"");
+    online_steps_read(answer);
+    s_on_mode = ON_SIGNIN;
+    online_note(register_account ? L"Account made: you can play online." : L"");
     CheckDlgButton(s_wnd, ID_ON_ENABLE, BST_CHECKED);
     online_account_show();
     settings_save();
     friends_enable();
     friends_fetch(NULL);
+}
+
+/* The signed-in account's step, from the server (api/account): when the Online tab opens. A token the server
+   ended (the password changed or was reset) signs out. */
+static void online_account_refresh(void)
+{
+    char answer[2048];
+    int status;
+    if (!s_online_token[0])
+        return;
+    status = online_request("/api/account", NULL, s_online_token, answer, sizeof answer);
+    if (status == 200) {
+        online_steps_read(answer);
+    } else if (status == 401) {
+        s_online_token[0] = s_online_xuid[0] = 0;
+        s_on_needs_code = 0;
+        settings_save();
+        online_note(L"Signed out: your password was changed or reset. Sign in again.");
+    }
+}
+
+/* The step button: create the account, set a new password with the reset code - or, signed in, the account's
+   re-activation code. */
+static void online_step(void)
+{
+    WCHAR name[64], code[32], password[128];
+    char qname[160], qcode[80], qpass[300], body[700], answer[2048];
+    HCURSOR old;
+    int status;
+    GetWindowTextW(ctl(ID_ON_NAME), name, 64);
+    GetWindowTextW(ctl(ID_ON_CODE), code, 32);
+    GetWindowTextW(ctl(ID_ON_PASSWORD), password, 128);
+    json_quote(name, qname, sizeof qname);
+    json_quote(code, qcode, sizeof qcode);
+    json_quote(password, qpass, sizeof qpass);
+    if (!s_online_token[0]) {
+        if (s_on_mode == ON_SIGNUP) {
+            online_sign_in(1);
+            return;
+        }
+        if (!name[0] || !code[0] || !password[0]) {
+            online_note(L"Type your account's name, the reset code and a new password.");
+            return;
+        }
+        sprintf_s(body, sizeof body, "{\"name\": %s, \"code\": %s, \"password\": %s}", qname, qcode, qpass);
+        old = SetCursor(LoadCursor(NULL, IDC_WAIT));
+        status = online_post("/api/password/reset", body, NULL, answer, sizeof answer);
+        SetCursor(old);
+        SecureZeroMemory(qpass, sizeof qpass);
+        SecureZeroMemory(body, sizeof body);
+        if (status == 200) {
+            s_on_mode = ON_SIGNIN;
+            set_text(ID_ON_PASSWORD, L"");
+            set_text(ID_ON_CODE, L"");
+            online_account_show();
+        }
+        online_note_answer(status, answer, NULL);
+        return;
+    }
+    if (!code[0]) {
+        online_note(L"Type the code.");
+        return;
+    }
+    sprintf_s(body, sizeof body, "{\"code\": %s}", qcode);
+    old = SetCursor(LoadCursor(NULL, IDC_WAIT));
+    status = online_post("/api/reactivate", body, s_online_token, answer, sizeof answer);
+    SetCursor(old);
+    if (status == 200) {
+        online_steps_read(answer);
+        set_text(ID_ON_CODE, L"");
+        online_note(s_on_needs_code ? L"" : L"Account re-activated: you can play online.");
+        online_account_show();
+        friends_fetch(NULL);
+    } else {
+        online_note_answer(status, answer, NULL);
+    }
 }
 
 static void online_sign_out(void)
@@ -1666,6 +2010,9 @@ static void online_sign_out(void)
         online_post("/api/logout", "{}", s_online_token, answer, sizeof answer);
     s_online_token[0] = 0;
     s_online_xuid[0] = 0;
+    s_on_needs_code = 0;
+    s_on_mode = ON_SIGNIN;
+    online_note(L"");
     online_account_show();
     settings_save();
     friends_enable();
@@ -1790,6 +2137,8 @@ static void friends_show(int http, char *answer)
                 label = L"In an online match", online++;
             else if (!wcscmp(status, L"online"))
                 label = L"Online", online++;
+            else if (!wcscmp(status, L"ingame"))
+                label = L"In the game";
             v = strstr(p, "\"mutual\"");
             if (v && v < close && strncmp(v + 8, ": false", 7) == 0 && wcscmp(label, L"Offline") == 0)
                 label = L"Offline (hasn't added you)";
@@ -1882,7 +2231,7 @@ static int nvidia_adapter(void)
 }
 
 /* The Upscaling list (the game's GRAPHICS -> UPSCALING): off, FSR 1 ultra quality .. performance, FSR 2
-   (experimental) - not with Direct3D 11 (no compute) - and DLSS (experimental) - Direct3D 12 (AUTO) only, with
+   (experimental) - not with Direct3D 11 (no compute) - and DLSS (experimental) - Direct3D 12 (AUTO) or Vulkan, with
    nvngx_dlss.dll in the game folder and an NVIDIA GPU; `sel` chosen (one not offered: the same FSR 1 level). */
 static void upscale_fill(int sel)
 {
@@ -1895,7 +2244,7 @@ static void upscale_fill(int sel)
     const int renderer = (int)SendMessageW(ctl(ID_RENDERER), CB_GETCURSEL, 0, 0);
     const int fsr2 = renderer != RENDERER_D3D11;
     WCHAR dll[MAX_PATH];
-    const int dlss = renderer == RENDERER_NATIVE && s_game_dir[0] && join(dll, s_game_dir, L"nvngx_dlss.dll") &&
+    const int dlss = renderer != RENDERER_D3D11 && s_game_dir[0] && join(dll, s_game_dir, L"nvngx_dlss.dll") &&
                      file_exists(dll) && nvidia_adapter();
     const int n = dlss ? 13 : fsr2 ? 9 : 5;
     int i;
@@ -1963,6 +2312,7 @@ static void settings_load(void)
     int msaa = 0, aa = 0, emulated = 0, api = 0, language = 1, online = 0, prepare = 1, frame_rate = 60;
     int priority = 0, unlock_all = 1, textures = 0, skip_intros = 0, skip_training = 0, arena_light = 100;
     int match_camera = 0;
+    int share = 1, up_kbs = 0, up_peers = 0, mod_mb = 0, mods_mb = 0;  /* (the game's online mod settings) */
     int exclusive = 0, max_scale = 4, scene_height = 0, upscale = 0, upscale_quality = 1;
     double render_scale = 1.0;
     char online_name[64] = "", online_server[128] = "", online_peers[256] = "";
@@ -2016,10 +2366,25 @@ static void settings_load(void)
             else if (!strcmp(key, "online_token")) strcpy_s(s_online_token, sizeof s_online_token, val);
             else if (!strcmp(key, "online_xuid")) strcpy_s(s_online_xuid, sizeof s_online_xuid, val);
             else if (!strcmp(key, "p2p_peers")) strcpy_s(online_peers, sizeof online_peers, val);
+            else if (!strcmp(key, "online_mod_upload")) share = strcmp(val, "false") != 0;
+            else if (!strcmp(key, "online_mod_upload_kbs")) up_kbs = atoi(val);
+            else if (!strcmp(key, "online_mod_upload_peers")) up_peers = atoi(val);
+            else if (!strcmp(key, "online_mod_max_mb")) mod_mb = atoi(val);
+            else if (!strcmp(key, "online_mods_max_mb")) mods_mb = atoi(val);
         }
         lines_free(&l);
     } else if (on_steam_deck()) {
         fullscreen = 1;  /* no settings yet: the Deck's screen is the window */
+    }
+    if (w >= 640 && h >= 360) {  /* (a saved size the list lacks: kept as a choice) */
+        int had = N_RES;
+        res_add(w, h);
+        if (N_RES != had) {
+            qsort(k_res, (size_t)N_RES, sizeof k_res[0], res_cmp);
+            SendMessageW(ctl(ID_RESOLUTION), CB_RESETCONTENT, 0, 0);
+            for (i = 0; i < N_RES; i++)
+                SendMessageW(ctl(ID_RESOLUTION), CB_ADDSTRING, 0, (LPARAM)k_res[i].label);
+        }
     }
     for (i = 0; i < N_RES; i++)
         if (k_res[i].w == w && k_res[i].h == h)
@@ -2034,6 +2399,14 @@ static void settings_load(void)
     display_hint();
     (void)emulated;  /* (an old native_renderer = "off": saved as "main" next time) */
     online_show(online, online_name, online_server);
+    {   /* (the game's online mod settings: mod_transfer.cpp's defaults when missing) */
+        WCHAR n[16];
+        CheckDlgButton(s_wnd, ID_ON_SHARE, share ? BST_CHECKED : BST_UNCHECKED);
+        swprintf_s(n, 16, L"%d", up_kbs > 0 ? up_kbs : 4096), set_text(ID_ON_UP_KBS, n);
+        swprintf_s(n, 16, L"%d", up_peers > 0 ? up_peers : 2), set_text(ID_ON_UP_PEERS, n);
+        swprintf_s(n, 16, L"%d", mod_mb > 0 ? mod_mb : 300), set_text(ID_ON_MOD_MB, n);
+        swprintf_s(n, 16, L"%d", mods_mb > 0 ? mods_mb : 1024), set_text(ID_ON_MODS_MB, n);
+    }
     {
         WCHAR w[256];
         MultiByteToWideChar(CP_UTF8, 0, online_peers, -1, w, 256);
@@ -2060,7 +2433,7 @@ static void settings_load(void)
 
 static int settings_save(void)
 {
-    enum { NK = 38 };
+    enum { NK = 43 };
     static const char *keys[NK] = { "gpu_plugin", "input_backend", "resolution", "resolution_scale", "window_width",
                                     "window_height", "fullscreen", "vsync", "audio_mute", "audio_backend", "show_fps",
                                     "native_2x_msaa", "native_renderer", "gpu_backend", "user_language",
@@ -2069,7 +2442,9 @@ static int settings_save(void)
                                     "process_priority", "unlock_everything", "native_texture_quality",
                                     "skip_intros", "skip_training", "fullscreen_exclusive", "native_max_scale",
                                     "native_render_scale", "native_scene_height", "arena_brightness", "perf_overlay",
-                                    "native_upscale", "native_upscale_quality", "match_camera" };
+                                    "native_upscale", "native_upscale_quality", "match_camera",
+                                    "online_mod_upload", "online_mod_upload_kbs", "online_mod_upload_peers",
+                                    "online_mod_max_mb", "online_mods_max_mb" };
     const int renderer = (int)SendMessageW(ctl(ID_RENDERER), CB_GETCURSEL, 0, 0);
     char vals[NK][160];
     int done[NK] = { 0 };
@@ -2162,6 +2537,22 @@ static int settings_save(void)
         sprintf_s(vals[21], 64, "%d", k_frame_rates[fi >= 0 && fi < N_FRAME_RATES ? fi : 1]);
     }
     toml_quote_ctl(ID_ON_PEERS, 140, vals[22], sizeof vals[22]);
+    {   /* (the game's online mod settings, kept in its ranges) */
+        static const struct { int id, lo, hi, def; } k_mods[4] = {
+            { ID_ON_UP_KBS, 64, 65536, 4096 }, { ID_ON_UP_PEERS, 1, 8, 2 },
+            { ID_ON_MOD_MB, 1, 4096, 300 }, { ID_ON_MODS_MB, 1, 16384, 1024 } };
+        strcpy_s(vals[38], 64, IsDlgButtonChecked(s_wnd, ID_ON_SHARE) == BST_CHECKED ? "true" : "false");
+        for (k = 0; k < 4; k++) {
+            WCHAR n[16];
+            int v;
+            GetWindowTextW(ctl(k_mods[k].id), n, 16);
+            v = n[0] ? _wtoi(n) : k_mods[k].def;
+            v = v < k_mods[k].lo ? k_mods[k].lo : v > k_mods[k].hi ? k_mods[k].hi : v;
+            sprintf_s(vals[39 + k], 64, "%d", v);
+            swprintf_s(n, 16, L"%d", v);  /* (the field shows what's saved) */
+            set_text(k_mods[k].id, n);
+        }
+    }
 
     settings_path(p);
     if (!toml_read(p, &l))
@@ -2654,9 +3045,15 @@ static RECT nav_rect(int k)
 }
 
 /* A group box: a card the window draws on the page. */
-typedef struct { int tab, x, y, w, h; WCHAR title[64]; } Card;
+typedef struct { int tab, x, y, w, h, id; WCHAR title[64]; } Card;
 static Card s_cards[96];
 static int  s_ncards;
+/* The Online tab's "Mod sharing" fold: its card and rows in the Friends card's place while open. */
+static int s_mods_fold;
+static int card_hidden(const Card *cd)
+{
+    return (cd->id == ID_FR_GROUP && s_mods_fold) || (cd->id == ID_ON_MODS_GROUP && !s_mods_fold);
+}
 /* Push buttons, drawn by the window (rounded; red for the main actions). */
 typedef struct { HWND h; int primary; } Btn;
 static Btn  s_btns[256];
@@ -2666,6 +3063,7 @@ static HWND s_hover_btn;
 static int is_primary_id(int id)
 {
     return id == ID_PLAY || id == ID_INSTALL || id == ID_SAVE || id == ID_DLC_INSTALL || id == ID_ON_SIGNIN ||
+           id == ID_ON_STEP ||
            id == ID_MV_CREATE || id == ID_APK_CREATE || id == ID_ADB_INSTALL;
 }
 
@@ -2780,7 +3178,7 @@ static HWND add(int tab, const WCHAR *cls, const WCHAR *text, DWORD style, int x
     /* A group box becomes a card the window draws (the control is never shown). */
     if (button && kind == BS_GROUPBOX && tab >= 0 && s_ncards < (int)(sizeof s_cards / sizeof s_cards[0])) {
         Card *cd = &s_cards[s_ncards++];
-        cd->tab = tab; cd->x = x; cd->y = y; cd->w = w; cd->h = h;
+        cd->tab = tab; cd->x = x; cd->y = y; cd->w = w; cd->h = h; cd->id = id;
         wcsncpy_s(cd->title, 64, text ? text : L"", _TRUNCATE);
         return CreateWindowExW(0, cls, text, WS_CHILD | style, S(x + SB_W), S(y + DY), S(w), S(h), s_wnd,
                                (HMENU)(INT_PTR)id, s_inst, NULL);
@@ -2876,6 +3274,21 @@ static void pt_refresh(void);
 static void mv_refresh(void);
 static volatile LONG s_up_busy;
 
+static void online_mods_fold_apply(void)
+{
+    static const int friends[] = { ID_FR_LIST, ID_FR_NAME, ID_FR_ADD, ID_FR_REMOVE, ID_FR_INFO, ID_FR_STATUS };
+    static const int mods[] = { ID_ON_MODS_L1, ID_ON_UP_KBS, ID_ON_MODS_L2, ID_ON_UP_PEERS,
+                                ID_ON_MODS_L3, ID_ON_MOD_MB, ID_ON_MODS_L4, ID_ON_MODS_MB, ID_ON_MODS_INFO };
+    size_t i;
+    const int shown = s_cur_tab == TAB_ONLINE;
+    for (i = 0; i < sizeof friends / sizeof friends[0]; i++)
+        ShowWindow(ctl(friends[i]), shown && !s_mods_fold ? SW_SHOW : SW_HIDE);
+    for (i = 0; i < sizeof mods / sizeof mods[0]; i++)
+        ShowWindow(ctl(mods[i]), shown && s_mods_fold ? SW_SHOW : SW_HIDE);
+    SetWindowTextW(ctl(ID_ON_MODS_FOLD), s_mods_fold ? L"Friends \x25B8" : L"Mod sharing \x25B8");
+    InvalidateRect(s_wnd, NULL, TRUE);  /* (the cards: drawn by the window) */
+}
+
 static void show_tab(int t)
 {
     int i, k;
@@ -2885,9 +3298,14 @@ static void show_tab(int t)
             ShowWindow(s_ctl[k][i], k == t ? SW_SHOW : SW_HIDE);
     s_tab_visible_online = t == TAB_ONLINE;
     if (t == TAB_ONLINE) {  /* (the controls the account/server state hides) */
+        static int refreshed;
+        online_route_show();
+        if (!refreshed && s_online_token[0])  /* (once a start: the account's steps, from the server) */
+            refreshed = 1, online_account_refresh();
         online_account_show();
         online_server_show();
         friends_enable();
+        online_mods_fold_apply();
         friends_fetch(NULL);
         SetTimer(s_wnd, FRIENDS_TIMER, 20000, NULL);
     } else {
@@ -2946,14 +3364,172 @@ static HWND pt_setup_grid(void);
 static void mv_setup(void);
 static void up_setup(void);
 
+/* ── Report a problem: a recorded match and its mods (report_match.h) - shared by the window and --report-send ── */
+
+typedef struct {
+    ReportMatch match;       /* the match picked */
+    int has_match;
+    ReportMod mods[REPORT_MAX_MODS];  /* the mods it used */
+    int n_mods;
+    int checked;             /* the server said which it has */
+    uint64_t max_upload;     /* the server's limit for new mod bytes (0: not said) */
+    WCHAR check_why[200];    /* why the check didn't work, or the server's "no mods now" */
+    WCHAR match_zip[MAX_PATH];
+    WCHAR mod_zip[REPORT_MAX_MODS][MAX_PATH];
+} RepMatch;
+
+static void rep_cli_progress(void *ctx, uint64_t sent, uint64_t total)
+{
+    static int last = -1;
+    const int pct = total ? (int)(sent * 100 / total) : 0;
+    (void)ctx;
+    if (pct / 10 != last / 10 || sent == total) wprintf(L"progress %d%% (%.1f of %.1f MB)\n", pct, sent / 1048576.0, total / 1048576.0);
+    last = pct;
+}
+
+#define REP_MOD_MAX (300ull << 20)   /* (the server's cap per mod and per report) */
+
+/* The mods the match used, hashed, and (online) which the server lacks. */
+static void rep_match_load(RepMatch *m, const WCHAR *server)
+{
+    int i;
+    m->n_mods = m->has_match ? report_match_mods(s_game_dir, m->match.dir, m->mods, REPORT_MAX_MODS) : 0;
+    m->checked = 0, m->max_upload = 0, m->check_why[0] = 0;
+    for (i = 0; i < m->n_mods; i++)
+        if (m->mods[i].size > REP_MOD_MAX) m->mods[i].send = 0;   /* (too big for the server) */
+    if (m->n_mods && server && server[0])
+        m->checked = report_mods_check(server, m->mods, m->n_mods, &m->max_upload, m->check_why, 200);
+}
+
+/* Bytes to send / already on the server (the tick on: the mods the server lacks, in the server's limit). */
+static void rep_match_sizes(const RepMatch *m, uint64_t *to_send, uint64_t *have, int *too_big)
+{
+    const uint64_t limit = m->max_upload ? m->max_upload : REP_MOD_MAX;
+    int i;
+    *to_send = *have = 0, *too_big = 0;
+    for (i = 0; i < m->n_mods; i++) {
+        const ReportMod *d = &m->mods[i];
+        if (d->on_server) { *have += d->size; continue; }
+        if (!d->hash[0]) continue;                        /* (not installed any more) */
+        if (!d->send || *to_send + d->size > limit) { ++*too_big; continue; }
+        *to_send += d->size;
+    }
+}
+
+static void rep_mb(WCHAR *out, int n, uint64_t bytes)
+{
+    swprintf_s(out, n, bytes >= (10ull << 20) ? L"%.0f MB" : L"%.1f MB", bytes / 1048576.0);
+}
+
+/* "Mods used in this match: N (X MB to send, Y MB already on the server)". */
+static void rep_match_mods_text(const RepMatch *m, WCHAR *out, int n)
+{
+    uint64_t to_send, have;
+    int too_big, gone = 0, i;
+    WCHAR a[32], b[32], extra[200] = L"";
+    if (!m->has_match) { wcscpy_s(out, n, L"No match picked: the report goes without one."); return; }
+    if (!m->n_mods) { wcscpy_s(out, n, L"Mods used in this match: none."); return; }
+    if (m->checked && m->check_why[0]) {   /* (the server's "no mods now": nothing about sizes) */
+        swprintf_s(out, n, L"Mods used in this match: %d. %s", m->n_mods, m->check_why);
+        return;
+    }
+    rep_match_sizes(m, &to_send, &have, &too_big);
+    for (i = 0; i < m->n_mods; i++) gone += !m->mods[i].hash[0];
+    rep_mb(a, 32, to_send);
+    rep_mb(b, 32, have);
+    if (too_big) swprintf_s(extra, 200, L"; %d too big to send", too_big);
+    if (gone) swprintf_s(extra + wcslen(extra), 200 - wcslen(extra), L"; %d not installed any more", gone);
+    if (m->checked)
+        swprintf_s(out, n, L"Mods used in this match: %d (%s to send, %s already on the server%s).%s%s", m->n_mods, a, b,
+                   extra, m->check_why[0] ? L" " : L"", m->check_why);
+    else
+        swprintf_s(out, n, L"Mods used in this match: %d (%s to send%s; the server couldn't be asked which it has%s%s).",
+                   m->n_mods, a, extra, m->check_why[0] ? L": " : L"", m->check_why);
+}
+
+/* The upload's match and mod parts into u: zips in <game>\Reports\.upload (rep_match_done deletes them). */
+static void rep_match_parts(RepMatch *m, int with_mods, ReportUpload *u, char *name_utf8, int name_n)
+{
+    WCHAR dir[MAX_PATH];
+    const uint64_t limit = m->max_upload ? m->max_upload : REP_MOD_MAX;
+    uint64_t total = 0;
+    int i;
+    if (!m->has_match) return;
+    swprintf_s(dir, MAX_PATH, L"%s\\Reports", s_game_dir);
+    CreateDirectoryW(dir, NULL);
+    wcscat_s(dir, MAX_PATH, L"\\.upload");
+    CreateDirectoryW(dir, NULL);
+    swprintf_s(m->match_zip, MAX_PATH, L"%s\\match.zip", dir);
+    if (report_zip_dir(m->match.dir, m->match_zip, "")) {
+        const WCHAR *name = wcsrchr(m->match.dir, L'\\');
+        WideCharToMultiByte(CP_UTF8, 0, name ? name + 1 : m->match.dir, -1, name_utf8, name_n, NULL, NULL);
+        u->match_zip = m->match_zip;
+        u->match_name = name_utf8;
+    }
+    u->mods = m->mods;
+    u->n_mods = m->n_mods;
+    for (i = 0; with_mods && i < m->n_mods; i++) {
+        ReportMod *d = &m->mods[i];
+        if (d->on_server || !d->hash[0] || !d->send || total + d->size > limit) continue;
+        swprintf_s(m->mod_zip[i], MAX_PATH, L"%s\\%S.zip", dir, d->hash);
+        if (report_zip_dir(d->folder, m->mod_zip[i], "")) {
+            u->mod_zips[i] = m->mod_zip[i];
+            total += d->size;
+        } else {
+            m->mod_zip[i][0] = 0;
+        }
+    }
+}
+
+static void rep_match_done(RepMatch *m)
+{
+    int i;
+    if (m->match_zip[0]) DeleteFileW(m->match_zip), m->match_zip[0] = 0;
+    for (i = 0; i < REPORT_MAX_MODS; i++)
+        if (m->mod_zip[i][0]) DeleteFileW(m->mod_zip[i]), m->mod_zip[i][0] = 0;
+}
+
+/* What the result page / the CLI says about the match and mods after a send. */
+static void rep_match_result_text(const RepMatch *m, const ReportResult *r, WCHAR *out, int n)
+{
+    out[0] = 0;
+    if (!m->has_match) return;
+    swprintf_s(out, n, L"Match: %s.", r->match_stored ? L"sent" : L"not kept by the server");
+    if (r->mods_sent || r->mods_dropped)
+        swprintf_s(out + wcslen(out), n - wcslen(out), L" Mods: %d sent, %d kept%s%s.", r->mods_sent, r->mods_stored,
+                   r->mods_why[0] ? L" - " : L"", r->mods_why);
+}
+
 #define X0 28
+
+/* The Online tab's account box: a control moved to x (from X0), y - as add() places it - and shown with its tab. */
+static void on_place(int id, int x, int y, int w, int h)
+{
+    MoveWindow(ctl(id), S(X0 + x + PAD + SB_W), S(y + DY), S(w), S(h), TRUE);
+    ShowWindow(ctl(id), s_tab_visible_online ? SW_SHOW : SW_HIDE);
+}
 /* Report a problem: a window asks what happened (kind, how often, what and
    what just before), then the zip (report.c) is made with that description in
    its report.txt, and the window says where to post it: a new thread in the
    Discord's bug-svr11 forum (the description is copied, ready to paste). */
 #define DISCORD_INVITE L"https://discord.com/invite/QhGSuDKHwk"
 #define DISCORD_FORUM L"bug-svr11"
-enum { REP_KIND = 300, REP_AGAIN, REP_WHAT, REP_BEFORE, REP_STATUS, REP_CREATE, REP_DISCORD, REP_SHOW, REP_COPY };
+enum { REP_KIND = 300, REP_AGAIN, REP_WHAT, REP_BEFORE, REP_STATUS, REP_CREATE, REP_DISCORD, REP_SHOW, REP_COPY,
+       REP_CONTACT, REP_ADDPIC, REP_SUMMARY, REP_SEND, REP_COPYID, REP_MATCH, REP_MODS, REP_INCMODS, REP_PROGRESS, REP_INCSAVE,
+       REP_PIC0 = 340, REP_DEL0 = 350 };
+#define WM_APP_REP_SENT (WM_APP + 70)   /* the report window's own: the send finished (s_rep_result) */
+#define WM_APP_REP_MODS (WM_APP + 71)   /* ... the picked match's mods are hashed and checked (lParam: a RepMatch) */
+#define WM_APP_REP_PROGRESS (WM_APP + 72)   /* ... the upload: wParam percent, lParam MB sent x10 */
+#define REP_DY 122                      /* (page 1's rows below the match and save rows) */
+static ReportMatch s_rep_matches[REPORT_MAX_MATCHES];   /* the picker's matches, newest first */
+static int s_rep_nmatches;
+static RepMatch s_rep_rm;          /* the picked match and its mods (checked) */
+static int s_rep_mods_gen;         /* (a newer pick replaces an older check's result) */
+static volatile LONG s_rep_mods_busy;
+static WCHAR s_rep_pics[REPORT_MAX_IMAGES][MAX_PATH];  /* the pictures to send */
+static int s_rep_npics;
+static ReportResult s_rep_result;
+static char s_rep_problem[120], s_rep_happens[40], s_rep_what[4096], s_rep_before[4096], s_rep_contact[200];
 static const WCHAR *const k_rep_kinds[] = { L"The game crashed (closed by itself)", L"The game froze or hung",
                                             L"Graphics look wrong", L"Sound or music", L"Controller or keyboard",
                                             L"Online", L"Mods", L"Saves or created content", L"The launcher",
@@ -2998,6 +3574,123 @@ static void rep_clear(HWND w)
         DestroyWindow(c);
 }
 
+/* Page 1's picture rows (a name and Remove per picture) and the line saying what Send sends. */
+static void rep_pics_show(HWND w)
+{
+    ReportUpload u;
+    WCHAR line[300];
+    int i;
+    for (i = 0; i < REPORT_MAX_IMAGES; i++) {
+        const WCHAR *name = i < s_rep_npics ? wcsrchr(s_rep_pics[i], L'\\') : NULL;
+        SetDlgItemTextW(w, REP_PIC0 + i, i < s_rep_npics ? (name ? name + 1 : s_rep_pics[i]) : L"");
+        ShowWindow(GetDlgItem(w, REP_DEL0 + i), i < s_rep_npics ? SW_SHOW : SW_HIDE);
+    }
+    EnableWindow(GetDlgItem(w, REP_ADDPIC), s_rep_npics < REPORT_MAX_IMAGES);
+    ZeroMemory(&u, sizeof u);
+    u.zip = L"report.zip";
+    u.n_images = s_rep_npics;
+    if (IsDlgButtonChecked(w, REP_INCSAVE) == BST_CHECKED) u.save_bytes = report_main_save_size(s_game_dir);
+    if (s_rep_rm.has_match && !s_rep_mods_busy) {   /* (the match and the mods Send would take, as rep_match_parts) */
+        const uint64_t limit = s_rep_rm.max_upload ? s_rep_rm.max_upload : REP_MOD_MAX;
+        uint64_t total = 0;
+        u.match_name = "match";
+        u.mods = s_rep_rm.mods;
+        u.n_mods = s_rep_rm.n_mods;
+        for (i = 0; IsDlgButtonChecked(w, REP_INCMODS) == BST_CHECKED && i < s_rep_rm.n_mods; i++) {
+            const ReportMod *d = &s_rep_rm.mods[i];
+            if (d->on_server || !d->hash[0] || !d->send || total + d->size > limit) continue;
+            u.mod_zips[i] = L"";
+            total += d->size;
+        }
+    }
+    report_send_summary(&u, line, 300);
+    SetDlgItemTextW(w, REP_SUMMARY, line);
+}
+
+/* Adds a picture (checked: png / jpeg / webp, 5 MB at most). 0 with the reason on the status line if not. */
+static int rep_pic_add(HWND w, const WCHAR *path)
+{
+    WCHAR why[300];
+    int i;
+    if (s_rep_npics >= REPORT_MAX_IMAGES) return 0;
+    for (i = 0; i < s_rep_npics; i++)
+        if (!_wcsicmp(s_rep_pics[i], path)) return 1;
+    if (!report_image_ok(path, why, 300)) {
+        if (w) SetDlgItemTextW(w, REP_STATUS, why);
+        return 0;
+    }
+    wcscpy_s(s_rep_pics[s_rep_npics++], MAX_PATH, path);
+    return 1;
+}
+
+/* "Add pictures...": a file dialog, several at once. */
+static void rep_pics_pick(HWND w)
+{
+    static WCHAR files[8192];
+    OPENFILENAMEW of;
+    ZeroMemory(&of, sizeof of);
+    files[0] = 0;
+    of.lStructSize = sizeof of;
+    of.hwndOwner = w;
+    of.lpstrFilter = L"Pictures (PNG, JPEG, WebP)\0*.png;*.jpg;*.jpeg;*.webp\0";
+    of.lpstrFile = files;
+    of.nMaxFile = 8192;
+    of.lpstrTitle = L"Pictures for the report";
+    of.Flags = OFN_FILEMUSTEXIST | OFN_EXPLORER | OFN_ALLOWMULTISELECT | OFN_HIDEREADONLY;
+    if (!GetOpenFileNameW(&of)) return;
+    SetDlgItemTextW(w, REP_STATUS, L"");
+    if (files[wcslen(files) + 1] == 0) {   /* (one file: its full path) */
+        rep_pic_add(w, files);
+    } else {                               /* (several: the folder, then the names) */
+        const WCHAR *p = files + wcslen(files) + 1;
+        for (; *p; p += wcslen(p) + 1) {
+            WCHAR full[MAX_PATH];
+            swprintf_s(full, MAX_PATH, L"%s\\%s", files, p);
+            if (!rep_pic_add(w, full) && s_rep_npics >= REPORT_MAX_IMAGES) break;
+        }
+    }
+    rep_pics_show(w);
+}
+
+/* The match picked (REP_MATCH): its mods hashed and checked with the server on a worker (a few seconds for big
+   mods the first time - the hashes are kept in Reports\.modhash); Send waits for it. */
+typedef struct { HWND w; int gen; RepMatch m; } RepModsJob;
+static DWORD WINAPI rep_mods_thread(LPVOID p)
+{
+    RepModsJob *j = (RepModsJob *)p;
+    WCHAR server[260];
+    online_server_text(server, 260);
+    rep_match_load(&j->m, server);
+    if (!PostMessageW(j->w, WM_APP_REP_MODS, (WPARAM)j->gen, (LPARAM)j)) free(j);
+    return 0;
+}
+
+static void rep_match_pick(HWND w)
+{
+    const int sel = (int)SendDlgItemMessageW(w, REP_MATCH, CB_GETCURSEL, 0, 0);
+    RepModsJob *j;
+    HANDLE t;
+    ++s_rep_mods_gen;
+    ZeroMemory(&s_rep_rm, sizeof s_rep_rm);
+    if (sel < 0 || sel >= s_rep_nmatches) {
+        WCHAR line[600];
+        rep_match_mods_text(&s_rep_rm, line, 600);
+        SetDlgItemTextW(w, REP_MODS, line);
+        EnableWindow(GetDlgItem(w, REP_INCMODS), FALSE);
+        InterlockedExchange(&s_rep_mods_busy, 0);
+        rep_pics_show(w);
+        return;
+    }
+    s_rep_rm.match = s_rep_matches[sel];
+    s_rep_rm.has_match = 1;
+    SetDlgItemTextW(w, REP_MODS, L"Mods used in this match: checking\x2026");
+    if (!(j = (RepModsJob *)calloc(1, sizeof *j))) return;
+    j->w = w, j->gen = s_rep_mods_gen, j->m = s_rep_rm;
+    InterlockedExchange(&s_rep_mods_busy, 1);
+    if ((t = CreateThread(NULL, 0, rep_mods_thread, j, 0, NULL)) != NULL) CloseHandle(t);
+    else { free(j); InterlockedExchange(&s_rep_mods_busy, 0); }
+}
+
 /* Page 1: the questions. */
 static void rep_page1(HWND w)
 {
@@ -3029,9 +3722,41 @@ static void rep_page1(HWND w)
     c = rep_add(w, L"Edit", L"", ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL | WS_TABSTOP, 20, 316, 480,
                 70, REP_BEFORE, NULL);
     SendMessageW(c, EM_LIMITTEXT, 1500, 0);
-    rep_add(w, L"Static", L"", SS_LEFT, 20, 404, 250, 36, REP_STATUS, NULL);
-    rep_add(w, L"Button", L"Create report", BS_DEFPUSHBUTTON | WS_TABSTOP, 280, 400, 130, 32, REP_CREATE, NULL);
-    rep_add(w, L"Button", L"Cancel", WS_TABSTOP, 420, 400, 80, 32, IDCANCEL, NULL);
+    rep_add(w, L"Static", L"Your Discord name (optional - so we can ask you):", SS_NOPREFIX, 20, 398, 290, 20, 0, NULL);
+    c = rep_add(w, L"Edit", L"", ES_AUTOHSCROLL | WS_TABSTOP, 310, 394, 190, 24, REP_CONTACT, NULL);
+    SendMessageW(c, EM_LIMITTEXT, 60, 0);
+    /* the match (the game's recordings, logs\matches: report_match.h) - the newest picked - and its mods */
+    rep_add(w, L"Static", L"Match:", 0, 20, 432, 60, 20, 0, NULL);
+    c = rep_add(w, L"ComboBox", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 84, 428, 416, 300, REP_MATCH, NULL);
+    s_rep_nmatches = report_match_list(s_game_dir, s_rep_matches, REPORT_MAX_MATCHES);
+    for (i = 0; i < s_rep_nmatches; i++) SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)s_rep_matches[i].label);
+    SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)(s_rep_nmatches ? L"None - send the report without a match"
+                                                              : L"None (no recorded matches)"));
+    SendMessageW(c, CB_SETCURSEL, 0, 0);
+    rep_add(w, L"Static", L"", SS_LEFT | SS_NOPREFIX, 20, 458, 480, 34, REP_MODS, NULL);
+    c = rep_add(w, L"Button", L"Include the mods used in this match (helps us reproduce it)",
+                BS_AUTOCHECKBOX | WS_TABSTOP, 20, 494, 480, 22, REP_INCMODS, NULL);
+    SendMessageW(c, BM_SETCHECK, BST_CHECKED, 0);   /* (on unless the player turns it off) */
+    c = rep_add(w, L"Button", L"Include my main save (story / Universe progress and options - not my created superstars "
+                              L"or Paint Tool)", BS_AUTOCHECKBOX | BS_MULTILINE | WS_TABSTOP, 20, 516, 480, 36, REP_INCSAVE, NULL);
+    SendMessageW(c, BM_SETCHECK, BST_CHECKED, 0);   /* (on unless the player turns it off) */
+    rep_add(w, L"Static", L"Pictures (up to 5): screenshots of the problem help a lot.", SS_NOPREFIX, 20, 432 + REP_DY, 360, 20, 0,
+            NULL);
+    rep_add(w, L"Button", L"Add pictures\x2026", WS_TABSTOP, 390, 428 + REP_DY, 110, 26, REP_ADDPIC, NULL);
+    for (i = 0; i < REPORT_MAX_IMAGES; i++) {
+        rep_add(w, L"Static", L"", SS_NOPREFIX | SS_PATHELLIPSIS, 20, 462 + REP_DY + i * 26, 380, 20, REP_PIC0 + i, NULL);
+        rep_add(w, L"Button", L"Remove", WS_TABSTOP, 410, 458 + REP_DY + i * 26, 90, 24, REP_DEL0 + i, NULL);
+    }
+    rep_add(w, L"Static", L"", SS_LEFT | SS_NOPREFIX, 20, 594 + REP_DY, 480, 34, REP_SUMMARY, NULL);
+    c = rep_add(w, PROGRESS_CLASSW, L"", 0, 20, 602 + REP_DY, 480, 16, REP_PROGRESS, NULL);   /* (over the summary, while sending) */
+    SendMessageW(c, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
+    ShowWindow(c, SW_HIDE);
+    rep_add(w, L"Static", L"", SS_LEFT, 20, 640 + REP_DY, 180, 36, REP_STATUS, NULL);
+    rep_add(w, L"Button", L"Send report", BS_DEFPUSHBUTTON | WS_TABSTOP, 200, 636 + REP_DY, 110, 32, REP_SEND, NULL);
+    rep_add(w, L"Button", L"Save zip", WS_TABSTOP, 318, 636 + REP_DY, 92, 32, REP_CREATE, NULL);
+    rep_add(w, L"Button", L"Cancel", WS_TABSTOP, 420, 636 + REP_DY, 80, 32, IDCANCEL, NULL);
+    rep_pics_show(w);
+    rep_match_pick(w);
     SetFocus(GetDlgItem(w, REP_WHAT));
 }
 
@@ -3082,7 +3807,90 @@ static int rep_describe(HWND w, char *utf8, int n)
                L"Just before:\r\n%s\r\n",
                PORT_VERSION, k_rep_kinds[k], k_rep_again[a], what, before[0] ? before : L"(not said)");
     WideCharToMultiByte(CP_UTF8, 0, s_rep_text, -1, utf8, n, NULL, NULL);
+    {   /* (the fields for the server's report.json) */
+        WCHAR contact[64];
+        GetDlgItemTextW(w, REP_CONTACT, contact, 64);
+        WideCharToMultiByte(CP_UTF8, 0, k_rep_kinds[k], -1, s_rep_problem, sizeof s_rep_problem, NULL, NULL);
+        WideCharToMultiByte(CP_UTF8, 0, k_rep_again[a], -1, s_rep_happens, sizeof s_rep_happens, NULL, NULL);
+        WideCharToMultiByte(CP_UTF8, 0, what, -1, s_rep_what, sizeof s_rep_what, NULL, NULL);
+        WideCharToMultiByte(CP_UTF8, 0, before, -1, s_rep_before, sizeof s_rep_before, NULL, NULL);
+        WideCharToMultiByte(CP_UTF8, 0, contact, -1, s_rep_contact, sizeof s_rep_contact, NULL, NULL);
+    }
     return 1;
+}
+
+/* The send (a worker: it can take a while on a slow line): report.json from the answers, the zip, the pictures,
+   to the configured online server. The window gets WM_APP_REP_SENT. */
+static WCHAR s_rep_server[260];
+static int s_rep_with_mods;
+static void rep_win_progress(void *ctx, uint64_t sent, uint64_t total)
+{
+    static DWORD last;
+    const DWORD now = GetTickCount();
+    if (now - last < 200 && sent < total) return;   /* (5 a second is plenty) */
+    last = now;
+    PostMessageW((HWND)ctx, WM_APP_REP_PROGRESS, (WPARAM)(total ? sent * 100 / total : 0), (LPARAM)(total / 104858));
+}
+static DWORD WINAPI rep_send_thread(LPVOID p)
+{
+    HWND w = (HWND)p;
+    ReportUpload u;
+    char sig[400], ver[40], match_name[300] = "";
+    char *json;
+    int i;
+    WideCharToMultiByte(CP_UTF8, 0, PORT_VERSION, -1, ver, sizeof ver, NULL, NULL);
+    report_signature(s_game_dir, sig, sizeof sig);
+    json = report_json("launcher", ver, s_rep_problem, s_rep_happens, s_rep_what, s_rep_before,
+                       s_rep_contact, sig);
+    ZeroMemory(&u, sizeof u);
+    u.json = json;
+    u.zip = s_rep_zip;
+    for (i = 0; i < s_rep_npics; i++) u.images[i] = s_rep_pics[i];
+    u.n_images = s_rep_npics;
+    rep_match_parts(&s_rep_rm, s_rep_with_mods, &u, match_name, sizeof match_name);
+    u.progress = rep_win_progress;
+    u.ctx = w;
+    report_send(s_rep_server, &u, &s_rep_result);
+    rep_match_done(&s_rep_rm);
+    free(json);
+    PostMessageW(w, WM_APP_REP_SENT, 0, 0);
+    return 0;
+}
+
+/* Page 3: sent (the id, how often seen before), or not (why, and the zip kept for Discord). */
+static void rep_page3(HWND w)
+{
+    WCHAR t[MAX_PATH + 1200], id[64];
+    const int ok = s_rep_result.id[0] != 0;
+    s_rep_page = ok ? 3 : 2;
+    rep_clear(w);
+    MultiByteToWideChar(CP_UTF8, 0, s_rep_result.id, -1, id, 64);
+    if (ok) {
+        WCHAR seen[600] = L"";
+        if (s_rep_result.seen_before > 0)
+            swprintf_s(seen, 600, L"\n\nThis problem was already reported %d time%s - yours adds to it, thank you.",
+                       s_rep_result.seen_before, s_rep_result.seen_before == 1 ? L"" : L"s");
+        {
+            WCHAR mm[400];
+            rep_match_result_text(&s_rep_rm, &s_rep_result, mm, 400);
+            if (mm[0]) swprintf_s(seen + wcslen(seen), 600 - wcslen(seen), L"\n\n%.150s", mm);
+        }
+        swprintf_s(t, MAX_PATH + 1200,
+                   L"Your report reached us.\n\nReport id:  %s%s\n\nIf you post about it on our Discord (" DISCORD_FORUM
+                   L" forum), give this id. A copy of the report is also kept here:\n%s",
+                   id, seen, s_rep_zip);
+        rep_add(w, L"Static", L"Report sent", 0, 20, 14, 480, 30, 0, s_big);
+        rep_add(w, L"Static", t, SS_LEFT | SS_NOPREFIX, 20, 52, 480, 290, 0, NULL);
+        rep_add(w, L"Button", L"Copy the id", BS_DEFPUSHBUTTON | WS_TABSTOP, 20, 360, 120, 32, REP_COPYID, NULL);
+        rep_add(w, L"Button", L"Show the file", WS_TABSTOP, 148, 360, 120, 32, REP_SHOW, NULL);
+        rep_add(w, L"Button", L"Close", WS_TABSTOP, 420, 360, 80, 32, IDCANCEL, NULL);
+        rep_add(w, L"Static", L"", SS_LEFT, 20, 404, 480, 20, REP_STATUS, NULL);
+        SetFocus(GetDlgItem(w, IDCANCEL));
+        return;
+    }
+    rep_page2(w);   /* (where to post it, the zip saved) */
+    swprintf_s(t, MAX_PATH + 1200, L"Not sent: %s Your report is saved - post it on Discord instead:", s_rep_result.why);
+    SetDlgItemTextW(w, REP_STATUS, t);
 }
 
 static LRESULT CALLBACK rep_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
@@ -3097,12 +3905,67 @@ static LRESULT CALLBACK rep_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
                 SetFocus(GetDlgItem(w, REP_WHAT));
                 return 0;
             }
-            if (!report_make_ex(s_game_dir, PORT_VERSION, utf8, s_rep_zip, MAX_PATH, &logs, &crashes)) {
+            if (!report_make_match(s_game_dir, PORT_VERSION, utf8, s_rep_rm.has_match ? s_rep_rm.match.dir : NULL,
+                                   IsDlgButtonChecked(w, REP_INCSAVE) == BST_CHECKED, s_rep_zip, MAX_PATH, &logs,
+                                   &crashes)) {
                 SetDlgItemTextW(w, REP_STATUS, L"The report could not be written (is the game folder read-only?).");
                 return 0;
             }
             rep_copy(w);
             rep_page2(w);
+            return 0;
+        }
+        case REP_SEND: {
+            static char utf8[8192];
+            int logs = 0, crashes = 0;
+            if (s_rep_mods_busy) {
+                SetDlgItemTextW(w, REP_STATUS, L"One moment - the match's mods are still being checked.");
+                return 0;
+            }
+            s_rep_with_mods = IsDlgButtonChecked(w, REP_INCMODS) == BST_CHECKED;
+            if (!rep_describe(w, utf8, sizeof utf8)) {
+                SetDlgItemTextW(w, REP_STATUS, L"Please say what happened first.");
+                SetFocus(GetDlgItem(w, REP_WHAT));
+                return 0;
+            }
+            /* (the match goes as its own part: not in the zip) */
+            if (!report_make_match(s_game_dir, PORT_VERSION, utf8, NULL, IsDlgButtonChecked(w, REP_INCSAVE) == BST_CHECKED,
+                                   s_rep_zip, MAX_PATH, &logs, &crashes)) {
+                SetDlgItemTextW(w, REP_STATUS, L"The report could not be written (is the game folder read-only?).");
+                return 0;
+            }
+            rep_copy(w);
+            online_server_text(s_rep_server, 260);
+            SetDlgItemTextW(w, REP_STATUS, L"Sending\x2026");
+            EnableWindow(GetDlgItem(w, REP_SEND), FALSE);
+            EnableWindow(GetDlgItem(w, REP_CREATE), FALSE);
+            EnableWindow(GetDlgItem(w, REP_MATCH), FALSE);
+            EnableWindow(GetDlgItem(w, REP_INCMODS), FALSE);
+            ShowWindow(GetDlgItem(w, REP_SUMMARY), SW_HIDE);
+            ShowWindow(GetDlgItem(w, REP_PROGRESS), SW_SHOW);
+            {
+                HANDLE t = CreateThread(NULL, 0, rep_send_thread, w, 0, NULL);
+                if (t) CloseHandle(t);
+                else { ZeroMemory(&s_rep_result, sizeof s_rep_result); wcscpy_s(s_rep_result.why, 300, L"No thread."); rep_page3(w); }
+            }
+            return 0;
+        }
+        case REP_ADDPIC:
+            rep_pics_pick(w);
+            return 0;
+        case REP_MATCH:
+            if (HIWORD(wp) == CBN_SELCHANGE) rep_match_pick(w);
+            return 0;
+        case REP_INCMODS:
+        case REP_INCSAVE:
+            rep_pics_show(w);   /* (the summary: with or without the mods / the save) */
+            return 0;
+        case REP_COPYID: {
+            WCHAR id[64];
+            MultiByteToWideChar(CP_UTF8, 0, s_rep_result.id, -1, id, 64);
+            wcscpy_s(s_rep_text, 4096, id);
+            rep_copy(w);
+            SetDlgItemTextW(w, REP_STATUS, L"Report id copied.");
             return 0;
         }
         case REP_DISCORD:
@@ -3123,9 +3986,45 @@ static LRESULT CALLBACK rep_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
             DestroyWindow(w);
             return 0;
         }
+        if (LOWORD(wp) >= REP_DEL0 && LOWORD(wp) < REP_DEL0 + REPORT_MAX_IMAGES) {   /* (Remove a picture) */
+            int k = LOWORD(wp) - REP_DEL0;
+            if (k < s_rep_npics) {
+                memmove(s_rep_pics[k], s_rep_pics[k + 1], (size_t)(s_rep_npics - k - 1) * sizeof s_rep_pics[0]);
+                s_rep_npics--;
+                rep_pics_show(w);
+            }
+            return 0;
+        }
+    }
+    if (m == WM_APP_REP_SENT) {
+        rep_page3(w);
+        return 0;
+    }
+    if (m == WM_APP_REP_MODS) {   /* (a picked match's mods checked: shown, unless a newer pick is on its way) */
+        RepModsJob *j = (RepModsJob *)lp;
+        if ((int)wp == s_rep_mods_gen && s_rep_page == 1) {
+            WCHAR line[600];
+            s_rep_rm = j->m;
+            rep_match_mods_text(&s_rep_rm, line, 600);
+            SetDlgItemTextW(w, REP_MODS, line);
+            EnableWindow(GetDlgItem(w, REP_INCMODS), s_rep_rm.n_mods > 0);
+            InterlockedExchange(&s_rep_mods_busy, 0);
+            rep_pics_show(w);
+        }
+        free(j);
+        return 0;
+    }
+    if (m == WM_APP_REP_PROGRESS) {
+        WCHAR t[120];
+        const double mb = (double)lp / 10.0;
+        SendDlgItemMessageW(w, REP_PROGRESS, PBM_SETPOS, wp, 0);
+        swprintf_s(t, 120, L"Sending\x2026 %d%% of %.1f MB", (int)wp, mb);
+        SetDlgItemTextW(w, REP_STATUS, t);
+        return 0;
     }
     if (m == WM_CTLCOLORSTATIC && GetDlgCtrlID((HWND)lp) == REP_STATUS) {
-        SetTextColor((HDC)wp, s_rep_page == 1 ? RGB(190, 30, 45) : RGB(30, 120, 60));
+        SetTextColor((HDC)wp, s_rep_page == 1 || (s_rep_page == 2 && s_rep_result.why[0]) ? RGB(190, 30, 45)
+                                                                                 : RGB(30, 120, 60));
         SetBkMode((HDC)wp, TRANSPARENT);
         return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
     }
@@ -3160,7 +4059,7 @@ static void report_window(int page, const WCHAR *capture_file)
         registered = 1;
     }
     r.right = S(520);
-    r.bottom = S(452);
+    r.bottom = S(684 + REP_DY);
     AdjustWindowRectEx(&r, WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME);
     GetWindowRect(s_wnd, &pr);
     w = CreateWindowExW(WS_EX_DLGMODALFRAME, L"SvR2011Report", L"Report a problem", WS_POPUP | WS_CAPTION | WS_SYSMENU,
@@ -3223,6 +4122,8 @@ static void report_problem(void)
     }
     s_rep_zip[0] = 0;
     s_rep_text[0] = 0;
+    s_rep_npics = 0;
+    ZeroMemory(&s_rep_result, sizeof s_rep_result);
     report_window(1, NULL);
 }
 
@@ -3275,6 +4176,7 @@ static void build_ui(void)
     add(TAB_SETTINGS, L"Static", L"Window size", SS_LEFT, X0 + 16, 76, 120, 20, 0);
     h = add(TAB_SETTINGS, L"ComboBox", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP | WS_GROUP,
             X0 + 150, 72, 240, 200, ID_RESOLUTION);
+    res_list_build(s_wnd);
     for (i = 0; i < N_RES; i++)
         SendMessageW(h, CB_ADDSTRING, 0, (LPARAM)k_res[i].label);
     h = add(TAB_SETTINGS, L"ComboBox", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, X0 + 400, 72, 146, 200,
@@ -3370,26 +4272,39 @@ static void build_ui(void)
     add(TAB_SETTINGS, L"Static", L"", SS_LEFT | SS_NOPREFIX, X0, 568, 560, 32, ID_SETTINGS_STATUS);
 
     /* Online */
+    /* the last online match's connection (online_route_show: the game's log) */
+    add(TAB_ONLINE, L"Static", L"", SS_LEFT | SS_NOPREFIX, X0, 16, 560, 34, ID_ON_ROUTE);
     add(TAB_ONLINE, L"Static", L"Community Creations and online matches (Player Match, Royal Rumble) through a "
                                L"Community Creations server - the original servers closed in 2014.",
         SS_LEFT, X0, 54, 560, 36, 0);
-    add(TAB_ONLINE, L"Button", L"Play online", BS_AUTOCHECKBOX | WS_TABSTOP, X0, 92, 400, 22, ID_ON_ENABLE);
+    add(TAB_ONLINE, L"Button", L"Play online", BS_AUTOCHECKBOX | WS_TABSTOP, X0, 92, 150, 22, ID_ON_ENABLE);
+    /* (the game's online_mod_upload: mod_transfer.cpp - the host sends its gameplay mods to joiners who lack them) */
+    add(TAB_ONLINE, L"Button", L"Share my mods with players who join me", BS_AUTOCHECKBOX | WS_TABSTOP, X0 + 160, 92,
+        290, 22, ID_ON_SHARE);
+    add(TAB_ONLINE, L"Button", L"Mod sharing \x25B8", BS_PUSHBUTTON | WS_TABSTOP, X0 + 452, 90, 108, 26,
+        ID_ON_MODS_FOLD);
     add(TAB_ONLINE, L"Button", L"Your account", BS_GROUPBOX, X0, 118, 560, 124, 0);
-    add(TAB_ONLINE, L"Static", L"Name", SS_LEFT, X0 + 16, 144, 130, 20, 0);
+    /* (the account box's fields and buttons: placed by online_account_show, for its mode) */
+    add(TAB_ONLINE, L"Static", L"Name", SS_LEFT, X0 + 16, 144, 130, 20, ID_ON_L_NAME);
     h = add(TAB_ONLINE, L"Edit", L"", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, X0 + 150, 140, 220, 24, ID_ON_NAME);
     SendMessageW(h, EM_LIMITTEXT, 15, 0);
-    add(TAB_ONLINE, L"Static", L"Password", SS_LEFT, X0 + 16, 174, 130, 20, 0);
+    add(TAB_ONLINE, L"Static", L"Password", SS_LEFT, X0 + 16, 174, 130, 20, ID_ON_L_PASS);
     h = add(TAB_ONLINE, L"Edit", L"", ES_AUTOHSCROLL | ES_PASSWORD | WS_BORDER | WS_TABSTOP, X0 + 150, 170, 220, 24,
             ID_ON_PASSWORD);
     SendMessageW(h, EM_LIMITTEXT, 100, 0);
+    add(TAB_ONLINE, L"Static", L"Code", SS_LEFT, X0 + 16, 174, 130, 20, ID_ON_L_CODE);
+    h = add(TAB_ONLINE, L"Edit", L"", ES_AUTOHSCROLL | ES_UPPERCASE | WS_BORDER | WS_TABSTOP, X0 + 150, 170, 220, 24,
+            ID_ON_CODE);
+    SendMessageW(h, EM_LIMITTEXT, 20, 0);
     add(TAB_ONLINE, L"Button", L"Sign in", BS_PUSHBUTTON | WS_TABSTOP, X0 + 384, 139, 162, 26, ID_ON_SIGNIN);
-    add(TAB_ONLINE, L"Button", L"Create account", BS_PUSHBUTTON | WS_TABSTOP, X0 + 384, 169, 162, 26,
+    add(TAB_ONLINE, L"Button", L"Create account\x2026", BS_PUSHBUTTON | WS_TABSTOP, X0 + 384, 169, 162, 26,
         ID_ON_REGISTER);
     add(TAB_ONLINE, L"Button", L"Sign out", BS_PUSHBUTTON | WS_TABSTOP, X0 + 384, 139, 162, 26, ID_ON_SIGNOUT);
+    add(TAB_ONLINE, L"Button", L"", BS_PUSHBUTTON | WS_TABSTOP, X0 + 384, 139, 162, 26, ID_ON_STEP);
+    add(TAB_ONLINE, L"Button", L"Back", BS_PUSHBUTTON | WS_TABSTOP, X0 + 384, 169, 162, 26, ID_ON_BACK);
+    add(TAB_ONLINE, L"Button", L"Forgot password?", BS_PUSHBUTTON | WS_TABSTOP, X0 + 384, 199, 162, 24, ID_ON_FORGOT);
     add(TAB_ONLINE, L"Static", L"", SS_LEFT | SS_NOPREFIX, X0 + 16, 200, 530, 18, ID_ON_ACCOUNT);
-    add(TAB_ONLINE, L"Static", L"The name (3-15 characters) is what other players see. The same account works on any "
-                               L"PC or phone.",
-        SS_LEFT, X0 + 16, 219, 530, 18, 0);
+    add(TAB_ONLINE, L"Static", L"", SS_LEFT | SS_NOPREFIX, X0 + 16, 219, 530, 18, ID_ON_INFO);
     add(TAB_ONLINE, L"Button", L"Server", BS_GROUPBOX, X0, 248, 560, 74, 0);
     h = add(TAB_ONLINE, L"ComboBox", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, X0 + 16, 270, 120, 200,
             ID_ON_SERVER_KIND);
@@ -3398,7 +4313,7 @@ static void build_ui(void)
     SendMessageW(h, CB_SETCURSEL, 0, 0);
     add(TAB_ONLINE, L"Edit", L"", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, X0 + 150, 270, 396, 24, ID_ON_SERVER);
     add(TAB_ONLINE, L"Static", L"", SS_LEFT | SS_NOPREFIX, X0 + 150, 298, 396, 20, ID_ON_SERVER_LABEL);
-    add(TAB_ONLINE, L"Button", L"Friends", BS_GROUPBOX, X0, 328, 560, 202, 0);
+    add(TAB_ONLINE, L"Button", L"Friends", BS_GROUPBOX, X0, 328, 560, 202, ID_FR_GROUP);
     {
         static const WCHAR *const names[] = { L"Player", L"Status" };
         static const int widths[] = { 150, 196 };
@@ -3412,7 +4327,24 @@ static void build_ui(void)
     add(TAB_ONLINE, L"Button", L"Add", BS_PUSHBUTTON | WS_TABSTOP, X0 + 380, 380, 80, 26, ID_FR_ADD);
     add(TAB_ONLINE, L"Button", L"Remove", BS_PUSHBUTTON | WS_TABSTOP, X0 + 466, 380, 80, 26, ID_FR_REMOVE);
     add(TAB_ONLINE, L"Static", L"Online: in the game's ONLINE menus. Friends' matches show in the game's searches.",
-        SS_LEFT | SS_NOPREFIX, X0 + 380, 414, 166, 60, 0);
+        SS_LEFT | SS_NOPREFIX, X0 + 380, 414, 166, 60, ID_FR_INFO);
+    /* Mod sharing (the fold: in the Friends box's place while open) - the game's online mod settings */
+    add(TAB_ONLINE, L"Button", L"Mods in online sessions", BS_GROUPBOX, X0, 328, 560, 202, ID_ON_MODS_GROUP);
+    add(TAB_ONLINE, L"Static", L"Upload speed (KB/s, all joiners)", SS_LEFT, X0 + 16, 354, 250, 20, ID_ON_MODS_L1);
+    h = add(TAB_ONLINE, L"Edit", L"", ES_NUMBER | WS_BORDER | WS_TABSTOP, X0 + 280, 350, 90, 24, ID_ON_UP_KBS);
+    SendMessageW(h, EM_LIMITTEXT, 5, 0);
+    add(TAB_ONLINE, L"Static", L"Joiners downloading at once", SS_LEFT, X0 + 16, 380, 250, 20, ID_ON_MODS_L2);
+    h = add(TAB_ONLINE, L"Edit", L"", ES_NUMBER | WS_BORDER | WS_TABSTOP, X0 + 280, 376, 90, 24, ID_ON_UP_PEERS);
+    SendMessageW(h, EM_LIMITTEXT, 1, 0);
+    add(TAB_ONLINE, L"Static", L"Largest mod to download (MB)", SS_LEFT, X0 + 16, 406, 250, 20, ID_ON_MODS_L3);
+    h = add(TAB_ONLINE, L"Edit", L"", ES_NUMBER | WS_BORDER | WS_TABSTOP, X0 + 280, 402, 90, 24, ID_ON_MOD_MB);
+    SendMessageW(h, EM_LIMITTEXT, 4, 0);
+    add(TAB_ONLINE, L"Static", L"Most to download for one session (MB)", SS_LEFT, X0 + 16, 432, 260, 20, ID_ON_MODS_L4);
+    h = add(TAB_ONLINE, L"Edit", L"", ES_NUMBER | WS_BORDER | WS_TABSTOP, X0 + 280, 428, 90, 24, ID_ON_MODS_MB);
+    SendMessageW(h, EM_LIMITTEXT, 5, 0);
+    add(TAB_ONLINE, L"Static", L"Mods you lack come straight from the host's game (never the server or the relay), into "
+                               L"UserData\\OnlineMods - removed when you leave online or close the game.",
+        SS_LEFT | SS_NOPREFIX, X0 + 16, 458, 530, 36, ID_ON_MODS_INFO);
     add(TAB_ONLINE, L"Static", L"", SS_LEFT | SS_NOPREFIX, X0 + 16, 478, 530, 18, ID_FR_STATUS);
     add(TAB_ONLINE, L"Static", L"Addresses", SS_LEFT, X0 + 16, 502, 90, 20, 0);
     h = add(TAB_ONLINE, L"Edit", L"", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, X0 + 110, 498, 436, 24, ID_ON_PEERS);
@@ -3561,6 +4493,7 @@ static void build_ui(void)
     /* Texture packs (texpacks_tab.c) */
     texpacks_build(s_wnd, add, TAB_TEXPACKS, ID_TEXPACKS_BASE, toml_get, toml_set);
     discover_build(s_wnd, add, TAB_DISCOVER, ID_DISCOVER_BASE, discover_server, discover_account);
+    discover_set_ini(s_launcher_ini);
     /* Setup: what's needed, found or missing; the Mod Maker's tools (setup_tab.c) */
     setup_build(s_wnd, add, TAB_SETUP, TAB_TOOLS, ID_SETUP_BASE, setup_go_install);
 
@@ -6351,13 +7284,19 @@ static void mv_refresh(void)
     WIN32_FIND_DATAW fd;
     HANDLE h;
     SendMessageW(list, LB_RESETCONTENT, 0, 0);
-    if (!mv_folder(dir) || !join(pat, dir, L"*.bik"))
+    if (!mv_folder(dir) || !join(pat, dir, L"*.*"))
         return;
     h = FindFirstFileW(pat, &fd);
     if (h == INVALID_HANDLE_VALUE)
         return;
     do {
-        WCHAR size[32], *dot;
+        WCHAR size[32], *dot, mp4[MAX_PATH];
+        const WCHAR *ext = wcsrchr(fd.cFileName, L'.');
+        /* (a movie is <name>.mp4 or <name>.bik; a .bik beside an .mp4 is its stub or fallback: one row) */
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || !ext || (_wcsicmp(ext, L".bik") && _wcsicmp(ext, L".mp4")))
+            continue;
+        if (!_wcsicmp(ext, L".bik") && join(mp4, dir, fd.cFileName) && (wcscpy_s(wcsrchr(mp4, L'.'), 5, L".mp4"), file_exists(mp4)))
+            continue;
         fmt_size(size, 32, ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow);
         wcscpy_s(line, MAX_PATH + 32, fd.cFileName);
         dot = wcsrchr(line, L'.');
@@ -6629,14 +7568,20 @@ static void mv_create(void)
     if (!video[0] || !file_exists(video)) { mv_status(L"Choose the video first."); return; }
     if (!mv_name(name, 40)) { mv_status(L"Give the movie a name (letters and digits); the game lists it by that name."); return; }
     if (!mv_folder(dir)) { mv_status(L"The game folder does not exist; choose it on the Play tab first."); return; }
+    /* (an .mp4: the game plays it as an HD movie, a tenth of a .bik's size; movie_make writes the
+     * .bik where Windows can't encode H.264) */
     swprintf_s(file, 64, L"%s.bik", name);
     memset(&s_mv_job, 0, sizeof s_mv_job);
     if (!join(s_mv_job.out, dir, file)) return;
-    if (file_exists(s_mv_job.out)) {
+    {
+        const int had_bik = file_exists(s_mv_job.out);
+        wcscpy_s(wcsrchr(s_mv_job.out, L'.'), 5, L".mp4");
+        if (had_bik || file_exists(s_mv_job.out)) {
         WCHAR q[200];
         swprintf_s(q, 200, L"A movie named %s already exists. Replace it?", name);
         if (MessageBoxW(s_wnd, q, WINDOW_TITLE, MB_YESNO | MB_ICONQUESTION) != IDYES)
             return;
+        }
     }
     wcscpy_s(s_mv_job.video, MAX_PATH, video);
     mv_bottom_path(s_mv_job.bottom);
@@ -6660,6 +7605,12 @@ static void mv_done(int ok)
     EnableWindow(ctl(ID_MV_STOP), FALSE);
     if (ok) {
         const WCHAR *slash = wcsrchr(s_mv_job.out, L'\\');
+        WCHAR other[MAX_PATH];
+        /* (the replaced movie's other half: an older <name>.bik beside the new .mp4 would be taken as
+         * its fallback - or it is the game's stub, made again; an older .mp4 beside a new .bik would win) */
+        wcscpy_s(other, MAX_PATH, s_mv_job.out);
+        wcscpy_s(wcsrchr(other, L'.'), 5, s_mv_job.wrote_bik ? L".mp4" : L".bik");
+        DeleteFileW(other);
         SendMessageW(ctl(ID_MV_PROGRESS), PBM_SETPOS, 100, 0);
         mv_status(L"Made %s (%d s). In the game: CREATE AN ENTRANCE \x2192 FINALIZE \x2192 MOVIE, after NONE.",
                   slash ? slash + 1 : s_mv_job.out, (s_mv_job.frames + 29) / 30);
@@ -6681,11 +7632,22 @@ static void mv_delete(void)
     swprintf_s(q, 300, L"Delete the movie %s? Entrances that use it show no movie.", line);
     if (!mv_folder(dir) || MessageBoxW(s_wnd, q, WINDOW_TITLE, MB_YESNO | MB_ICONQUESTION) != IDYES)
         return;
-    wcscat_s(line, MAX_PATH + 32, L".bik");
-    if (join(path, dir, line) && shell_op(FO_DELETE, path, NULL, FOF_ALLOWUNDO))
-        mv_status(L"Deleted %s (it is in the Recycle Bin).", line);
-    else
-        mv_status(L"Could not delete %s (is the game using it?).", line);
+    {
+        /* (<name>.mp4 and / or <name>.bik - the .bik beside an .mp4 is its stub or fallback) */
+        int gone = 0, failed = 0;
+        static const WCHAR *const exts[] = { L".mp4", L".bik" };
+        int e;
+        for (e = 0; e < 2; e++) {
+            WCHAR f[MAX_PATH + 32];
+            swprintf_s(f, MAX_PATH + 32, L"%s%s", line, exts[e]);
+            if (!join(path, dir, f) || !file_exists(path)) continue;
+            if (shell_op(FO_DELETE, path, NULL, FOF_ALLOWUNDO)) gone++; else failed++;
+        }
+        if (gone && !failed)
+            mv_status(L"Deleted %s (it is in the Recycle Bin).", line);
+        else
+            mv_status(L"Could not delete %s (is the game using it?).", line);
+    }
     mv_refresh();
 }
 
@@ -7203,7 +8165,7 @@ static int card_at(HWND c)
     MapWindowPoints(NULL, s_wnd, (POINT *)&r, 2);
     for (i = 0; i < s_ncards; i++) {
         const Card *cd = &s_cards[i];
-        if (cd->tab != s_cur_tab)
+        if (cd->tab != s_cur_tab || card_hidden(cd))
             continue;
         if (r.left >= S(cd->x + SB_W) && r.top >= S(cd->y + DY) && r.right <= S(cd->x + cd->w + SB_W) + 1 &&
             r.bottom <= S(cd->y + cd->h + DY) + 1)
@@ -7836,7 +8798,7 @@ static void paint_window(HDC dc)
         for (i = 0; i < s_ncards; i++) {
             const Card *cd = &s_cards[i];
             RECT c;
-            if (cd->tab != s_cur_tab || (cd->title[0] == 1 && !s_notice[0]))
+            if (cd->tab != s_cur_tab || card_hidden(cd) || (cd->title[0] == 1 && !s_notice[0]))
                 continue;
             c.left = S(cd->x + SB_W); c.top = S(cd->y + DY); c.right = S(cd->x + cd->w + SB_W);
             c.bottom = S(cd->y + cd->h + DY);
@@ -7963,13 +8925,18 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         case ID_DEFAULTS:
             settings_defaults();
             break;
-        case ID_ON_ENABLE:
+        case ID_ON_MODS_FOLD:
+            s_mods_fold = !s_mods_fold;
+            online_mods_fold_apply();
+            break;
+        case ID_ON_ENABLE: case ID_ON_SHARE:
             if (HIWORD(wp) == BN_CLICKED) {
                 s_settings_dirty = 1;
                 set_text(ID_ON_STATUS, L"");
             }
             break;
         case ID_ON_NAME: case ID_ON_SERVER: case ID_ON_PEERS:
+        case ID_ON_UP_KBS: case ID_ON_UP_PEERS: case ID_ON_MOD_MB: case ID_ON_MODS_MB:
             if (HIWORD(wp) == EN_CHANGE) {
                 s_settings_dirty = 1;
                 set_text(ID_ON_STATUS, L"");
@@ -7985,8 +8952,23 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         case ID_ON_SIGNIN:
             online_sign_in(0);
             break;
-        case ID_ON_REGISTER:
-            online_sign_in(1);
+        case ID_ON_REGISTER:  /* (the sign-up form) */
+            s_on_mode = ON_SIGNUP;
+            online_note(L"");
+            online_account_show();
+            break;
+        case ID_ON_FORGOT:
+            s_on_mode = ON_FORGOT;
+            online_note(L"");
+            online_account_show();
+            break;
+        case ID_ON_BACK:
+            s_on_mode = ON_SIGNIN;
+            online_note(L"");
+            online_account_show();
+            break;
+        case ID_ON_STEP:
+            online_step();
             break;
         case ID_ON_SIGNOUT:
             online_sign_out();
@@ -8211,7 +9193,8 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
     case WM_CTLCOLORBTN: {
         /* (text on a card: its colour; on the page: the page's) */
         const int on_card = card_at((HWND)lp), id = GetDlgCtrlID((HWND)lp);
-        SetTextColor((HDC)wp, id == ID_PLAY_STATUS && s_play_ready ? C_GOOD : id == ID_UP_STATUS ? C_MUTED : C_TEXT);
+        SetTextColor((HDC)wp, id == ID_PLAY_STATUS && s_play_ready ? C_GOOD : id == ID_UP_STATUS ? C_MUTED :
+                              id == ID_ON_ROUTE ? (s_route_kind == 1 ? C_GOOD : s_route_kind == 2 ? C_WARN : C_MUTED) : C_TEXT);
         if ((GetWindowLongW((HWND)lp, GWL_STYLE) & ES_READONLY) && m == WM_CTLCOLORSTATIC) {
             WCHAR cn[16];
             if (GetClassNameW((HWND)lp, cn, 16) && !_wcsicmp(cn, L"Edit")) {   /* (read-only fields) */
@@ -8428,7 +9411,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     int capture_bundled = 0;  /* (--bundled-start: the start's bundled install too - timed, a shot while it runs) */
     const ULONGLONG t_start = GetTickCount64();
     ULONGLONG t_shown = 0;
-    const WCHAR *capture_music = NULL, *const *capture_tag = NULL;
+    const WCHAR *capture_music = NULL, *const *capture_tag = NULL, *const *capture_mods = NULL;
+    int capture_mods_show = 0;
     WCHAR **argv = CommandLineToArgvW(GetCommandLineW(), &argc), *slash, *capture_file = NULL, **capture_account = NULL;
     (void)prev; (void)cmd;
 
@@ -8606,6 +9590,98 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
         else wprintf(L"failed\n");
         return ok ? 0 : 1;
     }
+    /* --report-send <game folder> <answers file>: Report a problem's Send, no window (tests). The file: UTF-8 lines
+       server= problem= happens= what= before= contact= image=<path> (up to 5), match=<folder | latest | none>
+       (default latest: as the window preselects), mods=1|0 (the tick, default 1), save=1|0 (the main save tick, default 1). Prints the match, the mods line,
+       progress, "sent <id> seen_before <n>" or "not sent: <why>", what happened to the match and mods, and the zip. */
+    if (argv && argc >= 4 && !wcscmp(argv[1], L"--report-send")) {
+        static char what[4096], line[4096], problem[120] = "Something else", happens[40] = "Every time", before[4096],
+                    contact[200], server[300], sig[400], ver[40], desc[16384];
+        WCHAR zip[MAX_PATH], wserver[300], pics[REPORT_MAX_IMAGES][MAX_PATH], summary[300];
+        ReportUpload u;
+        ReportResult r;
+        FILE *f = NULL;
+        int logs = 0, crashes = 0, npics = 0, i, with_mods = 1, with_save = 1;
+        char *json, match_name[300] = "";
+        static WCHAR wmatch[MAX_PATH] = L"latest", line16[600];
+        static RepMatch rm;
+        console_setup();
+        if (_wfopen_s(&f, argv[3], L"rb") || !f) { wprintf(L"not sent: can't read %s\n", argv[3]); return 1; }
+        while (fgets(line, sizeof line, f)) {
+            char *v;
+            size_t n;
+            if (!memcmp(line, "\xEF\xBB\xBF", 3)) memmove(line, line + 3, strlen(line + 3) + 1);   /* (a BOM) */
+            v = strchr(line, '=');
+            n = strlen(line);
+            while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
+            if (!v) continue;
+            *v++ = 0;
+            if (!strcmp(line, "server")) strcpy_s(server, sizeof server, v);
+            else if (!strcmp(line, "problem")) strcpy_s(problem, sizeof problem, v);
+            else if (!strcmp(line, "happens")) strcpy_s(happens, sizeof happens, v);
+            else if (!strcmp(line, "what")) strcpy_s(what, sizeof what, v);
+            else if (!strcmp(line, "before")) strcpy_s(before, sizeof before, v);
+            else if (!strcmp(line, "contact")) strcpy_s(contact, sizeof contact, v);
+            else if (!strcmp(line, "image") && npics < REPORT_MAX_IMAGES)
+                MultiByteToWideChar(CP_UTF8, 0, v, -1, pics[npics++], MAX_PATH);
+            else if (!strcmp(line, "match")) MultiByteToWideChar(CP_UTF8, 0, v, -1, wmatch, MAX_PATH);
+            else if (!strcmp(line, "mods")) with_mods = atoi(v) != 0;
+            else if (!strcmp(line, "save")) with_save = atoi(v) != 0;
+        }
+        fclose(f);
+        /* (a test aid: never the live server by default - server= must be given; 26 Oct a BOM hid it and a test
+           report went live) */
+        if (!server[0]) { wprintf(L"not sent: no server= line in %s (give the test server)\n", argv[3]); return 1; }
+        wcscpy_s(s_game_dir, MAX_PATH, argv[2]);
+        MultiByteToWideChar(CP_UTF8, 0, server, -1, wserver, 300);
+        ZeroMemory(&rm, sizeof rm);
+        if (!_wcsicmp(wmatch, L"latest")) {
+            static ReportMatch list[REPORT_MAX_MATCHES];
+            if (report_match_list(argv[2], list, REPORT_MAX_MATCHES) > 0) rm.match = list[0], rm.has_match = 1;
+        } else if (wmatch[0] && _wcsicmp(wmatch, L"none")) {
+            wcscpy_s(rm.match.dir, MAX_PATH, wmatch);
+            report_match_label(wmatch, rm.match.label, 200);
+            rm.has_match = GetFileAttributesW(wmatch) != INVALID_FILE_ATTRIBUTES;
+        }
+        if (rm.has_match) {
+            rep_match_load(&rm, wserver);
+            rep_match_mods_text(&rm, line16, 600);
+            wprintf(L"match: %s\n%s\n", rm.match.label, line16);
+            for (i = 0; i < rm.n_mods; i++)
+                wprintf(L"  mod %s\\%s %S %.1f MB %S%s\n", rm.mods[i].type, rm.mods[i].id, rm.mods[i].version,
+                        rm.mods[i].size / 1048576.0, rm.mods[i].hash[0] ? rm.mods[i].hash : "(not installed)",
+                        rm.mods[i].on_server ? L" (on the server)" : L"");
+        } else {
+            wprintf(L"match: none\n");
+        }
+        snprintf(desc, sizeof desc, "Problem: %s\r\nHappens: %s\r\n\r\nWhat happened:\r\n%s\r\n\r\nJust before:\r\n%s\r\n",
+                 problem, happens, what, before[0] ? before : "(not said)");
+        if (!report_make_match(argv[2], PORT_VERSION, desc, NULL, with_save, zip, MAX_PATH, &logs, &crashes)) {
+            wprintf(L"not sent: the zip could not be written\n");
+            return 1;
+        }
+        WideCharToMultiByte(CP_UTF8, 0, PORT_VERSION, -1, ver, sizeof ver, NULL, NULL);
+        report_signature(argv[2], sig, sizeof sig);
+        json = report_json("launcher", ver, problem, happens, what, before, contact, sig);
+        ZeroMemory(&u, sizeof u);
+        u.json = json;
+        u.zip = zip;
+        for (i = 0; i < npics; i++) u.images[i] = pics[i];
+        u.n_images = npics;
+        rep_match_parts(&rm, with_mods, &u, match_name, sizeof match_name);
+        u.progress = rep_cli_progress;
+        if (with_save) u.save_bytes = report_main_save_size(argv[2]);
+        report_send_summary(&u, summary, 300);
+        wprintf(L"%s\n", summary);
+        i = report_send(wserver, &u, &r);
+        rep_match_done(&rm);
+        free(json);
+        if (i) wprintf(L"sent %S seen_before %d (zip %s)\n", r.id, r.seen_before, zip);
+        else wprintf(L"not sent: %s (HTTP %d; the zip is kept: %s)\n", r.why, r.status, zip);
+        rep_match_result_text(&rm, &r, line16, 600);
+        if (line16[0]) wprintf(L"%s\n", line16);
+        return i ? 0 : 1;
+    }
     if (argv && argc >= 4 && !wcscmp(argv[1], L"--import-360")) {   /* <360 save folder> <saves folder> */
         int skipped = 0, n;
         console_setup();
@@ -8656,7 +9732,25 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
     /* Tests: --mods-add <game folder> <file.svrmod> installs a mod as the Mods
        tab's + does (exit code 0 when installed). */
     if (argv && argc >= 4 && !wcscmp(argv[1], L"--mods-add")) {
-        const int ok = mods_install(argv[2], argv[3]);
+        int ok;
+        console_setup();  /* (what the Mods tab would say, printed) */
+        ok = mods_install(argv[2], argv[3]);
+        LocalFree(argv);
+        return ok ? 0 : 1;
+    }
+    /* Tests: --mods-shrink <game folder> - the Mods tab's Shrink movies (the result printed). */
+    if (argv && argc >= 3 && !wcscmp(argv[1], L"--mods-shrink")) {
+        int ok;
+        console_setup();
+        ok = mods_shrink(argv[2]);
+        LocalFree(argv);
+        return ok ? 0 : 1;
+    }
+    /* Tests: --mods-level <game folder> - the Mods tab's Level music (the gain per song printed). */
+    if (argv && argc >= 3 && !wcscmp(argv[1], L"--mods-level")) {
+        int ok;
+        console_setup();
+        ok = mods_level(argv[2]);
         LocalFree(argv);
         return ok ? 0 : 1;
     }
@@ -8772,6 +9866,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
         /* ... --roster-tag <id> <SMACKDOWN|RAW|NPC|MODS|DEFAULT>: the Roster tab tags it. */
         if (argc >= 7 && !wcscmp(argv[4], L"--roster-tag"))
             capture_tag = argv + 5;
+        /* ... --online-mods <share 0|1> <kbs> <peers> <mod MB> <session MB>: the Online tab's Mod sharing rows
+           filled and saved (svr2011.toml), then the fold captured open. */
+        if (argc >= 10 && !wcscmp(argv[4], L"--online-mods"))
+            capture_mods = argv + 5;
+        if (argc >= 6 && !wcscmp(argv[4], L"--online-mods") && !wcscmp(argv[5], L"show"))  /* (only the fold, as loaded) */
+            capture_mods_show = 1;
         /* ... --report-window <1|2>: Report a problem's window (questions / where to post) is captured instead. */
         if (argc >= 6 && !wcscmp(argv[4], L"--report-window"))
             capture_report = _wtoi(argv[5]);
@@ -8831,6 +9931,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
         music_add_files(s_game_dir, &capture_music, 1);
     if (capture_tag)
         roster_tag(s_game_dir, _wtoi(capture_tag[0]), capture_tag[1]);
+    if (capture_mods) {
+        CheckDlgButton(s_wnd, ID_ON_SHARE, _wtoi(capture_mods[0]) ? BST_CHECKED : BST_UNCHECKED);
+        set_text(ID_ON_UP_KBS, capture_mods[1]), set_text(ID_ON_UP_PEERS, capture_mods[2]);
+        set_text(ID_ON_MOD_MB, capture_mods[3]), set_text(ID_ON_MODS_MB, capture_mods[4]);
+        settings_save();
+        s_mods_fold = 1;
+    }
+    if (capture_mods_show)
+        s_mods_fold = 1;
     /* The first start (launcher.ini SetupShown): the Setup tab, what's found and what's missing. */
     if (capture_tab < 0 && !GetPrivateProfileIntW(L"Launcher", L"SetupShown", 0, s_launcher_ini)) {
         WritePrivateProfileStringW(L"Launcher", L"SetupShown", L"1", s_launcher_ini);
@@ -8872,6 +9981,28 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
         set_text(ID_ON_PASSWORD, capture_account[2]);
         online_sign_in(capture_account[0][2] == L'r');
     }
+    {   /* (tests, with --capture online) SVR2011_CAPTURE_ONLINE=<step>;<step>...: the account box's fields and
+           buttons - name=, password=, code= (typed), click=register|forgot|back|step|signin */
+        const char *v = capture_file ? getenv("SVR2011_CAPTURE_ONLINE") : NULL;
+        WCHAR w[1024], *ctx = NULL, *t;
+        if (v && *v) {
+            MultiByteToWideChar(CP_UTF8, 0, v, -1, w, 1024);
+            for (t = wcstok_s(w, L";", &ctx); t; t = wcstok_s(NULL, L";", &ctx)) {
+                static const struct { const WCHAR *k; int id; } fields[] = {
+                    { L"name=", ID_ON_NAME }, { L"password=", ID_ON_PASSWORD }, { L"code=", ID_ON_CODE } };
+                static const struct { const WCHAR *k; int id; } clicks[] = {
+                    { L"click=register", ID_ON_REGISTER }, { L"click=forgot", ID_ON_FORGOT }, { L"click=back", ID_ON_BACK },
+                    { L"click=step", ID_ON_STEP }, { L"click=signin", ID_ON_SIGNIN } };
+                size_t i;
+                for (i = 0; i < sizeof fields / sizeof fields[0]; i++)
+                    if (!wcsncmp(t, fields[i].k, wcslen(fields[i].k)))
+                        set_text(fields[i].id, t + wcslen(fields[i].k));
+                for (i = 0; i < sizeof clicks / sizeof clicks[0]; i++)
+                    if (!wcscmp(t, clicks[i].k))
+                        SendMessageW(s_wnd, WM_COMMAND, MAKEWPARAM(clicks[i].id, BN_CLICKED), (LPARAM)ctl(clicks[i].id));
+            }
+        }
+    }
     if (capture_file) {
         MSG pm;
         int k;
@@ -8887,6 +10018,25 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
         }
         for (k = 0; k < (capture_seq_n ? capture_seq_n : 1); k++) {
             ULONGLONG t0 = GetTickCount64();
+            {   /* SVR2011_CAPTURE_SIGNIN_AT=<k>|<name>|<password>: signed in as that account (name "-": signed out)
+                   before the sequence's k-th tab (Discovery's owner buttons after an account change) */
+                const char *v = getenv("SVR2011_CAPTURE_SIGNIN_AT");
+                WCHAR w[300], *name, *pw;
+                if (v && *v && atoi(v) == k && k) {
+                    MultiByteToWideChar(CP_UTF8, 0, v, -1, w, 300);
+                    if ((name = wcschr(w, L'|')) != NULL) {
+                        *name++ = 0;
+                        if ((pw = wcschr(name, L'|')) != NULL) *pw++ = 0;
+                        if (!wcscmp(name, L"-")) {
+                            online_sign_out();
+                        } else if (pw) {
+                            set_text(ID_ON_NAME, name);
+                            set_text(ID_ON_PASSWORD, pw);
+                            online_sign_in(0);
+                        }
+                    }
+                }
+            }
             if (k) {
                 /* as a click on the tab does */
                 NMHDR n = { s_tab, ID_TAB, TCN_SELCHANGE };
@@ -8900,6 +10050,59 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
                     TranslateMessage(&pm);
                     DispatchMessageW(&pm);
                 }
+        }
+        if (s_cur_tab == TAB_DISCOVER) {
+            /* Discovery: a download running (SVR2011_DISCOVER_DOWNLOAD) is waited for (15 minutes at most), its
+               status lines logged with times to <file>.discover.txt, shots <file>.during.bmp (past 30 %) and
+               <file>.reconnect.bmp (the first "connection lost"); then whether Delete shows */
+            WCHAR log[MAX_PATH], line[400], last[400] = L"", shot[MAX_PATH];
+            ULONGLONG t0 = GetTickCount64();
+            int permille = -1, owner = 0, during = 0, lost = 0;
+            FILE *f = NULL;
+            swprintf_s(log, MAX_PATH, L"%s.discover.txt", capture_file);
+            _wfopen_s(&f, log, L"w, ccs=UTF-8");
+            while (getenv("SVR2011_DISCOVER_DOWNLOAD") && !discover_test_state(NULL, NULL, NULL, 0) &&
+                   GetTickCount64() - t0 < 15000)   /* (it starts when the mod's page is in) */
+                if (MsgWaitForMultipleObjects(0, NULL, FALSE, 50, QS_ALLINPUT) == WAIT_OBJECT_0)
+                    while (PeekMessageW(&pm, NULL, 0, 0, PM_REMOVE)) {
+                        TranslateMessage(&pm);
+                        DispatchMessageW(&pm);
+                    }
+            t0 = GetTickCount64();
+            while ((discover_test_state(&permille, &owner, line, 400) || !wcsncmp(line, L"Reconnecting", 12)) &&
+                   GetTickCount64() - t0 < 900000) {   /* (a download, or the list waiting for the server) */
+                if (MsgWaitForMultipleObjects(0, NULL, FALSE, 50, QS_ALLINPUT) == WAIT_OBJECT_0)
+                    while (PeekMessageW(&pm, NULL, 0, 0, PM_REMOVE)) {
+                        TranslateMessage(&pm);
+                        DispatchMessageW(&pm);
+                    }
+                discover_test_state(&permille, &owner, line, 400);
+                if (wcscmp(line, last) && f) {
+                    fwprintf(f, L"%6.1f s  %s\n", (GetTickCount64() - t0) / 1000.0, line);
+                    wcscpy_s(last, 400, line);
+                }
+                if (!during && permille >= 300) {
+                    swprintf_s(shot, MAX_PATH, L"%s.during.bmp", capture_file);
+                    capture(shot);
+                    during = 1;
+                }
+                if (!lost && (wcsstr(line, L"connection lost") || !wcsncmp(line, L"Reconnecting", 12))) {
+                    swprintf_s(shot, MAX_PATH, L"%s.reconnect.bmp", capture_file);
+                    capture(shot);
+                    lost = 1;
+                }
+            }
+            t0 = GetTickCount64();
+            while (GetTickCount64() - t0 < 600)   /* (the answer's install, the page again) */
+                while (PeekMessageW(&pm, NULL, 0, 0, PM_REMOVE)) {
+                    TranslateMessage(&pm);
+                    DispatchMessageW(&pm);
+                }
+            discover_test_state(&permille, &owner, line, 400);
+            if (f) {
+                fwprintf(f, L"end: %s\nDelete shown: %s\n", line, owner ? L"yes" : L"no");
+                fclose(f);
+            }
         }
         if (capture_bundled) {
             WCHAR during[MAX_PATH], times[MAX_PATH];

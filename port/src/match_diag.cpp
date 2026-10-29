@@ -4,16 +4,20 @@
 // thread - and logs each case once a match.
 #include "match_diag.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdlib>
 #include <chrono>
 #include <cstring>
 #include <mutex>
+#include <string>
+#include <vector>
 
 #include <rex/logging.h>
 #include <rex/ppc.h>
 
+#include "match_box.h"
 #include "move_packs.h"
 #include "superstar_mods.h"
 
@@ -66,6 +70,15 @@ void NoteMove(uint32_t fighter, uint32_t slot, uint32_t move) {
   l->slot.store(slot, std::memory_order_relaxed), l->move.store(move & 0x7FFF, std::memory_order_relaxed);
   l->at.store(Clock::now().time_since_epoch().count(), std::memory_order_relaxed);
   g_moved.store(true, std::memory_order_relaxed);
+}
+
+bool LastMoveOf(uint32_t fighter, uint32_t& slot, uint32_t& move) {
+  for (const auto& e : g_last)
+    if (e.fighter.load(std::memory_order_relaxed) == fighter) {
+      slot = e.slot.load(std::memory_order_relaxed), move = e.move.load(std::memory_order_relaxed) & 0xFFFF;
+      return true;
+    }
+  return false;
 }
 
 void ClearMatchPeople() {
@@ -166,7 +179,10 @@ void MatchDiagTick(uint8_t* base, bool in_match) {
     // (the match clock ran 30 s on since the last answer: nobody attacks or chooses - "both stopped")
     if (clock > g_clock_at_move + kQuietFrames && g_told_quiet == 0 && g_last[0].fighter.load()) tell = true, g_told_quiet = clock;
   }
-  if (tell) LogMatchState(base, "the match clock ran 30 s with no wrestler asking for a move");
+  if (tell) {
+    LogMatchState(base, "the match clock ran 30 s with no wrestler asking for a move");
+    MatchBoxLog("no wrestler asked for a move for 30 s");
+  }
   // Two wrestlers frozen in a hold while the rest of the match runs (player report 21 Oct: "just the 2 opponents in
   // the ring freeze"): their motion and its frame unchanged for 10 s of the match clock.
   bool held_tell = false;
@@ -187,9 +203,11 @@ void MatchDiagTick(uint8_t* base, bool in_match) {
     }
     if (held >= 2 && !g_told_held) g_told_held = held_tell = true;
   }
-  if (held_tell)
+  if (held_tell) {
     LogMatchState(base, fmt::format("two wrestlers held in one motion frame for 10 s while the match clock runs (motion {})",
                                     held_motion).c_str());
+    MatchBoxLog("two wrestlers held in one motion frame for 10 s");
+  }
   // Test aid: SVR2011_TEST_MATCH_STATE=<s> - the state once, <s> s into the match clock.
   static const uint32_t test_at = [] { const char* v = std::getenv("SVR2011_TEST_MATCH_STATE"); return v ? uint32_t(std::atoi(v)) * 60 : 0u; }();
   static bool test_told = false;

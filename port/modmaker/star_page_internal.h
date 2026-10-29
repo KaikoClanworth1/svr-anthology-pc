@@ -44,16 +44,19 @@ struct StarProject {
   Image picture_small;            // the 256 bust made with it (or own_bust)
   bool own_bust = false;          // picture_small is the user's own bust picture
   Image picture_full;             // own full-body picture (render_full.dds -> SSFB; none: render.dds)
+  Image picture_load;             // the NOW LOADING picture (load.dds, 1024 x 512 DXT5; none: the arena's / the game's)
   bool game_look = false;         // the picture's tone moved toward the game's renders
   Image picture_src;              // the picture as picked (this session: the game look can be undone)
   int call = -1;                  // -1: "The Superstar"
   float height = 1.0f;            // height=<scale> from the feet (0.80-1.25; 1: left out)
   float theme_gain = 0.0f;        // theme_gain=<dB> (-20..+6; 0: left out)
+  float call_gain = 0.0f;         // call_gain=<dB>: the name recording against the game's own calls (-20..+12; 0: left out)
   std::vector<Picture> signs;     // its fans' signs (up to 4; 128 x 64)
   // the SvR 2010-style extras (the game: superstar_mods.cpp)
   int pose = -1;                  // pose=<motion id>: the select / VS panel's pose (-1: the style's)
   int music = 0;                  // music= : a theme of the game's own (its music id 1-253) instead of a song file; 0 = none
   int entrance = -1;              // entrance= number (-1: the style's); a superstar's id, or 535 (Jeff Hardy's, unused)
+  int victory = -1;               // victory= scene (-1: the game's; Victories())
   char announcer[32] = "";        // announcer=<NAME>: the ring announcer's own clips of that name
   char hometown_city[32] = "";    // hometown=<CITY>[,<STATE>]: the announcer's own hometown clips
   char hometown_state[32] = "";

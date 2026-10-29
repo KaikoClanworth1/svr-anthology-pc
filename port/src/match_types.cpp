@@ -16,6 +16,7 @@
 #include "match_types.h"
 #include "anthology.h"
 #include "mystery_opponent.h"
+#include "no_mods.h"
 #include "pad_types.h"
 
 #include <algorithm>
@@ -30,6 +31,8 @@
 #include <atomic>
 #include <chrono>
 #include <map>
+#include <mutex>
+#include <set>
 #include <random>
 #include <string>
 #include <vector>
@@ -48,6 +51,10 @@
 #include "weapons_page.h"
 #include "generated/default/svr2011_init.h"
 #include "free_cam.h"
+#include "crowd_fight.h"
+#include "match_box.h"
+#include "match_record.h"
+#include "thread_cpu.h"
 
 namespace svr2011 {
 std::atomic<uint32_t> g_match_rule{~0u}, g_match_arena{~0u};  // (the last match placed: LastMatch)
@@ -670,17 +677,21 @@ std::vector<uint8_t> WithRows(const uint8_t* table, uint32_t size) {
         Wr32(copy.data() + 0x04, k == 0 ? kWeaponsText : kStagesText);
         Wr32(copy.data() + 0x5C, m.normal);
         Wr32(copy.data() + 0x40, 0);
-        if (k == 1 && submenu) {  // (THREE STAGES OF HELL: a submenu of the sets - a new node, its rows a new group)
+        if (k == 1 && submenu) {  // (THREE STAGES OF HELL: a submenu of the sets, its rows a new group)
+          // Its node: the one of the record before it (node ids, above). A new top id here, in the middle of the
+          // table, left B doing nothing in the sets (player report, 2.1.5: "Gauntlet > Three Stages of Hell, you
+          // can't go back any more" - HANDICAP's and 6-MAN's).
+          const uint32_t shared = Rd32(out.data() + out.size() - kRec + 0x1C);
           std::vector<uint8_t> row(submenu, submenu + kRec);
           Wr32(row.data() + 0x00, kStagesLabel);
           Wr32(row.data() + 0x04, kStagesText);
           Wr32(row.data() + 0x18, m.group);
-          Wr32(row.data() + 0x1C, node);
+          Wr32(row.data() + 0x1C, shared);
           Wr32(row.data() + 0x38, Rd32(rec + 0x38));
           Wr32(row.data() + 0x40, 0);
           copy = row;
-          AddStageSets({node, Rd32(rec + 0x14) + 0x100, m.normal}, group, node + 1);
-          node += 1 + uint32_t(SetsFor(m.normal).size());
+          AddStageSets({shared, Rd32(rec + 0x14) + 0x100, m.normal}, group, node);
+          node += uint32_t(SetsFor(m.normal).size());
           ++group;
         }
         uint8_t* prev = out.data() + out.size() - kRec;  // (the group's last row stays last)
@@ -888,7 +899,7 @@ void ShapeRule(uint8_t* base, uint32_t rule, uint32_t like, bool select_only) {
 
 namespace svr2011 {
 
-bool MatchTypeSwitchOn(const char* id) {
+const std::map<std::string, bool>& MatchTypeSwitches() {
   static const std::map<std::string, bool> on = [] {
     std::map<std::string, bool> m;
     const std::filesystem::path dir = rex::filesystem::GetExecutableFolder() / "Mods" / "MatchTypes";
@@ -898,11 +909,22 @@ bool MatchTypeSwitchOn(const char* id) {
                           "three_stages_of_hell", "elimination", "mystery_opponent", "hiac_tables_ladders", "hiac_roof_start",
                           "three_stages_tables_ladders",
                           "gauntlet_eliminator", "cage_weapons", "inferno_weapons", "online_first_blood"}) {
-      m[k] = !std::filesystem::exists(dir / k / "disabled", ec);
-      if (!m[k]) REXLOG_INFO("match types: {} off (mod switched off)", k);
+      // (Start Without Mods: none - they count as mods for online, online_files.h ActiveMatchMods)
+      m[k] = !NoMods() && !std::filesystem::exists(dir / k / "disabled", ec);
+      // (FREE-ROAMING BACKSTAGE is removed - the user's call for 2.1.6: its rows never added, its rules played as
+      // a named room at set-up, sub_827374A0 below)
+      const bool removed = std::string(k) == "free_roaming_backstage";
+      if (removed) m[k] = false;
+      if (!m[k])
+        REXLOG_INFO("match types: {} off ({})", k, removed ? "removed" : NoMods() ? "started without mods" : "mod switched off");
     }
     return m;
   }();
+  return on;
+}
+
+bool MatchTypeSwitchOn(const char* id) {
+  const auto& on = MatchTypeSwitches();
   const auto it = on.find(id);
   return it == on.end() || it->second;
 }
@@ -1021,6 +1043,7 @@ REX_HOOK_RAW(sub_82BAA6E8) {
   if (svr2011::kAnthology && table) svr2011::HideOnlineRows(base + table, size);  // (no online: anthology.h)
   std::vector<uint8_t> rows;
   if (g_memory && table) rows = WithRows(base + table, size);
+  svr2011::LoadWatchDone("its menus read");
   if (rows.empty()) {
     __imp__sub_82BAA6E8(ctx, base);
     return;
@@ -1185,6 +1208,15 @@ REX_HOOK_RAW(sub_827374A0) {
   svr2011::SetMatchLoading(true);  // (arena_mods: a custom arena's loading pictures)
   RestoreRule(base);
   g_lumberjacks_chosen = false;
+  // FREE-ROAMING BACKSTAGE is removed (its rows: MatchTypeSwitches): a whole-backstage rule reaching here anyway - a
+  // saved match, Universe, a CPU set-up - plays the first named room instead (PARKING LOT: 0x1B, 2 on 2: 0x70).
+  // Road to WrestleMania's own uses (its story context) stay the game's.
+  if ((rule == kWholeBackstage || rule == kWholeBackstage2) && !Rd32(base + kStoryContext)) {
+    const uint32_t room = rule == kWholeBackstage ? kBackstage1v1FirstRule : 0x70u;
+    REXLOG_INFO("match types: rule {:02X} (free-roaming backstage, removed) played as rule {:02X}", rule, room);
+    rule = room;
+    ctx.r4.u64 = rule;
+  }
   g_free_roam = (rule == kWholeBackstage || rule == kWholeBackstage2) && !Rd32(base + kStoryContext);
   // A backstage mod's own row: its bg78 for this match (any other: the usual)
   {
@@ -1231,20 +1263,20 @@ REX_HOOK_RAW(sub_827374A0) {
   if (g_pending_like != ~0u && ((rule >= g_pending_rule_lo && rule <= g_pending_rule_hi) ||
                          (!g_pending_select_only && rule == kWholeBackstage2)))
     ShapeRule(base, played, g_pending_like, g_pending_select_only);
-  // 6-MAN WEAPONS EVERYWHERE: a tornado match - everyone legal, no tags (B11:
-  // it played as a 6-man tag). The rule record's +8 is 2 where everyone is
-  // legal (triple threat, fatal-4-way, the tornado rules 0x0F and 2 on 2
-  // Extreme Rules 0x4E), 0 in the tag rules; back after the match (RestoreRule).
-  if (g_weapons && rule == 0x08)
-    if (const uint32_t rules = Rd32(base + kRules)) {
-      if (g_saved.rule != rule) {
-        g_saved.rule = rule;
-        std::memcpy(g_saved.rec, base + rules + rule * kRuleSize, kRuleSize);
-        std::memcpy(g_saved.rec2, base + rules + kRule2 + rule * kRule2Size, kRule2Size);
-      }
-      base[rules + rule * kRuleSize + 8] = 2;
-      REXLOG_INFO("match types: WEAPONS EVERYWHERE - 6-man as a tornado match");
-    }
+  // 6-MAN WEAPONS EVERYWHERE: a free-for-all - all six in the ring, each for
+  // himself. Its rule is 6-MAN's normal one, the 6-man tag 0x08 (two of each
+  // team on the apron). B11 set only the record's +8 (2, "everyone legal"),
+  // but the game's own tornado 6-man (0x0B) has +8 0 too - its tornado bytes
+  // are in the option record - and the 2.1.5 report still saw a tag match. So
+  // the record takes the shape of the 6-man battle royal (0x23: six teams,
+  // the free-for-all option), as 6-MAN's backstage rows do (ShapeRule: the
+  // slots and teams, the match family, the option record's people count and
+  // free-for-all byte); back after the match (RestoreRule).
+  constexpr uint32_t kSixTag = 0x08, kSixFreeForAll = 0x23;
+  if (g_weapons && rule == kSixTag) {
+    ShapeRule(base, rule, kSixFreeForAll, false);
+    REXLOG_INFO("match types: WEAPONS EVERYWHERE - 6-man as a free-for-all (shaped like rule {:02X})", kSixFreeForAll);
+  }
   ctx.r4.u64 = played;
   __imp__sub_827374A0(ctx, base);
 }
@@ -1545,6 +1577,14 @@ void WrF(uint8_t* p, float f) {
   uint32_t v;
   std::memcpy(&v, &f, 4);
   Wr32(p, v);
+}
+// (test aids: a fighter put at x, y, z - his base +288 and the body's three copies (+0, +704, +768, hctp_room) -
+// in area `area` (+444: 0 the ring, 1 outside); a paired start keeps such places)
+void PutFighter(uint8_t* base, uint32_t f, float x, float y, float z, uint8_t area = 0) {
+  WrF(base + f + 288, x), WrF(base + f + 292, y), WrF(base + f + 296, z);
+  if (const uint32_t body = Rd32(base + f + 304))
+    for (uint32_t at : {0u, 704u, 768u}) WrF(base + body + at, x), WrF(base + body + at + 4, y), WrF(base + body + at + 8, z);
+  base[f + 444] = area;
 }
 
 }  // namespace
@@ -1870,6 +1910,7 @@ REX_EXTERN(__imp__sub_822AD738);
 REX_HOOK_RAW(sub_822AD738) {
   const uint32_t placer = ctx.r3.u32;
   svr2011::SetMatchLoading(false);  // (its loading screen is up)
+  svr2011::LoadWatchDone("a match placed");
   svr2011::g_match_placements.fetch_add(1);
   LogMatch(ctx, base, ctx.r4.u32);
   // Research aid (Hell in a Cell roof): SVR2011_TEST_CELL_START=<y tenths> -
@@ -1978,16 +2019,97 @@ REX_HOOK_RAW(sub_82216C58) {
       break;
     }
   __imp__sub_82216C58(ctx, base);
+  // A fighter on the floor outside (+444 area 1, base y near 0) never stands under the ring, yet a paired move started
+  // by the apron could have its pair's places redone into the ring's footprint (a ported Double Arm DDT 2 from the
+  // floor by the apron: the victim's base at (13.4, 8.4), the attacker's slid to 15 from it), and when the move ended
+  // the game played the ring entry from there - the victim floated at ring height and climbed in (item 10, 29 Oct).
+  // Such a base goes back to the fighter's last one on the floor outside: the move plays where it started.
+  // (not backstage - arena 78, the HCTP rooms too: no ring there, the floor round the middle is the room's)
+  if (fighter && fighter < 0xF0000000u && Rd32(base + kLiveSettings + 64) != 78) {
+    struct Floor {
+      uint32_t fighter;
+      float x, z;
+    };
+    static Floor floor_at[16] = {};
+    // (empty again each match - the match frame going back: fighters' addresses are reused, and online every peer
+    // must start the same whatever it played before; the rest is the synced match state alone)
+    static uint32_t last_frame = 0;
+    if (const uint32_t frame = Rd32(base + 0x82E3CD0C); frame < last_frame) {
+      for (Floor& s : floor_at) s = {};
+      last_frame = frame;
+    } else {
+      last_frame = frame;
+    }
+    constexpr float kRopes = 28.8f;  // (the ring's footprint: inside the ropes)
+    const float x = RdF(base + fighter + 288), y = RdF(base + fighter + 292), z = RdF(base + fighter + 296);
+    Floor* f = nullptr;
+    for (Floor& s : floor_at)
+      if (s.fighter == fighter || (!f && !s.fighter)) f = &s;
+    if (f && f->fighter != fighter) *f = {fighter, 0.f, 0.f};
+    const bool outside = base[fighter + 444] == 1 && y > -4.f;
+    auto clear = [&](float px, float pz) { return std::fabs(px) >= kRopes || std::fabs(pz) >= kRopes; };
+    const uint32_t body = Rd32(base + fighter + 304);
+    if (f && outside && clear(x, z)) {
+      f->x = x, f->z = z;
+    } else if (f && outside) {
+      // (the move's first frame: the base is redone already, the body still where he stood - Cena thrown out by a
+      // test the same frame had no floor place yet, and his slid partner was put back again and again)
+      if (body && RdF(base + body + 4) > -4.f && clear(RdF(base + body), RdF(base + body + 8)) && f->x == 0.f && f->z == 0.f)
+        f->x = RdF(base + body), f->z = RdF(base + body + 8);
+      if (f->x != 0.f || f->z != 0.f) {
+        static int logged = 0;
+        if (logged++ < 24)
+          REXLOG_INFO("match types: fighter {:08X} on the floor outside with his base under the ring ({:.1f}, {:.1f}): "
+                      "back to ({:.1f}, {:.1f})", fighter, x, z, f->x, f->z);
+        WrF(base + fighter + 288, f->x), WrF(base + fighter + 296, f->z);
+      }
+    }
+  }
   // Test aid: SVR2011_TEST_MOTION_LOG=1 - each fighter's motion (+212) when
-  // it changes, with the person and the match frame.
+  // it changes, with the person, the match frame, where he is (+288) and his
+  // area (+444: 0 the ring, 1 outside).
   static const bool motion_log = std::getenv("SVR2011_TEST_MOTION_LOG") != nullptr;
   if (motion_log && fighter) {
     static uint32_t last_motion[16] = {};
     const uint32_t person = std::min<uint32_t>(Rd32(base + fighter + 1156), 15), m = Rd32(base + fighter + 212);
     if (m != last_motion[person]) {
       last_motion[person] = m;
-      REXLOG_INFO("motion: person {} -> {} (frame {}, state {})", person, m, Rd32(base + 0x82E3CD0C), base[fighter + 446]);
+      REXLOG_INFO("motion: person {} -> {} (frame {}, state {}) at ({:.1f}, {:.1f}, {:.1f}) area {}", person, m,
+                  Rd32(base + 0x82E3CD0C), base[fighter + 446], RdF(base + fighter + 288), RdF(base + fighter + 292),
+                  RdF(base + fighter + 296), base[fighter + 444]);
     }
+  }
+  // Test aid: SVR2011_TEST_POS_LOG=<frames> - for that many frames after person 0's or 1's motion changes, every 4th:
+  // the motion's base (+288, where the paired start put it), the body's place (body +0) and the facing (+276) of
+  // both - where a ported dive or corner move starts against the game's own
+  static const int pos_frames = [] { const char* v = std::getenv("SVR2011_TEST_POS_LOG"); return v ? std::atoi(v) : 0; }();
+  if (pos_frames > 0 && fighter) {
+    static uint32_t last_m[2] = {}, since[2] = {};
+    const uint32_t person = Rd32(base + fighter + 1156);
+    if (person < 2) {
+      const uint32_t m = Rd32(base + fighter + 212);
+      if (m != last_m[person]) last_m[person] = m, since[person] = 0;
+      if (since[person] <= uint32_t(pos_frames) && since[person] % 4 == 0) {
+        const uint32_t body = Rd32(base + fighter + 304);
+        REXLOG_INFO("pos: person {} motion {} +{} base ({:.1f}, {:.1f}, {:.1f}) body ({:.1f}, {:.1f}, {:.1f}) yaw {:.2f}", person, m,
+                    since[person], RdF(base + fighter + 288), RdF(base + fighter + 292), RdF(base + fighter + 296),
+                    body ? RdF(base + body) : 0.0f, body ? RdF(base + body + 4) : 0.0f, body ? RdF(base + body + 8) : 0.0f,
+                    RdF(base + fighter + 276));
+      }
+      ++since[person];
+    }
+  }
+  // Test aid: SVR2011_TEST_LOSE=<person>,<s> - at <s> seconds of the match clock the person loses (to person 0).
+  static const std::pair<int, int> lose = [] {
+    const char* v = std::getenv("SVR2011_TEST_LOSE");
+    int p = -1, s = 0;
+    if (v && std::sscanf(v, "%d,%d", &p, &s) != 2) p = -1;
+    return std::make_pair(p, s);
+  }();
+  if (lose.first >= 0 && fighter && int(Rd32(base + fighter + 1156)) == lose.first &&
+      Rd32(base + 0x82E3CD0C) == uint32_t(lose.second * 60) && !base[fighter + 447]) {
+    base[fighter + 447] = 1, base[fighter + 448] = 0;
+    REXLOG_INFO("match types: test - person {} loses", lose.first);
   }
   for (Attack& a : g_attacks)
     if (a.fighter == fighter && a.wrestler) {
@@ -2042,13 +2164,112 @@ REX_HOOK_RAW(sub_82216C58) {
     if (att == fighter && tgt && frames > 300 && frames >= last + every) {
       last = frames;
       const uint32_t motion = force[3 + next++ % (force.size() - 3)];
+      // SVR2011_TEST_FORCE_PLACE=<x>,<z>,<yaw>[,<y>[,<target x>,<target z>[,<target y>[,<target area>]]]] - the
+      // attacker is first put there in the ring (y -12 the mat; yaw in radians, +z at 0): corner, rope and dive
+      // moves start where they belong; with a target place the target too (an apron move: the target on the apron,
+      // area 1 - the paired start then sets both from the move).
+      static const std::vector<float> place = [] {
+        std::vector<float> v;
+        if (const char* e = std::getenv("SVR2011_TEST_FORCE_PLACE"))
+          for (const char* p = e; *p;) {
+            char* end = nullptr;
+            const float f = std::strtof(p, &end);
+            if (end == p) break;
+            v.push_back(f);
+            for (p = end; *p == ',' || *p == ' ';) ++p;
+          }
+        return v;
+      }();
+      if (place.size() >= 3) {
+        const float x = place[0], z = place[1], yaw = place[2], y = place.size() > 3 ? place[3] : -12.0f;
+        PutFighter(base, att, x, y, z, std::fabs(x) > 28.8f || std::fabs(z) > 28.8f ? 1 : 0);  // (past the ropes: outside)
+        WrF(base + att + 276, yaw);
+        if (place.size() >= 6)
+          PutFighter(base, tgt, place[4], place.size() > 6 ? place[6] : -12.0f, place[5], place.size() > 7 ? uint8_t(place[7]) : 0);
+      }
       const auto saved = ctx;
       ctx.r3.u64 = att;
       ctx.r4.u64 = tgt;
       ctx.r5.u64 = motion;
       sub_82191AA8(ctx, base);
+      // (and again after the start: the paired start keeps or redoes the places by the move - a stock corner move
+      // kept them, a ported one got its pair put back near the target - and the facing came out as the start left
+      // it (0.17 for a written -0.79: the target then landed outside the ring); written after it, the motion plays
+      // from them)
+      if (place.size() >= 3) {
+        const float x = place[0], z = place[1], y = place.size() > 3 ? place[3] : -12.0f;
+        WrF(base + att + 288, x), WrF(base + att + 292, y), WrF(base + att + 296, z), WrF(base + att + 276, place[2]);
+        if (place.size() >= 6)
+          WrF(base + tgt + 288, place[4]), WrF(base + tgt + 292, place.size() > 6 ? place[6] : -12.0f), WrF(base + tgt + 296, place[5]);
+      }
       REXLOG_INFO("match types: test - person {} starts motion {} on person {} ({} -> state {})", force[0], motion,
                   force[1], frames, Rd32(base + att + 212));
+      ctx = saved;
+    }
+  }
+  // Test aid: SVR2011_TEST_FORCE_DIVE=<every s>,<set-up motion>,<dive motion>[,<dive motion>...] - a dive from the
+  // top rope onto a lying person 1: every <s> seconds person 0 takes person 1 down with the set-up move (a paired
+  // move that leaves him lying, e.g. 5000 - person 0 put in the middle of the ring first, so it stays in the ring);
+  // 10 s later (the set-up over: placed during a move, both went back to its track) he is put on the top turnbuckle
+  // - (28.8, -21.9, -28.8), where a CPU's climb ends - with person 1 lying 20 units in front of him, and the dive
+  // starts through the paired start sub_82191AA8 (it keeps written places - the one-person setter sub_82396E80 didn't,
+  // with or without sub_8217C2B8), after which person 1 gets his own lying motion back (a dive has no track of his).
+  // A start with no target crashed: sub_8218F550 links the two people (+96 of each = the other) and wrote to 0x60.
+  // Stock dives start on the turnbuckle; ported ones (their tracks start at the root) rise where he stood, with
+  // person 1 put beside him - enough to see where the dive lands.
+  static const std::vector<uint32_t> dive = [] {
+    std::vector<uint32_t> v;
+    if (const char* e = std::getenv("SVR2011_TEST_FORCE_DIVE"))
+      for (const char* p = e; *p;) {
+        char* end = nullptr;
+        const unsigned long n = std::strtoul(p, &end, 10);
+        if (end == p) break;
+        v.push_back(uint32_t(n));
+        for (p = end; *p == ',' || *p == ' ';) ++p;
+      }
+    return v.size() >= 3 ? v : std::vector<uint32_t>{};
+  }();
+  if (!dive.empty()) {
+    constexpr uint32_t kChars = 0x82E3CC50, kMatchFrames = 0x82E3CD0C;
+    const uint32_t att = Rd32(base + kChars), tgt = Rd32(base + kChars + 4);
+    const uint32_t frames = Rd32(base + kMatchFrames), every = std::max<uint32_t>(dive[0], 10) * 60;
+    static uint32_t phase_at = 0, next = 0;
+    static int phase = 0;  // (0: the set-up next, 1: the dive next)
+    if (att == fighter && tgt && frames > 300) {
+      if (frames < phase_at) phase_at = 0, phase = 0;  // (a new match)
+      const auto saved = ctx;
+      auto put = [&](uint32_t f, float x, float y, float z) { PutFighter(base, f, x, y, z); };
+      if (phase == 0 && frames >= phase_at + every) {
+        phase_at = frames, phase = 1;
+        put(att, 0.0f, -12.0f, 0.0f);
+        ctx.r3.u64 = att, ctx.r4.u64 = tgt, ctx.r5.u64 = dive[1];
+        sub_82191AA8(ctx, base);
+        REXLOG_INFO("match types: test dive - set-up {} on person 1 ({})", dive[1], frames);
+      } else if (phase == 1 && frames >= phase_at + 600) {
+        phase = 0;
+        const uint32_t motion = dive[2 + next++ % (dive.size() - 2)];
+        const float ax = 28.8f, ay = -21.9f, az = -28.8f;
+        const float vx = ax - 14.1f, vz = az + 14.1f;  // (20 units toward the ring's middle)
+        // (facing him: through the one-person setter a turned yaw faced in; through the paired start - below - the
+        // turned yaw dove out of the ring)
+        const float yaw = std::atan2(vx - ax, vz - az);
+        // Places written before the one-person setter alone (sub_82396E80(fighter, motion, x, y)) didn't hold, with or
+        // without sub_8217C2B8; through the paired start they do (FORCE_PLACE). So the dive goes through the paired
+        // start - its links (+96) both valid here - and person 1 then gets his own lying motion back at once (a dive
+        // has no track of his: in it he'd wait for good).
+        const uint32_t lying = Rd32(base + tgt + 212), lx = Rd32(base + tgt + 216), ly = Rd32(base + tgt + 220);
+        put(att, ax, ay, az);
+        WrF(base + att + 276, yaw);
+        put(tgt, vx, -12.0f, vz);
+        ctx.r3.u64 = att, ctx.r4.u64 = tgt, ctx.r5.u64 = motion;
+        sub_82191AA8(ctx, base);
+        // (nothing written after the start: the place or the facing written again made the stock Frog Splash dive out
+        // of the ring, 28 Oct - the start's own are right for a dive)
+        ctx.r3.u64 = tgt, ctx.r4.u64 = lying, ctx.r5.u64 = lx, ctx.r6.u64 = ly;
+        sub_82396E80(ctx, base);
+        REXLOG_INFO("match types: test dive - person 0 dives with {} from the top rope onto person 1 ({} -> state {})",
+                    motion, frames, Rd32(base + att + 212));
+      }
       ctx = saved;
     }
   }
@@ -2213,6 +2434,9 @@ void MatchTypesUpdate(PPCContext& ctx, uint8_t* base) {
   OnlineFirstBlood(base);
   constexpr uint32_t kChars = 0x82E3CC50;
   MatchHudTick(base);  // (match_hud.h: the HUD shows while the match's clock runs)
+  svr2011::CrowdHandoffUpdate(ctx, base);  // (a fan hands a weapon over the barricade: crowd_fight.h)
+  svr2011::MatchBoxUpdate(ctx, base);      // (the match's black box: match_box.h)
+  svr2011::MatchRecordUpdate(ctx, base);   // (match recordings: match_record.h)
   // Research aid (stuck wrestlers, B11/B12): SVR2011_TEST_STUCK_CHARS=1 - each
   // second, people 0-5 whose place and motion (+212) haven't changed for 10 s
   // while the match clock runs are logged (once each time), with the motion.
@@ -2698,14 +2922,66 @@ void ApplyWeapons(uint8_t* base) {
 
 }  // namespace
 
+// The crowd area's weapons (crowd_fight.h): with the crowd area open, the rule's placed list gets these too -
+// on the floor behind the barricade (SvR 2008's crowd area: barricade z -85, outer wall z -112), fixed places (every
+// game of an online match places the same: lockstep). Models every Extreme Rules match makes: chairs, and the trash can
+// and guitar of its nine (OPTIONS -> WEAPONS picks: the chosen ones in their place, as WEAPONS EVERYWHERE's).
+constexpr Placed kPlacedCrowd[] = {
+    {4, 1, -30.f, 0.f, -97.f, 20.f},   // a chair
+    {63, 1, 0.f, 0.f, -98.f, 0.f},     // a trash can
+    {89, 1, 28.f, 0.f, -96.f, 80.f},   // a guitar
+    {4, 1, 60.f, 0.f, -100.f, 140.f},  // a chair by the stands
+};
+struct {
+  uint32_t entry = 0, count = 0, records = 0;
+} g_crowd_swapped;
+uint32_t g_crowd_records = 0;
+
+void RestoreCrowdWeapons(uint8_t* base) {
+  if (!g_crowd_swapped.entry) return;
+  Wr32(base + g_crowd_swapped.entry, g_crowd_swapped.count);
+  Wr32(base + g_crowd_swapped.entry + 4, g_crowd_swapped.records);
+  g_crowd_swapped = {};
+}
+
+void AddCrowdWeapons(uint8_t* base) {
+  RestoreCrowdWeapons(base);
+  // (not with WEAPONS EVERYWHERE's list in: on top of it a quit crashed in the placing, sub_821C1F20)
+  if (!g_memory || g_swapped.entry || !svr2011::CrowdAreaFor(base)) return;
+  const uint32_t rule = base[0x82E3DE00];
+  const uint32_t entry = WeaponEntry(base, rule);
+  if (!entry) return;
+  const uint32_t n = Rd32(base + entry), records = Rd32(base + entry + 4);
+  constexpr uint32_t k = uint32_t(std::size(kPlacedCrowd)), kMax = 64;
+  if ((n && !records) || n > kMax) return;  // (Extreme Rules' own list is empty: ours alone)
+  if (!g_crowd_records) g_crowd_records = g_memory->SystemHeapAlloc((kMax + k) * 28);
+  if (!g_crowd_records) return;
+  if (n) std::memcpy(base + g_crowd_records, base + records, size_t(n) * 28);
+  for (uint32_t i = 0; i < k; ++i) {
+    uint8_t* r = base + g_crowd_records + (n + i) * 28;
+    const Placed& w = kPlacedCrowd[i];
+    WrF(r, w.x), WrF(r + 4, w.y), WrF(r + 8, w.z);
+    WrF(r + 12, 0.f), WrF(r + 16, w.yaw), WrF(r + 20, 0.f);
+    r[24] = uint8_t(15010 >> 8), r[25] = uint8_t(15010 & 0xFF);  // (motion: lying)
+    r[26] = w.place;
+    r[27] = uint8_t(svr2011::ExtremeWeaponsPlacedModel(int(n + i), w.model));
+  }
+  g_crowd_swapped = {entry, n, records};
+  Wr32(base + entry, n + k);
+  Wr32(base + entry + 4, g_crowd_records);
+  REXLOG_INFO("match types: the crowd area's weapons - {} more on the floor behind the barricade (rule {:02X})", k, rule);
+}
+
 // The match's weapons are made (as it loads): sub_8227B938.
 REX_EXTERN(__imp__sub_8227B938);
 REX_HOOK_RAW(sub_8227B938) {
   ApplyWeapons(base);
+  AddCrowdWeapons(base);
   if (g_swapped.entry) REXLOG_INFO("match types: WEAPONS EVERYWHERE - the weapons are made");
   svr2011::ExtremeWeaponsMaking(base, true, ctx);  // (the Extreme Rules weapons as chosen: weapons_page.h)
   __imp__sub_8227B938(ctx, base);
   svr2011::ExtremeWeaponsMaking(base, false, ctx);
+  RestoreCrowdWeapons(base);
   RestoreWeapons(base);
 }
 
@@ -2713,8 +2989,10 @@ REX_HOOK_RAW(sub_8227B938) {
 REX_EXTERN(__imp__sub_8227D130);
 REX_HOOK_RAW(sub_8227D130) {
   ApplyWeapons(base);
+  AddCrowdWeapons(base);
   __imp__sub_8227D130(ctx, base);
   svr2011::ExtremeWeaponsPlaced(base, g_memory);  // (the stock under the ring: the chosen weapons - weapons_page.h)
+  RestoreCrowdWeapons(base);
   RestoreWeapons(base);
 }
 
@@ -2789,8 +3067,17 @@ int32_t NearWeapon(PPCContext& ctx, uint8_t* base, uint32_t ai) {
 }
 }  // namespace
 
+bool CondCharacterMissing1xx(uint8_t* base, uint32_t object, uint32_t id);  // (below, with the other tables)
+static void EventAnswer(uint32_t id, PPCContext& ctx);
+
 REX_EXTERN(__imp__sub_828578E8);
 REX_HOOK_RAW(sub_828578E8) {
+  const uint32_t cond = ctx.r4.u32;
+  // (the event scripts' conditions 100-199: a missing character - see CharacterMissing below)
+  if (CondCharacterMissing1xx(base, ctx.r3.u32, cond)) {
+    ctx.r3.u64 = 0;
+    return;
+  }
   // (a CPU in its weapon cooldown: "a usable weapon lies somewhere" (157) is no - it wrestles)
   static const bool no_cooldown = std::getenv("SVR2011_TEST_WE_NO_COOLDOWN") != nullptr;
   if (ctx.r4.u32 == 157 && ctx.r3.u32 && g_weapons && !no_cooldown && WeaponsRule(base[0x82E3DE00]) &&
@@ -2803,11 +3090,36 @@ REX_HOOK_RAW(sub_828578E8) {
     return;
   }
   __imp__sub_828578E8(ctx, base);
+  EventAnswer(cond, ctx);
 }
+
+// Research aid: SVR2011_TEST_AI_LOG=1 - each CPU action made (both factories): person, action id, match frame; the
+// same action again and again folded into one line with its count (a CPU that stands still: what it keeps trying).
+namespace {
+void AiActionLog(uint8_t* base, uint32_t ai, uint32_t id, int factory) {
+  static const bool on = std::getenv("SVR2011_TEST_AI_LOG") != nullptr;
+  if (!on || !ai) return;
+  const uint32_t person = Rd32(base + ai), who = person ? Rd32(base + person + 1156) : 99;
+  if (who >= 8) return;
+  static std::mutex mu;
+  static uint32_t last_id[8] = {}, repeats[8] = {}, since[8] = {};
+  std::lock_guard lock(mu);
+  const uint32_t frames = Rd32(base + 0x82E3CD0C);
+  if (last_id[who] == id) {
+    ++repeats[who];
+    return;
+  }
+  if (repeats[who])
+    REXLOG_INFO("ai: person {} action {} x{} more (frames {}-{})", who, last_id[who], repeats[who], since[who], frames);
+  last_id[who] = id, repeats[who] = 0, since[who] = frames;
+  REXLOG_INFO("ai: person {} action {} (factory {}) frame {}", who, id, factory, frames);
+}
+}  // namespace
 
 REX_EXTERN(__imp__sub_82812838);
 REX_HOOK_RAW(sub_82812838) {
   const uint32_t id = ctx.r4.u32;
+  AiActionLog(base, ctx.r3.u32, id, 1);
   if ((id == 140 || id == 141 || id == 260) && NearWeapon(ctx, base, ctx.r3.u32) >= 0) ctx.r4.u64 = 300;
   // (a weapon action made: this CPU's cooldown starts - WEAPONS EVERYWHERE)
   if (g_weapons && ctx.r3.u32 && (id == 140 || id == 141 || id == 260 || (id >= 300 && id <= 304)))
@@ -2825,6 +3137,7 @@ REX_HOOK_RAW(sub_82812838) {
 // ... and its sibling for actions 146-346: 260, the search itself (sub_82828968).
 REX_EXTERN(__imp__sub_828136D0);
 REX_HOOK_RAW(sub_828136D0) {
+  AiActionLog(base, ctx.r3.u32, ctx.r4.u32, 2);
   if (static const bool item_log = std::getenv("SVR2011_TEST_ITEM_LOG") != nullptr; item_log && ctx.r4.u32 == 260) {
     const uint32_t person = ctx.r3.u32 ? Rd32(base + ctx.r3.u32) : 0;
     REXLOG_INFO("item: person {} action 260 (second factory) frame {}", person ? Rd32(base + person + 1156) : 99,
@@ -3275,6 +3588,12 @@ REX_HOOK_RAW(sub_828C48E8) {
     REXLOG_INFO("match types: WEAPONS EVERYWHERE - rule {:02X} with the Extreme Rules options", rule);
   }
   svr2011::MysteryOpponentLive(base, live);  // (entrances on: mystery_opponent.h)
+  // Test aid (match replays, docs/MATCH_RECORDINGS.md): SVR2011_TEST_ENTRANCES=0|1 - the live rules' ENTRANCES
+  // (+38) for this match: off, the people start in their in-ring places at the bell.
+  if (const char* v = std::getenv("SVR2011_TEST_ENTRANCES"); v && live) {
+    base[live + 38] = uint8_t(*v == '1');
+    REXLOG_INFO("match types: test - entrances {} (live rules {:08X})", *v == '1' ? "on" : "off", live);
+  }
 }
 
 // Research aid (online match types): SVR2011_TEST_ONLINE_TRACE=1 - the
@@ -3309,6 +3628,34 @@ SVR2011_ONLINE_TRACE(sub_82470AA0)
 SVR2011_ONLINE_TRACE(sub_82470AE0)
 SVR2011_ONLINE_TRACE(sub_828B4A48)
 
+// Test aids for the event scripts' conditions (both tables below): SVR2011_TEST_EVENT_LOG=1 - each id's first
+// answer of each value, with its caller; SVR2011_TEST_EVENT_TRUE=<id>[,<id>...] - those ids answer 1 (an
+// objective reached without walking there: Road to WrestleMania's backstage walks).
+static void EventAnswer(uint32_t id, PPCContext& ctx) {
+  static const bool log = std::getenv("SVR2011_TEST_EVENT_LOG") != nullptr;
+  static const std::set<uint32_t> forced = [] {
+    std::set<uint32_t> s;
+    if (const char* v = std::getenv("SVR2011_TEST_EVENT_TRUE"))
+      for (const char* q = v; *q;) {
+        s.insert(uint32_t(std::strtoul(q, nullptr, 10)));
+        while (*q && *q != ',') ++q;
+        if (*q == ',') ++q;
+      }
+    return s;
+  }();
+  if (forced.count(id)) {
+    static std::set<uint32_t> told;
+    if (told.insert(id).second) REXLOG_INFO("[svr2011] event condition {}: test - answered 1 (was {})", id, ctx.r3.u32);
+    ctx.r3.u64 = 1;
+  }
+  if (!log) return;
+  static std::mutex mu;
+  static std::set<uint64_t> seen;
+  std::lock_guard lock(mu);
+  if (seen.insert(uint64_t(id) << 32 | ctx.r3.u32).second)
+    REXLOG_INFO("[svr2011] event condition {} = {} (from {:08X})", id, ctx.r3.u32, uint32_t(ctx.lr));
+}
+
 // A condition of the game's event scripts (sub_82856B00(object, id), 99 of
 // them): id 32 reads the object's character's +20 (another character - the
 // one it's handling) and that one's +212 / +220 without checking it's there
@@ -3335,6 +3682,7 @@ REX_HOOK_RAW(sub_82856B00) {
     }
   }
   __imp__sub_82856B00(ctx, base);
+  EventAnswer(id, ctx);
 }
 
 // ...and its conditions 400-483 (sub_82858B08(object, id), which sub_82859388 hands the 400s): the same kind
@@ -3367,6 +3715,50 @@ REX_HOOK_RAW(sub_82858B08) {
     }
   }
   __imp__sub_82858B08(ctx, base);
+  EventAnswer(id, ctx);
+}
+
+// ...and its conditions 100-199 (sub_828578E8) and 200-299 (sub_82853E38), the same kind again. Road to WrestleMania,
+// John Cena's week 2 (2.1.5, PC crash lr 82859424 / ctr 82857DEC, Android a freeze - two reports, 24 Oct): the
+// backstage brawl with Ted and Cody, when MVP opens the door - id 119 reads the object's character's +20 (the one it
+// handles) and that one's +1828; MVP, just in, handles no one: a read of 0x724. 174 hands +20 on (sub_821B59A8) and
+// 284 reads its +446 the same way. With nothing there these answer false, as the console's read near address 0 did;
+// so do the ids whose case starts with the object's character when there is none (kReads*: every case that loads
+// it, found by reading the cases - scratchpad tool cond_scan.py).
+namespace {
+bool CharacterMissing(uint8_t* base, uint32_t object, uint32_t id, uint32_t first, const uint64_t (&reads)[2],
+                      std::initializer_list<uint32_t> plus20) {
+  const uint32_t k = id - first;
+  if (!object || k >= 100 || !(reads[k / 64] >> (k % 64) & 1)) return false;
+  const uint32_t ch = Rd32(base + object);
+  if (!ch) return true;
+  for (const uint32_t v : plus20)
+    if (v == id && !Rd32(base + ch + 20)) return true;
+  return false;
+}
+}  // namespace
+
+// (sub_828578E8's hook is above, with the weapon cooldown answers)
+bool CondCharacterMissing1xx(uint8_t* base, uint32_t object, uint32_t id) {
+  constexpr uint64_t kReads1xx[2] = {0xFBFFFFFAEF7CBFFFull, 0x0000000FFF3FFEBFull};  // (bit = id - 100)
+  if (!CharacterMissing(base, object, id, 100, kReads1xx, {119, 174})) return false;
+  static int logged = 0;
+  if (logged++ < 3) REXLOG_INFO("[svr2011] event condition {} with no character to check - false (as on the console)", id);
+  return true;
+}
+
+REX_EXTERN(__imp__sub_82853E38);
+REX_HOOK_RAW(sub_82853E38) {
+  constexpr uint64_t kReads2xx[2] = {0xEF1DFF7FFFFFFEFEull, 0x0000000FDFFFFFFFull};  // (bit = id - 200)
+  const uint32_t id = ctx.r4.u32;
+  if (CharacterMissing(base, ctx.r3.u32, id, 200, kReads2xx, {284})) {
+    static int logged = 0;
+    if (logged++ < 3) REXLOG_INFO("[svr2011] event condition {} with no character to check - false (as on the console)", id);
+    ctx.r3.u64 = 0;
+    return;
+  }
+  __imp__sub_82853E38(ctx, base);
+  EventAnswer(id, ctx);
 }
 
 namespace svr2011 {
