@@ -177,8 +177,9 @@ final class Stfs {
             } catch (IOException e) {
                 continue;
             }
-            // (content type 2: marketplace content - his DLC packages)
-            if (head[0] != 'L' || head[1] != 'I' || head[2] != 'V' || head[3] != 'E' || be32(head, 0x344) != 2) continue;
+            // (content type 2: marketplace content - his DLC packages; Vol11 and Vol12 are CON, the rest LIVE)
+            String magic = new String(head, 0, 4, java.nio.charset.StandardCharsets.US_ASCII);
+            if (!magic.equals("LIVE") && !magic.equals("PIRS") && !magic.equals("CON ") || be32(head, 0x344) != 2) continue;
             try (InputStream in = new FileInputStream(f); OutputStream o = new FileOutputStream(new File(dlc, f.getName()))) {
                 FileOps.copy(in, o);
                 n[1]++;
