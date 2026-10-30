@@ -99,6 +99,24 @@ POS = [
     # A17: his jump over the original's 24 special ids (100, 101 ... 279), and the range 50-70 -> 50-999
     ('A17', 'sub_82331BE8', [(i, 'beq cr6,0x82331d5c', '') for i in range(12, 59, 2)] +
                             [(61, 'cmpwi cr6,r3,70', 'ctx.cr6.compare<int32_t>(ctx.r3.s32, 999, ctx.xer);')]),
+    # A19: the arena select's NEXT PAGE (the original: the DOWNLOADED ARENAS panel) turns his pages - his page
+    # (+9584: 0 = the game's page, then 2-8, back to 0) stepped by his 0x82479300, the tiles filled by his
+    # 0x82479400 (AnthArenaPage), the panel's call (sub_824775F0) and its state check (+9588) left out
+    ('A19', 'sub_82478B00', [(5, 'lwz r11,9588(r3)', 'ctx.r11.u64 = REX_LOAD_U32(ctx.r3.u32 + 9584);'),
+                             (8, 'bne cr6,0x82478b80', ''),
+                             (12, 'li r11,1', 'ctx.r10.s64 = ctx.r11.u32 == 0 || ctx.r11.u32 > 8 ? 2 : '
+                                              'ctx.r11.u32 == 8 ? 0 : ctx.r11.u32 + 1;'),
+                             (14, 'stw r11,9588(r31)', 'REX_STORE_U32(ctx.r31.u32 + 9584, ctx.r10.u32);'),
+                             (15, 'bl 0x823c8d48', 'AnthArenaPage(ctx, base);'),
+                             (20, 'bl 0x824775f0', '')]),
+    # A19: the arena under the cursor - on his pages his table's (his 0x82479150: page - 2, row x 5 + column),
+    # else the original's with his page in r9 (the panel's state not read)
+    ('A19', 'sub_82477598', [(0, 'lwz r9,9632(r3)',
+                              'ctx.r9.u64 = REX_LOAD_U32(ctx.r3.u32 + 9628);\n'
+                              '\tif (ctx.r9.s32 >= 2 && ctx.r9.u32 <= 8) {\n'
+                              '\t\tctx.r3.u64 = svr2011_anth_arena_pages[((ctx.r9.u32 - 2) * 20 + '
+                              'REX_LOAD_U32(ctx.r3.u32 + 72) * 5 + REX_LOAD_U32(ctx.r3.u32 + 88)) % 140];\n'
+                              '\t\treturn;\n\t}')]),
 ]
 # A18: two text ids swapped (a plain constant)
 CHANGES += [
@@ -163,7 +181,49 @@ def main():
              '}',
              'static thread_local uint32_t g_anth_n;',
              '// (A8) the chosen version\'s ids (anthology.cpp)',
-             'extern "C" uint32_t svr2011_anth_ids[15];', '']
+             'extern "C" uint32_t svr2011_anth_ids[15];',
+             '// (A19) his arena pages\' arena numbers (anthology.cpp)',
+             'extern "C" uint8_t svr2011_anth_arena_pages[140];',
+             '// (A19) his 0x82479400: the arena select\'s 20 tiles (+3216 from the screen, 320 bytes apart, their',
+             '// picture key at +272) for his page - page 2 first keeps the game\'s page\'s keys (160 bytes at +9620,',
+             '// -1 at +9624: the DOWNLOADED ARENAS panel\'s ids, unused now), page 0 puts them back; pages 2-8 show',
+             '// keys 10-29, 30-49 ... of the arena picture table (+10656: its +64)',
+             'static void AnthArenaPage(PPCContext& ctx, uint8_t* base) {',
+             '  PPCContext c = ctx;',
+             '  const uint32_t s = ctx.r31.u32 - 44, page = REX_LOAD_U32(s + 9628);',
+             '  uint32_t off;',
+             '  auto show = [&](uint32_t i, uint64_t key) {',
+             '    c.r3.u64 = s + 3216 + i * 320;',
+             '    c.r4.u64 = key;',
+             '    c.lr = 0x82478B40;',
+             '    sub_827023A0(c, base);',
+             '  };',
+             '  if (page == 0) {',
+             '    const uint32_t saved = REX_LOAD_U32(s + 9620);',
+             '    if (REX_LOAD_U32(s + 9624) != 0xFFFFFFFFu || !saved) return;',
+             '    for (uint32_t i = 0; i < 20; ++i) show(i, REX_LOAD_U64(saved + i * 8));',
+             '    return;',
+             '  }',
+             '  if (page == 2) {',
+             '    if (REX_LOAD_U32(s + 9624) != 0xFFFFFFFFu) {',
+             '      c.r3.u64 = 160;',
+             '      c.lr = 0x82478B40;',
+             '      sub_8269A8D8(c, base);',
+             '      const uint32_t saved = c.r3.u32;',
+             '      if (!saved) return;',
+             '      REX_STORE_U32(s + 9620, saved);',
+             '      REX_STORE_U32(s + 9624, 0xFFFFFFFFu);',
+             '      for (uint32_t i = 0; i < 20; ++i) REX_STORE_U64(saved + i * 8, REX_LOAD_U64(s + 3216 + i * 320 + 272));',
+             '    }',
+             '    off = 80;',
+             '  } else {',
+             '    off = page * 160 - 240;',
+             '  }',
+             '  const uint32_t table = REX_LOAD_U32(s + 10656);',
+             '  if (!table) return;',
+             '  const uint32_t from = REX_LOAD_U32(table + 64) + off;',
+             '  for (uint32_t i = 0; i < 20; ++i) show(i, REX_LOAD_U64(from + i * 8));',
+             '}', '']
     for cid, fn, subs in CHANGES:
         if fn not in found:
             sys.exit('anthology_redo: %s not in %s' % (fn, gen))

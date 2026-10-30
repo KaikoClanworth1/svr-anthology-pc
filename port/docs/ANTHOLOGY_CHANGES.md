@@ -34,6 +34,7 @@ lists it so it can be shown to him. Addresses are the original disc program's (h
 | A16 | sub_82734560: a call (sub_828B6950) replaced by 0 | the function at build time | (scan) |
 | A17 | sub_82331BE8: his jump over the original's 24 special ids (100, 101 ... 279), and the range 50-70 → 50-999 | the 24 branches left out and the compare changed at build time | (scan) |
 | A18 | sub_821B0EE8 / sub_821B0F18: two text ids swapped (0x8749 / 0x874D) | the two constants at build time | (scan) |
+| A19 | The arena select's NEXT PAGE: his own code (his 0x82479150-0x82479560, in place of the DOWNLOADED ARENAS panel). sub_82478B00 [82478FF0]: his page (+9584: 0 = the game's page, then 2-8, then 0 again) stepped by his 0x82479300; his 0x82479400 keeps the 20 tiles' pictures the first time (160 bytes at +9620, -1 at +9624 from the screen) and fills the tiles for the page from the arena picture table (its +64: keys 10-29, 30-49 ...), putting the game's back on page 0; the panel's call (sub_824775F0) gone. sub_82477598 [82477A38 -> his 0x82479150]: on his pages the arena under the cursor is from his table at his 0x82479340 (7 pages x 20 numbers, row x 5 + column) | both functions at build time (tools/anthology_redo.py, his 0x82479400 as AnthArenaPage); his table read from his chosen program at start-up, his code beside it checked (anthology.cpp) | players: NEXT PAGE should go to pages of all the modded arenas, not the 3-arena panel |
 
 The build also hides the main menu's Xbox LIVE row (no online in this version: anthology.cpp
 HideOnlineRows), which is the port's choice, not a change of his.
@@ -47,9 +48,6 @@ the game's own device calls (native_renderer.cpp NoteDevice).
 Changes found in his program that the port does not do, because nothing has needed them so far. Each
 waits for a test that shows it matters:
 
-- sub_82478B00: code of his own (a state 0-8 at +9584 stepped by his function at his 0x82479300, then 20
-  records 320 bytes apart at +3216 saved and restored by his code at his 0x82479400; scattered over
-  his 0x82479200-0x82479560). What it is for isn't known yet.
 - The "Entrance FPS Switcher" programs in his @Alternate_Files: not needed (the port has its own 60 fps
   entrances setting).
 - Calls his program sends to other functions or to his own code are only partly checked: callscan.py

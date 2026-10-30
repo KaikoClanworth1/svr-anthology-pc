@@ -29,6 +29,9 @@ REXCVAR_DEFINE_STRING(anthology_version, "", "Game",
 // A8 (Yumboy11's versions): the 15 ids of sub_825A6810 / sub_825AAB10 (tools/anthology_redo.py), the
 // original disc's until a version is read.
 extern "C" uint32_t svr2011_anth_ids[15] = {1, 0, 17, 12, 16, 15, 14, 4, 6, 18, 7, 8, 9, 10, 11};
+// A19 (his arena select pages): the arena numbers of his pages 2-8, 20 tiles each (0: an empty tile), read
+// from his program; all 0 until then (his pages then show no arenas).
+extern "C" uint8_t svr2011_anth_arena_pages[140] = {};
 
 namespace svr2011 {
 
@@ -108,6 +111,9 @@ constexpr size_t kHisXexSize = 14856192;
 constexpr size_t kHisList = 0x336BB, kHisList2 = 0x336D3, kHisPck = 0x3866C;  // (in his file)
 constexpr size_t kHisIds = 0x5AA080, kHisIds2 = 0x5AE3A0;                    // (li r4 / li r31 runs)
 constexpr uint32_t kList = 0x820306F3, kList2 = 0x8203070B, kPck = 0x820356AC;  // (the original's)
+// A19: his arena pages' table (his 0x82479340, 7 pages x 20 bytes), checked by his code beside it: the
+// page step at his 0x82479300 (li r10,2) and the cursor's page read at his 0x82479150 (lwz r9,9628(r3))
+constexpr size_t kHisPages = 0x47C340, kHisPageStep = 0x47C300, kHisPageRead = 0x47C150;
 
 // The immediates of `li reg, n` in [from, from + 0x100) of his file.
 std::vector<uint32_t> LoadImmediates(const std::vector<uint8_t>& x, size_t from, uint32_t reg) {
@@ -158,6 +164,14 @@ void ApplyVersion(rex::memory::Memory* memory) {
   if (On("A6")) put(kList, kHisList, 8), put(kList2, kHisList2, 8);
   if (On("A7")) put(kPck, kHisPck, 10);
   if (On("A8")) std::memcpy(svr2011_anth_ids, ids, sizeof ids);
+  if (On("A19")) {
+    if (Be32(x.data() + kHisPageStep) == 0x39400002 && Be32(x.data() + kHisPageRead) == 0x8123259C) {
+      std::memcpy(svr2011_anth_arena_pages, x.data() + kHisPages, sizeof svr2011_anth_arena_pages);
+      REXLOG_INFO("[svr2011] anthology A19: his arena select pages 2-8 read");
+    } else {
+      REXLOG_WARN("[svr2011] anthology A19: his arena pages' code not where it should be - his pages stay empty");
+    }
+  }
   std::string list;
   for (uint32_t id : ids) list += fmt::format(" {}", id);
   REXLOG_INFO("[svr2011] anthology: version {} (Yumboy11's): pac\\{}.h, sound\\{}, menu ids{}", name,
