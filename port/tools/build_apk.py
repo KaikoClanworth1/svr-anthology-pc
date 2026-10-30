@@ -66,6 +66,12 @@ def build_native(debug_suite=False):
 
 
 def version():
+    if ANTHOLOGY:
+        # (SVR Anthology: its own numbers, ANTHOLOGY_VERSION.txt - 1.0.0 -> 211000, above the 2.1.5 / 2.1.6
+        # builds it had before, so an installed one updates)
+        v = (PORT / "ANTHOLOGY_VERSION.txt").read_text().strip()
+        major, minor, patch = ([int(x) for x in v.split(".")] + [0, 0])[:3]
+        return v, 210000 + major * 1000 + minor * 100 + patch * 10
     v = (PORT / "VERSION.txt").read_text().strip()
     parts = [int(x) for x in v.split(".")] + [0, 0, 0]
     major, minor, patch, fix = parts[:4]

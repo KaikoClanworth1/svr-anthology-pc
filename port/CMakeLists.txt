@@ -427,7 +427,10 @@ if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/launcher/svr2011_launcher.c")
     target_compile_definitions(svr2011_anthology_launcher PRIVATE
         UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN SVR2011_RC_ANTHOLOGY)
     target_link_libraries(svr2011_anthology_launcher PRIVATE comctl32 comdlg32 shell32 ole32 bcrypt gdiplus dwmapi uxtheme winhttp)
-    target_compile_definitions(svr2011_anthology_launcher PRIVATE "PORT_VERSION=L\"${SVR2011_PORT_VERSION}\"")
+    # (SVR Anthology's own version, ANTHOLOGY_VERSION.txt - not the recomp's)
+    file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/ANTHOLOGY_VERSION.txt" SVR2011_ANTHOLOGY_VERSION LIMIT_COUNT 1)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/ANTHOLOGY_VERSION.txt")
+    target_compile_definitions(svr2011_anthology_launcher PRIVATE "PORT_VERSION=L\"${SVR2011_ANTHOLOGY_VERSION}\"")
     # The hybrid CRT: the VC++ part (vcruntime) built in, the Universal CRT from Windows (ucrtbase.dll /
     # api-ms-win-crt-*, part of Windows 10+; Windows 7/8.1 with update KB2999226). The launcher starts
     # without the VC++ runtime, tells a player who has none / an old one where to get it (setup_tab.c), and

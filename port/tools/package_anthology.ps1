@@ -1,6 +1,6 @@
 # The SvR Anthology release (branch anthology): SVR Anthology by Yumboy11 on the PC recomp. No game data and
 # nothing of the Anthology - the player uses their own ISO and Yumboy11's own installer (Read Me).
-#   .\package_anthology.ps1 -Base <the normal release's package folder> [-Version 2.1.5]
+#   .\package_anthology.ps1 -Base <the normal release's package folder> [-Version 1.0.0]
 #     -> port\out\SvR-Anthology-PC-v<version>.zip
 # -Base: the normal release of the same version (port\out\package\SvR2011-PC-v<version> in the release
 # copy): its shaders, button pictures and third-party notices are the same files. The programs come from
@@ -8,7 +8,7 @@
 param([Parameter(Mandatory = $true)][string]$Base, [string]$Version = "", [string]$Build = "")
 $ErrorActionPreference = "Stop"
 $port = Split-Path $PSScriptRoot -Parent
-if (-not $Version) { $Version = (Get-Content (Join-Path $port "VERSION.txt") -TotalCount 1).Trim() }
+if (-not $Version) { $Version = (Get-Content (Join-Path $port "ANTHOLOGY_VERSION.txt") -TotalCount 1).Trim() }
 $build = if ($Build) { $Build } else { Join-Path $port "out\build\SourceAnth" }
 $sdk = Join-Path (Split-Path $port -Parent) "recomp\rexglue-sdk\out\win-amd64"
 $name = "SvR-Anthology-PC-v$Version"
