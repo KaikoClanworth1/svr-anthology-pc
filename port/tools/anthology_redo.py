@@ -15,7 +15,8 @@ import sys
 # (SVR2011_IMP, anthology.h).
 HOOKED = {'sub_828C4060', 'sub_828C4140',  # (superstar_mods.cpp: the attire lookups)
           'sub_8245F1C0',                   # (managers.cpp: browsing)
-          'sub_82734560'}                   # (superstar_mods.cpp: the exhibition grid)
+          'sub_82734560',                   # (superstar_mods.cpp: the exhibition grid)
+          'sub_827374A0'}                   # (match_types.cpp: a match set up)
 CHANGES = [
     # A3: a table of 80 entries of 40 bytes (count at +3200) -> 129 entries (count at +5160)
     ('A3', 'sub_828C40D0', [('ctx.r3.s64 = 3204;', 'ctx.r3.s64 = 5164;', 1),
@@ -117,6 +118,18 @@ POS = [
                               '\t\tctx.r3.u64 = svr2011_anth_arena_pages[((ctx.r9.u32 - 2) * 20 + '
                               'REX_LOAD_U32(ctx.r3.u32 + 72) * 5 + REX_LOAD_U32(ctx.r3.u32 + 88)) % 140];\n'
                               '\t\treturn;\n\t}')]),
+    # A21: the /ETEX/%04d picture of number + 300 (the original: + 100)
+    ('A21', 'sub_827667E0', [(21, 'addi r6,r11,100', 'ctx.r6.s64 = ctx.r11.s64 + 300;')]),
+    # A22: an id (+64 of sub_825740C8's object) of 100 or more takes entry 0 (the original: the block skipped)
+    ('A22', 'sub_82583988', [(7, 'bge cr6,0x82583c0c', 'if (!ctx.cr6.lt) ctx.r30.s64 = 0;')]),
+    # A23: a match set up: a person whose record id is 20-24 skips the record's lookup (sub_828B4528 /
+    # sub_828C1BD8) - his jump to the block after it
+    ('A23', 'sub_827374A0', [(54, 'lwzx r3,r11,r29',
+                              'ctx.r3.u64 = REX_LOAD_U32(ctx.r11.u32 + ctx.r29.u32);\n'
+                              '\tif (ctx.r3.u32 - 20 <= 4) goto loc_827376B0;')]),
+    # A24: the arena select's flags 11 -> 15 for the match kind sub_82733D18 answers (his Readme: "I enable
+    # the select arena for the rumble")
+    ('A24', 'sub_8245C2B0', [(36, 'li r30,11', 'ctx.r30.s64 = 15;')]),
 ]
 # A18: two text ids swapped (a plain constant)
 CHANGES += [

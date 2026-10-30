@@ -35,6 +35,10 @@ lists it so it can be shown to him. Addresses are the original disc program's (h
 | A17 | sub_82331BE8: his jump over the original's 24 special ids (100, 101 ... 279), and the range 50-70 → 50-999 | the 24 branches left out and the compare changed at build time | (scan) |
 | A18 | sub_821B0EE8 / sub_821B0F18: two text ids swapped (0x8749 / 0x874D) | the two constants at build time | (scan) |
 | A19 | The arena select's NEXT PAGE: his own code (his 0x82479150-0x82479560, in place of the DOWNLOADED ARENAS panel). sub_82478B00 [82478FF0]: his page (+9584: 0 = the game's page, then 2-8, then 0 again) stepped by his 0x82479300; his 0x82479400 keeps the 20 tiles' pictures the first time (160 bytes at +9620, -1 at +9624 from the screen) and fills the tiles for the page from the arena picture table (its +64: keys 10-29, 30-49 ...), putting the game's back on page 0; the panel's call (sub_824775F0) gone. sub_82477598 [82477A38 -> his 0x82479150]: on his pages the arena under the cursor is from his table at his 0x82479340 (7 pages x 20 numbers, row x 5 + column) | both functions at build time (tools/anthology_redo.py, his 0x82479400 as AnthArenaPage); his table read from his chosen program at start-up, his code beside it checked (anthology.cpp) | players: NEXT PAGE should go to pages of all the modded arenas, not the 3-arena panel |
+| A21 | sub_827667E0 [82766F28]: the picture `/ETEX/%04d` of a number + 300 (the original: + 100) | the constant at build time | an order-pairing of every function (scratchpad audit2.py) |
+| A22 | sub_82583988 [82584110]: an id (+64 of sub_825740C8's object) of 100 or more takes entry 0 (the original: the block left out) | the branch made his assignment at build time | (audit2.py) |
+| A23 | sub_827374A0 [82737C90] (a match set up): a person with record id 20-24 skips the record lookup (sub_828B4528, sub_828C1BD8) | his check written in at build time (the port's hook there calls it: match_types.cpp) | (audit2.py) |
+| A24 | sub_8245C2B0 [8245C7B8]: the arena select is made with flags 15, not 11, for the match kind sub_82733D18 answers - his Readme: "I enable the select arena for the rumble" | the constant at build time | (audit2.py) |
 
 The build also hides the main menu's Xbox LIVE row (no online in this version: anthology.cpp
 HideOnlineRows), which is the port's choice, not a change of his.
@@ -48,11 +52,21 @@ the game's own device calls (native_renderer.cpp NoteDevice).
 Changes found in his program that the port does not do, because nothing has needed them so far. Each
 waits for a test that shows it matters:
 
+- A20, the online CREATE SESSION's arena select (sub_82521D18's screen, opened only from the online lobby,
+  sub_824EB618): the same pages as A19 - his page step (his 0x82523040: 1-8), the arena on his pages from
+  his A19 table (his 0x825228D0, over the original's mode 2 list sub_825222E0), the tiles' pictures (his
+  0x82523060), NEXT PAGE without the mode 1 check (sub_82522908), B closing the screen (sub_82522A18), the
+  screen starting on the first list (sub_82522AE0). Not needed: no online in this version.
+- sub_82575D60 [82576458]: the "DLCV" value masked with 0xFFFDFFFF (the original: 0xFFF8FFFF). His program is
+  another release of the game (title 54511A11); this may be that release's, not his. His DLC and saves work
+  without it.
 - The "Entrance FPS Switcher" programs in his @Alternate_Files: not needed (the port has its own 60 fps
   entrances setting).
-- Calls his program sends to other functions or to his own code are only partly checked: callscan.py
-  checks the redone functions; across the whole program most such differences are the later build's
-  (the compiler folds the same small functions differently).
+- The whole program was checked on 30 Oct (scratchpad audit2-6.py): every function paired by order between
+  the fingerprint pairs (53,192), compared with addresses masked; his nops; branches into code of his own;
+  calls to another function than the original's, with functions of the same code taken as the same. What
+  is left are the other release's differences: other structure offsets, other virtual tables (e.g.
+  sub_824F8DE8), the system libraries.
 
 Many other differences come from the later build itself (compiler output: other registers, other
 addresses). They aren't his changes, and the port leaves them alone.

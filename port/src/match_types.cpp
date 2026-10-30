@@ -1159,6 +1159,9 @@ REX_HOOK_RAW(sub_8243FCC8) {
 
 // A match is set up: sub_827374A0(match, rule, ...).
 REX_EXTERN(__imp__sub_827374A0);
+#ifdef SVR2011_ANTHOLOGY
+REX_EXTERN(anth_sub_827374A0);
+#endif
 REX_HOOK_RAW(sub_827374A0) {
   uint32_t rule = ctx.r4.u32;
   // ONLINE: the session's PORT RULES (online_rules.h) - the same modes as the
@@ -1278,7 +1281,7 @@ REX_HOOK_RAW(sub_827374A0) {
     REXLOG_INFO("match types: WEAPONS EVERYWHERE - 6-man as a free-for-all (shaped like rule {:02X})", kSixFreeForAll);
   }
   ctx.r4.u64 = played;
-  __imp__sub_827374A0(ctx, base);
+  SVR2011_IMP(sub_827374A0)(ctx, base);  // (anthology.h)
 }
 
 // -- Lumberjack outside Road to WrestleMania ------------------------------
