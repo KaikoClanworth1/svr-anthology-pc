@@ -37,8 +37,10 @@
 #include <uxtheme.h>
 #include <wchar.h>
 
+#include "anth_report.h"
 #include "anthology_disc.h"
 #include "apk_package.h"
+#include "reports_tab.h"
 #include "stfs.h"
 #include "ui_theme.h"
 #include "unzip.h"
@@ -81,7 +83,10 @@
 #define NAV_TOP  86
 #define NAV_H    42
 
-enum { PAGE_PLAY, PAGE_SETTINGS, PAGE_SETUP, PAGE_PHONE, PAGE_COUNT, PAGE_ALL = -1 };
+enum { PAGE_PLAY, PAGE_SETTINGS, PAGE_SETUP, PAGE_PHONE, PAGE_REPORT, PAGE_MY_REPORTS, PAGE_COUNT, PAGE_ALL = -1 };
+#define ID_REPORT_BASE 1300    /* Report a problem's controls (anth_report.c) */
+#define ID_MY_REPORTS_BASE 1400 /* My reports' (reports_tab.c) */
+#define REPORT_SERVER L"https://sho-ti.me/svr"
 
 enum {
     ID_ISO_EDIT = 100, ID_ISO_FILE, ID_ISO_FOLDER,
@@ -330,11 +335,11 @@ static int render_index(int max_scale, double res, int height)
 
 /* Every control, with its page and its layout in 96-DPI units (a DPI change lays them out again). */
 typedef struct { HWND h; int page, x, y, w, hh, card, big; } Placed;
-static Placed s_placed[128];
+static Placed s_placed[192];
 static int s_nplaced;
 /* The cards: rounded panels the window draws behind a page's controls. */
 typedef struct { int page, x, y, w, h; const WCHAR *title; } Card;
-static Card s_cards[16];
+static Card s_cards[24];
 static int s_ncards;
 
 static HWND ctl(int id) { return GetDlgItem(s_wnd, id); }
@@ -1156,6 +1161,34 @@ static void build_window(void)
         SS_LEFT | SS_NOPREFIX, 18, 320, 690, 66, 0);
 }
 
+/* The reports' server: svr2011.toml's online_server (test folders set theirs), else ours. Online play stays off. */
+static void report_server(WCHAR *out, int n)
+{
+    char v[260];
+    if (get_toml("online_server", v, sizeof v) && v[0]) MultiByteToWideChar(CP_UTF8, 0, v, -1, out, n);
+    else wcscpy_s(out, (size_t)n, REPORT_SERVER);
+}
+
+/* (no accounts in this version) */
+static void report_no_token(char *out, size_t n)
+{
+    if (n) out[0] = 0;
+}
+
+static void build_report_pages(void)
+{
+    card(PAGE_REPORT, 0, 0, 724, 590, NULL);
+    anth_report_build(s_wnd, add, PAGE_REPORT, ID_REPORT_BASE, s_dir, PORT_VERSION, report_server);
+    reports_build(s_wnd, add, PAGE_MY_REPORTS, ID_MY_REPORTS_BASE, report_server, report_no_token);
+    {   /* (reports_tab.c's R_LIST: this launcher's dark colours) */
+        HWND list = GetDlgItem(s_wnd, ID_MY_REPORTS_BASE + 2);
+        SetWindowTheme(list, L"DarkMode_Explorer", NULL);
+        ListView_SetBkColor(list, C_FIELD);
+        ListView_SetTextBkColor(list, C_FIELD);
+        ListView_SetTextColor(list, RGB(230, 232, 238));
+    }
+}
+
 static void show_page(int page)
 {
     int i;
@@ -1164,6 +1197,7 @@ static void show_page(int page)
         ShowWindow(s_placed[i].h, s_placed[i].page == page || s_placed[i].page == PAGE_ALL ? SW_SHOWNOACTIVATE : SW_HIDE);
     if (page == PAGE_SETTINGS) settings_load();
     refresh();
+    if (page == PAGE_MY_REPORTS) reports_show(s_dir);
     InvalidateRect(s_wnd, NULL, TRUE);
 }
 
@@ -1191,8 +1225,9 @@ static RECT page_rect(int x, int y, int w, int h)
 static void paint_window(HDC dc)
 {
     static const struct { WCHAR icon; const WCHAR *name; } nav[PAGE_COUNT] = {
-        { 0xE768, L"Play" }, { 0xE713, L"Settings" }, { 0xE90F, L"Setup" }, { 0xE8EA, L"Phone" } };
-    static const WCHAR *const titles[PAGE_COUNT] = { NULL, L"Settings", L"Setup", L"Android phone" };
+        { 0xE768, L"Play" }, { 0xE713, L"Settings" }, { 0xE90F, L"Setup" }, { 0xE8EA, L"Phone" },
+        { 0xE7BA, L"Report" }, { 0xE8F2, L"My reports" } };
+    static const WCHAR *const titles[PAGE_COUNT] = { NULL, L"Settings", L"Setup", L"Android phone", L"Report a problem", L"My reports" };
     RECT cl, r;
     HBRUSH sb = CreateSolidBrush(C_SIDEBAR);
     WCHAR v[96];
@@ -1353,7 +1388,13 @@ static void draw_button(const DRAWITEMSTRUCT *d)
 static LRESULT CALLBACK wnd_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
+    case WM_NOTIFY:
+        if (reports_notify((const NMHDR *)lp)) return 0;
+        break;
+    case WM_APP_ANTH_REPORT: anth_report_message(msg, wp, lp); return 0;
+    case WM_APP_REPORTS: reports_message(msg, wp, lp); return 0;
     case WM_COMMAND:
+        if (anth_report_command(LOWORD(wp), HIWORD(wp)) || reports_command(LOWORD(wp), HIWORD(wp))) return 0;
         switch (LOWORD(wp)) {
         case ID_ISO_FILE: pick_iso(); save_paths(); refresh(); break;
         case ID_ISO_FOLDER:
@@ -1579,8 +1620,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR args, int show)
             game_command(cmd, MAX_PATH * 2 + 40, exe, argv[2]);
             return write_result(argv[3], cmd);
         }
+        if (!wcscmp(argv[1], L"--report-send") && argc >= 4) {   /* <answers file> <out file>: no window */
+            WCHAR server[300], text[500];
+            int ok;
+            report_server(server, 300);
+            ok = anth_report_send_file(s_dir, PORT_VERSION, server, argv[2], text, 500);
+            return write_result(argv[3], text) || !ok;
+        }
         if (!wcscmp(argv[1], L"--capture")) {
             capture_page = !wcscmp(argv[2], L"settings") ? PAGE_SETTINGS : !wcscmp(argv[2], L"setup") ? PAGE_SETUP
+                         : !wcscmp(argv[2], L"report") ? PAGE_REPORT : !wcscmp(argv[2], L"myreports") ? PAGE_MY_REPORTS
                          : !wcscmp(argv[2], L"phone") ? PAGE_PHONE : PAGE_PLAY;
             capture_file = argv[3];
         }
@@ -1640,6 +1689,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR args, int show)
     }
     make_fonts();
     build_window();
+    build_report_pages();
     check(ID_CLOSE_ON_START, GetPrivateProfileIntW(L"Anthology", L"CloseOnStart", 0, s_ini));
     {
         char v[16] = "";
@@ -1660,6 +1710,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR args, int show)
         SetWindowPos(s_wnd, NULL, -8000, -8000, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         ShowWindow(s_wnd, SW_SHOWNOACTIVATE);
         UpdateWindow(s_wnd);
+        if (capture_page == PAGE_MY_REPORTS) {   /* (the server's answer in the picture) */
+            const ULONGLONG until = GetTickCount64() + 2500;
+            MSG m;
+            while (GetTickCount64() < until) {
+                while (PeekMessageW(&m, NULL, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageW(&m); }
+                Sleep(20);
+            }
+            UpdateWindow(s_wnd);
+        }
         capture_wnd(s_wnd, capture_file);
         DestroyWindow(s_wnd);
         return 0;

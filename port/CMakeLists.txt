@@ -419,7 +419,7 @@ if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/launcher/svr2011_launcher.c")
     # The SvR Anthology launcher (branch anthology): SVR Anthology by Yumboy11 - his installer, then the game
     # with --game_data_root; no mods, no online (launcher/anthology_launcher.c).
     # (Phone page: apk_package.c's install over USB, with updater.c / unzip.c for Google's adb)
-    add_executable(svr2011_anthology_launcher WIN32 launcher/anthology_launcher.c launcher/anthology_disc.c launcher/stfs.c launcher/ui_theme.c launcher/apk_package.c launcher/updater.c launcher/unzip.c launcher/launcher.rc src/utf8.manifest)
+    add_executable(svr2011_anthology_launcher WIN32 launcher/anthology_launcher.c launcher/anthology_disc.c launcher/anth_report.c launcher/report.c launcher/report_send.c launcher/report_match.c launcher/report_receipts.c launcher/reports_tab.c launcher/stfs.c launcher/ui_theme.c launcher/apk_package.c launcher/updater.c launcher/unzip.c launcher/launcher.rc src/utf8.manifest)
     set_target_properties(svr2011_anthology_launcher PROPERTIES OUTPUT_NAME "SvR Anthology Launcher")
     set_property(TARGET svr2011_anthology_launcher PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
     target_link_options(svr2011_anthology_launcher PRIVATE -Wl,/NODEFAULTLIB:libucrt.lib -Wl,/DEFAULTLIB:ucrt.lib

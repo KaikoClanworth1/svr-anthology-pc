@@ -506,6 +506,7 @@ int report_send(const WCHAR *server, const ReportUpload *u, ReportResult *r)
     }
     r->status = (int)status;
     if (status == 200 && json_get(answer, "id", r->id, sizeof r->id) && r->id[0]) {
+        json_get(answer, "secret", r->secret, sizeof r->secret);
         if (json_get(answer, "seen_before", value, sizeof value)) r->seen_before = atoi(value);
         r->match_stored = json_get(answer, "match", value, sizeof value) && !strcmp(value, "true");
         r->mods_sent = mods_in;

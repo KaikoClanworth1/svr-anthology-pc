@@ -58,6 +58,7 @@ public class LauncherActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        ProblemReport.ctx = getApplicationContext();  // (report.txt's "last exit" lines)
         InstallActivity.init(this);
         getWindow().setStatusBarColor(kBackground);
         getWindow().setNavigationBarColor(kBackground);
@@ -478,6 +479,14 @@ public class LauncherActivity extends Activity {
             ViewGroup.LayoutParams.WRAP_CONTENT);
         lp.topMargin = dp(18);
         c.addView(play, lp);
+
+        // Report a problem and My reports, as the port's: they go to the online dashboard's SvR Anthology page.
+        Button report = button("Report a problem…", kBackground);
+        report.setOnClickListener(v -> ReportForm.show(this));
+        c.addView(report, fullWidth(12));
+        Button mine = button("My reports", kBackground);
+        mine.setOnClickListener(v -> ReportsList.show(this));
+        c.addView(mine, fullWidth(8));
 
         TextView tips = text("Play with a controller or the on-screen touch controls (Settings → Touch "
             + "controls). Updates come from the SvR Anthology Launcher on your PC (Phone page).", 13, kDim);
