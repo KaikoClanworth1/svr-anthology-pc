@@ -69,6 +69,8 @@ void ForceAnthologySettings() {
   rex::cvar::SetFlagByName("native_texture_packs", "");
   // (the Anthology's folder: read only)
   rex::cvar::SetFlagByName("allow_game_relative_writes", "false");
+  // (the select screen's "?" tile: the game's random pick, not the port's managers list and M picture)
+  rex::cvar::SetFlagByName("managers_tile", "false");
   REXLOG_INFO("[svr2011] SvR Anthology build (SVR Anthology by Yumboy11): data {}; no mods, no online",
               GameDataFolder().string());
 }

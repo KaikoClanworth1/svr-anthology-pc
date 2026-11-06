@@ -1587,7 +1587,8 @@ void ApplyRecords(uint8_t* base) {
     REXLOG_INFO("[svr2011] superstar mods: test - {} ids absent (id:index:name byte){}", n, absent);
   }
   for (uint32_t id : kPool) {
-    if (ModOf(id)) continue;
+    // (the Anthology: no mods, and Yumboy11 has his own superstars on these ids - they stay as his data says)
+    if (svr2011::kAnthology || ModOf(id)) continue;
     const uint32_t si = Rd16(base + kIdToIndex + id * 2);
     if (si < 512) base[kRecords + si * kRecordSize + kSelectable] = 0;
   }
