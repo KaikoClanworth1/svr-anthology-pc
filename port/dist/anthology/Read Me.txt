@@ -1,6 +1,6 @@
 SVR ANTHOLOGY by Yumboy11 - on the WWE SmackDown vs. Raw 2011 PC recomp
 ==========================================================================
-SVR Anthology PC 1.0.0 (on the SvR 2011 PC recomp 2.1.6 by KaikoClanworth)
+SVR Anthology PC 1.0.1 (on the SvR 2011 PC recomp 2.1.6 by KaikoClanworth)
 
 SVR Anthology is made by Yumboy11. All credit for it goes to Yumboy11 and the
 people he thanks in his own Readme.txt (in his installer's folder):
@@ -21,6 +21,14 @@ game program and a small launcher that runs the Anthology you install yourself:
 Yumboy11 allows his Anthology to be used with this recomp on exactly those
 terms: your own ISO, his own installer, and full credit to him.
 
+
+REPORTING A PROBLEM
+-------------------
+Use the Report page in the launcher, or Report a problem in the phone app.
+Please report problems with this PC version there, not to Yumboy11. The
+report sends your newest logs, crash reports and settings, without passwords,
+and any pictures you add. It never sends Yumboy11's files. My reports shows
+what became of it. Online play stays off.
 
 HOW TO SET IT UP
 ----------------
