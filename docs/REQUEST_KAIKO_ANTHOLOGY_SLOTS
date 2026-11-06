@@ -1,0 +1,117 @@
+# SVR Anthology PC: request for more slots (roster, attires, pac lists)
+
+From Piloun1 (author of *The Ultimate SvR Editor*, an editor for SvR 2008-2011 / SVR Anthology:
+https://github.com/Piloun1/piloun1-svr-edit). Written 2026-11-07, about **svr-anthology-pc 1.0.2**.
+
+First: thank you for 1.0.2. The 137 superstars hidden by `ApplyRecords` / `kPool` are back (Downloaded Superstars
+tile), I had patched the 1.0.1 exe myself to check that this was the cause.
+
+I add and port characters into Yumboy11's Anthology (WWE 2K14 / 2K15 models, moves, entrances, attires), and I am
+stuck on slot limits. Below: what is full today, measured on my install, and what could be changed, from the easiest
+to the biggest. Everything was read from the game files and from your public sources (MIT); nothing of yours was run.
+
+\---
+
+## 1\. What is full in Anthology (measured on my install, DLC records included)
+
+|Limit|Used / max|Free|
+|-|-|-|
+|Superstar records (id -> index table `u16\\\\\\\[322]` at guest `0x82DB3610`, ids 50-69 and 100-321)|**241 / 242**|1 (id 242)|
+|Ids 70-99 (present, no index: DLC ids)|30 / 30 used by Yumboy11's DLC|0|
+|Your `kPool` ids (137: 72 blank + 65 absent on the disc)|**137 / 137 used by Yumboy11**|0|
+|Attire table (COS, `misc.pac` `BATH\\\\\\\\INIT` child 5), your A3|**129 / 129** (HD) ; 67 / 129 (4:3)|0|
+|Pac lists `pac\\\\\\\\pliANTHO.h` (and the 7 other modes' lists)|**6 125 / 6 144 bytes**, 379 / 512 lines|\~1 new `.pac` line|
+|Attires per superstar (select menu, 7 lines)|7|(rule)|
+
+So in Anthology, **your D14 "route A" (remap onto the 137 live kPool ids) frees nothing**: Yumboy11 already put a
+character on every one of those ids. Only a roster bigger than 242 (D14 "route B", `big\\\\\\\_roster`) can add characters.
+
+\---
+
+## 2\. Requests, easiest first
+
+### R1. Attire table: 129 -> 400 places (A3) — small, already tested in game
+
+I patched these exact values into **svr2011.exe 1.0.1** and launched it on an "all attires" table (175 records, the
+four mode tables merged): **it works in game in your recomp** (tested 2026-11-06). The same 400-place change is also
+in a separate `defaultTENUES.xex` for Xenia.
+
+Change in `port/tools/anthology\\\\\\\_redo.py` (same substitutions as today, bigger numbers):
+
+```python
+# A3: a table of 80 entries of 40 bytes (count at +3200) -> 400 entries (count at +16000)
+('A3', 'sub\\\\\\\_828C40D0', \\\\\\\[('ctx.r3.s64 = 3204;', 'ctx.r3.s64 = 16004;', 1),
+                        # (the other allocation path, in 16-byte units: 201 -> 1001, room for the 16004)
+                        ('ctx.r3.s64 = 201;', 'ctx.r3.s64 = 1001;', 1)]),
+('A3', 'sub\\\\\\\_828C3F28', \\\\\\\[('ctx.r9.s64 = 80;', 'ctx.r9.s64 = 400;', 1),
+                        ('ctx.r3.u32 + 3200', 'ctx.r3.u32 + 16000', 1)]),
+('A3', 'sub\\\\\\\_828C3F70', \\\\\\\[('ctx.r3.u32 + 3200', 'ctx.r3.u32 + 16000', 1)]),
+('A3', 'sub\\\\\\\_828C3FF8', \\\\\\\[('ctx.r3.u32 + 3200', 'ctx.r3.u32 + 16000', 1)]),
+('A3', 'sub\\\\\\\_828C4060', \\\\\\\[('ctx.r3.u32 + 3200', 'ctx.r3.u32 + 16000', 1)]),
+('A3', 'sub\\\\\\\_828C4140', \\\\\\\[('ctx.r3.u32 + 3200', 'ctx.r3.u32 + 16000', 1)]),
+('A3', 'sub\\\\\\\_828C4400', \\\\\\\[('ctx.r3.u32 + 3200', 'ctx.r3.u32 + 16000', 1),
+                        ('ctx.r28.u32 + 3200', 'ctx.r28.u32 + 16000', 1)]),
+```
+
+Why it is safe: the loader `sub\\\\\\\_828C4400` copies as many 40-byte records as the file declares, **without any bound**,
+so the table must only be at least as big as the file. Yumboy11's files have 129 records, so nothing changes for them;
+modders get room for 271 more. (Same remark for vanilla 2011, where your D14 note lists "COS attire from misc.pac (80
+records)" as a remaining limit.)
+
+In the 1.0.1 binary, the ten compiled values were (RVA of the function, offset, 129-place value -> 400-place value):
+`0x48DADF0` +0xA7 5164 -> 16004, +0xC6 323 -> 1001, +0x11A 129 -> 400, +0x133 5160 -> 16000, +0x15B 129 -> 400 (loop
+counter, the r9 value compiled twice); `0x48DB300` +0x3, `0x48DB460` +0x41, `0x48DB600` +0x3, `0x48DB790` +0x4E,
+`0x48DD840` +0x1E0: 5160 -> 16000 (file offset = RVA - 0xC00).
+
+### R2. Bigger pac lists (`.h`) — small to medium
+
+`CYFilePacListLoader` (same function in all four SvR games; Anthology guest `0x826B97F0`, SvR 2011 `0x826B902C`)
+reserves **6 144 bytes** for the `.h` file and a table of **512 lines** (64-byte names). Yumboy11's lists are at
+6 122-6 125 bytes, so a new character can no longer get its own `ch\\\\\\\\NNN.pac` (my tool now stores new attires inside an
+existing pac, like Yumboy11 does for 37 superstars, but that is a workaround). A hook giving e.g. 32 KB / 2 048 lines
+would remove this limit. Please also check the headroom of the pac directory memory (A1, 0x4B000 bytes) when more
+pacs are mounted.
+
+Gotcha if you ever mount Anthology from the pacs' own tables (your `PacListFolder` / `SVR2011\\\\\\\_TEST\\\\\\\_PLIST` path,
+`sub\\\\\\\_825953B0`): it **crashes on Anthology** (I tried it on 1.0.1: "read of guest 0x30414000", lr in `sub\\\\\\\_826B87B0`,
+r8 = 'EMD ', r7 = '0202'). Cause: 13 Anthology pacs have a TOC header that disagrees with `plist360.arc`:
+`ch\\\\\\\\101.pac`, `ch\\\\\\\\102.pac`, `ch\\\\\\\\59.pac` count their EMD directory with 3 words too many (59/56, 51/48, 55/52; the .arc
+is right), so the search walks 12 bytes past the end of `ch\\\\\\\\101.pac` and off the 0x4B000 directory memory; the others
+have entries renamed only in the .arc (`MatchHD.pac`: 81 `/MENU/000L…` names, your A5; `evtgdhd.pac`,
+`E4 / W0 / EC / ED.pac`, `dhb.pac`, `py2.pac`) or a different size (`menu.pac`, `ch\\\\\\\\241.pac`). The game itself only
+reads the .arc, so Anthology is fine as shipped; but any feature that trusts the pacs' own TOCs needs the .arc
+sections instead. Also: Yumboy11 numbers the .arc sections of lines 248-378 by **pac number**, not by line; the game
+(`sub\\\\\\\_826B9350`) ignores that number (k-th non-empty section = line k), so tools must too.
+
+### R3. More than 242 superstars in Anthology (your D14 route B / `big\\\\\\\_roster`) — big
+
+This is the one that really adds slots. Facts from Anthology that may help:
+
+* Every index 0-241 is used (ids 50-69, 100-321 except 242), ids 70-99 are all used by DLC characters, the 137
+`kPool` ids are all Yumboy11's. New characters therefore need **indices >= 242 and ids >= 322** (the `u16\\\\\\\[322]`
+table at `0x82DB3610`, its reverse `u16\\\\\\\[242]` at `0x82DB3898`, the present table `u8\\\\\\\[322]` at `0x82DB3AE0`).
+* Save: records 242 x 260 B and profiles 242 x 1 056 B at fixed offsets (your D14 note); a side file for the
+extension (like your planned `00mods.dat`) would keep `SaveData.dat` compatible with Xenia, which matters to
+Anthology players who move saves between the two.
+* Per-id data that a new id needs (what my tool writes when it adds a character): `chEtc.pac` CHAR/DAT (264 B record)
+and CHAR/PRO (profile: moveset, entrance block at +0x1C0), COS attire records, `ch\\\\\\\\NNN.pac` (or a host pac), renders
+(SSFA / SSFB / SSFC, icon SSFD) by id, name text ids in `string.pac`, the announcer's name.
+* Anthology also has 8 modes (8 xex, each with its own `.h` list; 4 different COS tables: `pac\\\\\\\\misc.pac`,
+`pac\\\\\\\\07\\\\\\\\misc.pac`, `pac\\\\\\\\rr\\\\\\\\misc.pac`, `pac\\\\\\\\lm\\\\\\\\misc.pac`): an extension would have to work for every mode.
+
+### R4. Optional: mods in the Anthology build
+
+1.0.2 still says "No mods, no Mod Maker". If superstar mods were allowed in the Anthology build (with route B or with
+your remap), modders could add characters without touching Yumboy11's files at all.
+
+\---
+
+## 3\. What I can do to help
+
+* Test any build in game (Xenia and your recomp) and report precisely (logs, crash files).
+* Provide data dumps from Anthology (records, profiles, COS tables, .h / .arc sections) or check a list of ids.
+* My tool already reads and writes the COS table up to 400 places, the `.h` lists and the `.arc` sections the way the
+game reads them, and reports the limits above ("Limits of the game" window), so I can check a change right away.
+
+Thanks again for the recomp and for 1.0.2.
+
