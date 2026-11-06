@@ -69,7 +69,7 @@ static void do_send(Send *s)
         return;
     }
     report_signature(s->dir, sig, sizeof sig);
-    json = report_json("anthology", ver, s->kind, s->often, s->what, s->before, s->contact, sig);
+    json = report_json("anthology", ver, s->kind, s->often, s->what, s->before, s->contact, sig, "");
     if (!json) {
         wcscpy_s(s->r.why, 300, L"Out of memory.");
         return;

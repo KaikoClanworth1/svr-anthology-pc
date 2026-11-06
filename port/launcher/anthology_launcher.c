@@ -124,21 +124,6 @@ static int S(int v) { return MulDiv(v, s_dpi, 96); }
 
 /* ---- files and folders ---- */
 
-static int join(WCHAR *out, const WCHAR *a, const WCHAR *b)
-{
-    size_t n = wcslen(a);
-    return swprintf_s(out, MAX_PATH, n && a[n - 1] == L'\\' ? L"%s%s" : L"%s\\%s", a, b) > 0;
-}
-static int file_exists(const WCHAR *p)
-{
-    DWORD a = GetFileAttributesW(p);
-    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
-}
-static int dir_exists(const WCHAR *p)
-{
-    DWORD a = GetFileAttributesW(p);
-    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
-}
 static int has_file(const WCHAR *dir, const WCHAR *name)
 {
     WCHAR p[MAX_PATH];
