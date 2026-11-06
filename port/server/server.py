@@ -722,10 +722,11 @@ class Service:
                                  secret=relay.rl.read_secret(args.relay_secret) if edge else None,
                                  network=lambda: SETTINGS["match_network"])
         self.leaderboards = leaderboards.Leaderboards(self.store)
-        # the ONLINE menu's NEWS: how many play now, first; then the dashboard's
-        # text (online_news) when it has one, else the stored record's
-        self.sake.news_prefix = lambda: "%d player%s online now. " % (
-            self.stats.playing_now(), "" if self.stats.playing_now() == 1 else "s")
+        # the ONLINE menu's NEWS: how many look for a match now, first; then the dashboard's
+        # text (online_news) when it has one, else the stored record's. (" online now. " stays in the line: the
+        # game rewrites its news panel only over a text that has it - online.cpp SetOnlineNews)
+        self.sake.news_prefix = lambda: (lambda n: "%d player%s looking for a match online now. " % (
+            n, "" if n == 1 else "s"))(self.looking_for_match())
         self.sake.news_text = lambda: news_fields(SETTINGS["online_news"])
         self.sake.refuse_unmarked = lambda: SETTINGS["cc_unmarked"] == "refuse" and release_at_least(
             SETTINGS["latest_release"], MODFREE_SINCE)
@@ -847,6 +848,9 @@ class Service:
                                                                 "code the server owner gives you."}, status=403)
             # (account_checks off: as before 2.1.6 - an account without a code: it needs a re-activation code once on)
             account, error = await loop.run_in_executor(None, self.accounts.register, name, password, ip)
+        elif register and self.signup.relaxed() and not str(body.get("invite", "")).strip():
+            # (account_checks off and no code typed: an account as before 2.1.6 - it needs a re-activation code once on)
+            account, error = await loop.run_in_executor(None, self.accounts.register, name, password, ip)
         elif register:
             account, error = await loop.run_in_executor(None, self.signup.register, name, password,
                                                         str(body.get("invite", "")), ip)
@@ -952,6 +956,18 @@ class Service:
             if t - v["seen"] <= LIVE_LIFE:
                 names |= {p["name"] for p in v["players"] if p.get("name")}
         return len(names)
+
+    def looking_for_match(self):
+        """Players looking for a match now (the in-game NEWS line): searching or on the ONLINE MATCH screens (the
+        presence poll's place "matchmaking", 2.1.7 on), or hosting a lobby others can find (place "lobby_host"; any
+        game's: the live reports of sessions still in the lobby). Not players in a match - a started session isn't
+        offered to searches - nor ones who joined a lobby."""
+        t = now()
+        ids = {a for a, (place, _) in list(self.stats.places.items())
+               if place in ("matchmaking", "lobby_host") and t - self.stats.recent.get(a, 0) < SETTINGS["presence_window"]}
+        ids |= {v["host_id"] for v in list(self.live.values())
+                if v.get("host_id") and v.get("state") == "lobby" and t - v["seen"] <= LIVE_LIFE}
+        return len(ids)
 
     def presence(self, account_id):
         """playing: in an online match or its lobby (its game has the relay open);
@@ -1063,7 +1079,7 @@ class Service:
         old = self.live.get(sid, {})
         state = str(body.get("state") or "lobby")[:12]
         self.live[sid] = {
-            "session": sid, "host": account["name"], "kind": str(body.get("kind") or "")[:40],
+            "session": sid, "host": account["name"], "host_id": account["id"], "kind": str(body.get("kind") or "")[:40],
             "rule": str(body.get("rule") or "")[:40],
             "rule_name": match_names.rule_name(str(body.get("rule") or "")) or "", "arena": str(body.get("arena") or "")[:40],
             "arena_name": match_names.arena_name(body.get("arena"), str(body.get("arena_mod") or "")[:60]),
@@ -1125,7 +1141,7 @@ class Service:
 
     # The games' per-match connection reports (p2p.cpp): how online matches
     # connected - only counts per day, nothing about who or from where.
-    NET_PATHS = ("direct", "relay", "lan")
+    NET_PATHS = ("direct", "ipv6", "relay", "lan")
     NET_NATS = ("cone", "symmetric", "mapped", "open", "unknown")
     NET_RTT = (50, 100, 150, 250, 400, 100000)  # (upper bounds, ms)
 
@@ -1144,6 +1160,10 @@ class Service:
             rtt = max(0, int(body.get("rtt") or 0))
             version = re.sub(r"[^0-9A-Za-z.\-]", "", str(body.get("version") or ""))[:24] or "?"
             network = str(body.get("network") or "")  # (2.1.4 on: the match network it played on)
+            # (2.2.0 on: "ipv6": true beside path "direct". A server before that doesn't know the field and counts a
+            # direct match; a path it doesn't know it would refuse, and the report would be lost)
+            if path == "direct" and body.get("ipv6") is True:
+                path = "ipv6"
         except (ValueError, TypeError, AttributeError):
             return web.json_response({"ok": False}, status=400)
         if path not in self.NET_PATHS or nat not in self.NET_NATS:
@@ -1224,7 +1244,8 @@ class Service:
         return web.json_response({"ok": False}, status=404)
 
     async def api_status(self, request):
-        return web.json_response({"ok": True, "server": "svr2011-community", "version": 1})
+        return web.json_response({"ok": True, "server": "svr2011-community", "version": 1,
+                                  "invite_needed": not self.signup.relaxed()})  # (sign-up asks for a code)
 
     # the port's logo store
 
@@ -1641,12 +1662,36 @@ class Service:
         info, _ = discovery.get(self.store, mid, True)
         return web.json_response({"ok": True, "mod": info})
 
+    def mod_admin_key(self, request):
+        """The storage node's key (X-Storage-Key) on a core that has a node: an admin's update of any mod from the
+        PC (the bulk movie shrink) - through /svr/api/mods/{id}/file, whose nginx location takes big bodies."""
+        key = request.headers.get("X-Storage-Key", "")
+        return bool(self.node_key and key and hmac.compare_digest(key, self.node_key))
+
     async def api_mod_update_file(self, request):
-        """PUT multipart: svrmod (the new file) + version (a new one); maybe name / tags / description / types."""
+        """PUT multipart: svrmod (the new file) + version (a new one); maybe name / tags / description / types.
+        Its owner's (Bearer), or an admin's with the storage node's key (mod_admin_key)."""
         mid = self._mod_id(request)
+        if self.mod_admin_key(request):
+            if mid is None or discovery.owner_of(self.store, mid) is None:
+                return web.json_response({"ok": False, "error": "No such mod."}, status=404)
+            return await self.mod_update_file(request, mid, None)
         account, err = self.mod_owner_check(request, mid)
         if err:
             return err
+        return await self.mod_update_file(request, mid, account)
+
+    @admin_only
+    async def admin_mod_update_file(self, request):
+        """The dashboard's PUT of a mod's new version (as api_mod_update_file; the owner stays)."""
+        mid = self._mod_id(request)
+        if mid is None or discovery.owner_of(self.store, mid) is None:
+            return web.json_response({"ok": False, "error": "No such mod."}, status=404)
+        return await self.mod_update_file(request, mid, None)
+
+    async def mod_update_file(self, request, mid, account):
+        """A new version of mod mid from its owner (account), or from an admin (None): then no quota, and the
+        owner, author, id and downloads stay all the same; the form's "why" goes in the log."""
         length = request.content_length
         if not length:
             return web.json_response({"ok": False, "error": "no length"}, status=411)
@@ -1657,7 +1702,7 @@ class Service:
             return web.json_response({"ok": False, "error": "Another mod is being stored - try again in a minute."},
                                      status=503)
         async with self.mod_upload:
-            raw, data, file_name = {}, None, ""
+            raw, data, file_name, admin_why = {}, None, "", "admin"
             reader = await request.multipart()
             while True:
                 part = await reader.next()
@@ -1669,6 +1714,8 @@ class Service:
                     data = await part.read()
                 elif name in discovery.MAX_TEXT or name == "types":
                     raw[name] = (await part.text()).strip()[:discovery.MAX_TEXT.get(name, 100)]
+                elif name == "why" and account is None:
+                    admin_why = (await part.text()).strip()[:60] or admin_why
                 else:
                     await part.release()
             fields, why = self.mod_fields(raw)
@@ -1685,17 +1732,19 @@ class Service:
                 why = self.names_why(account, *fields.values())
             if not why:
                 manifest, why = await loop.run_in_executor(None, discovery.check_svrmod, data)
-            if not why:
+            if not why and account:
                 why = self.mod_quota_why(account, len(data), but=mid)
+            by = "its owner" if account else "admin (%s)" % admin_why
             if why:
-                gs.log("discovery: update of mod %d from %s refused: %s" % (mid, account["name"], why))
+                gs.log("discovery: update of mod %d from %s refused: %s" % (
+                    mid, account["name"] if account else by, why))
                 return web.json_response({"ok": False, "error": why}, status=400)
             fields["needs"] = manifest.get("needs", "")[:20]  # (the new file's own)
             was = await loop.run_in_executor(None, discovery.replace_file, self.store, mid, data, file_name, fields)
             if was is None:
                 return web.json_response({"ok": False, "error": "No such mod."}, status=404)
-            gs.log("discovery: mod %d updated by its owner (file) %s -> %s (%d bytes, %s)" % (
-                mid, was, fields["version"], len(data), manifest.get("type", "?")))
+            gs.log("discovery: mod %d updated by %s (file) %s -> %s (%d -> %d bytes, %s)" % (
+                mid, by, was, fields["version"], (old or {}).get("size", 0), len(data), manifest.get("type", "?")))
             info, _ = discovery.get(self.store, mid, True)
             return web.json_response(dict({"ok": True, "mod": info}, **self.mod_size_warning(len(data))))
 
@@ -1984,7 +2033,8 @@ class Service:
     async def api_report(self, request):
         """multipart: report (JSON), zip (optional), image0-image4 (optional png / jpg / webp), match (the match
         folder's zip, optional), mod0..modN (a mod's zip each, named <content hash>.zip: only those the check
-        asked for) -> {ok, id, signature, seen_before, match, mods_stored, mods_refused}"""
+        asked for) -> {ok, id, secret (the sender's receipt: its Reports list asks with it), signature, seen_before,
+        match, mods_stored, mods_refused}"""
         def no(status, why):
             return web.json_response({"ok": False, "error": why}, status=status)
         length = request.content_length
@@ -2099,13 +2149,177 @@ class Service:
                    "seen %d before" % (got["id"], meta["app"], meta["version"], meta["problem"], len(zip_bytes) >> 10,
                                        len(images), len(match_bytes) >> 10, len(mod_files), len(stored),
                                        got["signature"], got["seen_before"]))
-            return web.json_response({"ok": True, "id": got["id"], "signature": got["signature"],
+            return web.json_response({"ok": True, "id": got["id"], "secret": got.get("secret", ""),
+                                      "signature": got["signature"],
                                       "seen_before": got["seen_before"], "match": bool(match_bytes),
                                       "mods_stored": stored, "mods_refused": refused})
         finally:
             for path in mod_files.values():
                 if os.path.exists(path):
                     os.remove(path)
+
+    STATUS_LIMIT = (600, 60)  # receipt lookups per IP: 60 in 10 minutes (a launcher asks when its tab opens)
+
+    async def api_report_status(self, request):
+        """{"reports": [{"id", "secret"}, ...]} (100 at most; signed in: the account's other reports too) ->
+        {ok, reports: [{id, state, received, app, problem, what, note, version, question, date, replies,
+        from_account}]} - state: received / looking / fixed / needs_info / replied / done / duplicate / unknown
+        (no such report, or not its secret). Never another report, never the logs, zip, pictures or contact."""
+        t, q = now(), self.check_times["status:" + self.client_ip(request)]
+        while q and q[0] < t - self.STATUS_LIMIT[0]:
+            q.popleft()
+        if len(q) >= self.STATUS_LIMIT[1]:
+            return web.json_response({"ok": False, "error": "Too many lookups from here - try again later."}, status=429)
+        q.append(t)
+        try:
+            receipts = (await request.json()).get("reports")
+        except (ValueError, AttributeError):
+            return web.json_response({"ok": False, "error": "Send {\"reports\": [{\"id\", \"secret\"}]} as JSON."},
+                                     status=400)
+        if not isinstance(receipts, list):
+            return web.json_response({"ok": False, "error": "reports: a list"}, status=400)
+        account = self.raw_account(request)  # (a blocked account still owns its reports)
+        try:
+            rows = await asyncio.get_running_loop().run_in_executor(
+                None, self.reports.status, receipts[:reports.MAX_STATUS_IDS], account["name"] if account else None)
+        except Exception:
+            return web.json_response({"ok": False, "error": "The report store didn't answer - try again later."},
+                                     status=503)
+        return web.json_response({"ok": True, "reports": rows})
+
+    async def api_report_reply(self, request):
+        """multipart: report (JSON {id, secret, text}), image0-image2 (optional) -> {ok} / {ok: false, error}: the
+        sender's answer to a question we asked (needs_info). Rate-limited as reports, through the name filter."""
+        def no(status, why):
+            return web.json_response({"ok": False, "error": why}, status=status)
+        if (request.content_length or 0) > reports.MAX_REPLY_IMAGES * reports.MAX_IMAGE + (1 << 20):
+            return no(413, "The answer is too large (pictures: %d MB each)." % (reports.MAX_IMAGE >> 20))
+        meta, images = None, {}
+        try:
+            reader = await request.multipart()
+            while True:
+                part = await reader.next()
+                if part is None:
+                    break
+                name = part.name or ""
+                cap = (64 << 10 if name in ("report", "report.json") else
+                       reports.MAX_IMAGE if re.fullmatch(r"image[0-%d]" % (reports.MAX_REPLY_IMAGES - 1), name) else 0)
+                if not cap:
+                    await part.release()
+                    continue
+                data = bytearray()
+                while True:
+                    chunk = await part.read_chunk(1 << 16)
+                    if not chunk:
+                        break
+                    data += chunk
+                    if len(data) > cap:
+                        return no(413, "%s is too large." % name)
+                if name in ("report", "report.json"):
+                    try:
+                        meta = json.loads(bytes(data).decode("utf-8-sig"))
+                    except ValueError:
+                        return no(400, "report: not valid JSON")
+                else:
+                    images[int(name[5:])] = bytes(data)
+        except (ValueError, AssertionError, KeyError):
+            return no(400, "Send it as multipart/form-data.")
+        if not isinstance(meta, dict):
+            return no(400, "No report part.")
+        text = str(meta.get("text") or "").replace("\r\n", "\n").strip()[:reports.MAX_REPLY]
+        if not text and not images:
+            return no(400, "Write an answer first.")
+        for n, img in sorted(images.items()):
+            if not reports.image_ext(img):
+                return no(400, "image%d: only PNG, JPEG or WebP pictures." % n)
+        if reports.has_url(text):
+            return no(400, reports.url_refusal())
+        if text and self.names.check(text):
+            return no(400, "Your answer has a word that isn't allowed - please write it without it.")
+        ip = self.client_ip(request)
+        account = self.raw_account(request)
+        if self.report_throttled(["reply:" + ip] + (["reply-acc:%d" % account["id"]] if account else [])):
+            return no(429, "Too many answers from here - try again later.")
+        try:
+            ok, why = await asyncio.get_running_loop().run_in_executor(
+                None, self.reports.reply, str(meta.get("id") or ""), meta.get("secret"), text,
+                [images[n] for n in sorted(images)], account["name"] if account else None)
+        except Exception:
+            return no(503, "The report store didn't answer - try again later.")
+        if not ok:
+            return no(404 if why == "No such report." else 409, why)
+        gs.log("reports: %s answered (%d chars, %d pictures)" % (meta.get("id"), len(text), len(images)))
+        return web.json_response({"ok": True})
+
+    async def api_report_edit(self, request):
+        """multipart: report (JSON {id, secret, what, before, contact}), image0-image4 (optional) -> {ok, edits,
+        pictures} / {ok: false, error}: the sender adds to a report it sent - more of what happened / before, a new
+        contact, pictures (5 a report in all) - until it's done or a duplicate. Kept as an edit history beside the
+        report (reports.edit). Rate-limited as reports, through the name filter."""
+        def no(status, why):
+            return web.json_response({"ok": False, "error": why}, status=status)
+        if (request.content_length or 0) > reports.MAX_IMAGES * reports.MAX_IMAGE + (1 << 20):
+            return no(413, "The change is too large (pictures: %d MB each)." % (reports.MAX_IMAGE >> 20))
+        meta, images = None, {}
+        try:
+            reader = await request.multipart()
+            while True:
+                part = await reader.next()
+                if part is None:
+                    break
+                name = part.name or ""
+                cap = (64 << 10 if name in ("report", "report.json") else
+                       reports.MAX_IMAGE if re.fullmatch(r"image[0-%d]" % (reports.MAX_IMAGES - 1), name) else 0)
+                if not cap:
+                    await part.release()
+                    continue
+                data = bytearray()
+                while True:
+                    chunk = await part.read_chunk(1 << 16)
+                    if not chunk:
+                        break
+                    data += chunk
+                    if len(data) > cap:
+                        return no(413, "%s is too large." % name)
+                if name in ("report", "report.json"):
+                    try:
+                        meta = json.loads(bytes(data).decode("utf-8-sig"))
+                    except ValueError:
+                        return no(400, "report: not valid JSON")
+                else:
+                    images[int(name[5:])] = bytes(data)
+        except (ValueError, AssertionError, KeyError):
+            return no(400, "Send it as multipart/form-data.")
+        if not isinstance(meta, dict):
+            return no(400, "No report part.")
+        what, before = (str(meta.get(k) or "").replace("\r\n", "\n").strip()[:reports.MAX_EDIT_TEXT]
+                        for k in ("what", "before"))
+        contact = str(meta.get("contact") or "").replace("\n", " ").strip()[:200]
+        if not (what or before or contact or images):
+            return no(400, "Write what to add, or add a picture.")
+        for n, img in sorted(images.items()):
+            if not reports.image_ext(img):
+                return no(400, "image%d: only PNG, JPEG or WebP pictures." % n)
+        if any(reports.has_url(t) for t in (what, before, contact)):
+            return no(400, reports.url_refusal())
+        if any(t and self.names.check(t) for t in (what, before, contact)):
+            return no(400, "Your text has a word that isn't allowed - please write it without it.")
+        ip = self.client_ip(request)
+        account = self.raw_account(request)
+        if self.report_throttled(["edit:" + ip] + (["edit-acc:%d" % account["id"]] if account else [])):
+            return no(429, "Too many changes from here - try again later.")
+        try:
+            ok, result = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: self.reports.edit(str(meta.get("id") or ""), meta.get("secret"), what, before, contact,
+                                                [images[n] for n in sorted(images)],
+                                                account["name"] if account else None))
+        except Exception:
+            return no(503, "The report store didn't answer - try again later.")
+        if not ok:
+            return no(404 if result == "No such report." else 409, result)
+        gs.log("reports: %s edited (%d + %d chars, %d pictures%s)" % (meta.get("id"), len(what), len(before),
+                                                                     len(images), ", contact" if contact else ""))
+        return web.json_response({"ok": True, "edits": result.get("edits", 0), "pictures": result.get("pictures", 0)})
 
     @admin_only
     async def admin_reports(self, request):
@@ -2942,11 +3156,14 @@ class Service:
         app.router.add_post(b + "/api/mods", self.api_mod_upload)
         app.router.add_route("*", b + "/api/mods/{id}", self.api_mod)  # (GET; PATCH / DELETE: its owner)
         app.router.add_get(b + "/api/mods/{id}/file", self.api_mod_file)
-        app.router.add_put(b + "/api/mods/{id}/file", self.api_mod_update_file)  # (its owner: an update)
+        app.router.add_put(b + "/api/mods/{id}/file", self.api_mod_update_file)  # (an update: its owner, or the node's key)
         app.router.add_put(b + "/api/mods/{id}/pictures/{n}", self.api_mod_update_picture)  # (its owner)
         app.router.add_get(b + "/api/mods/{id}/img/{n}", self.api_mod_image)
         app.router.add_post(b + "/api/reports", self.api_report)
         app.router.add_post(b + "/api/reports/mods/check", self.api_report_mods_check)
+        app.router.add_post(b + "/api/reports/status", self.api_report_status)
+        app.router.add_post(b + "/api/reports/reply", self.api_report_reply)
+        app.router.add_post(b + "/api/reports/edit", self.api_report_edit)
         self.relay.routes(app, b)
         app.router.add_get("/__health", self.health)
         app.router.add_get(b + "/api/storage/wanted", self.api_storage_wanted)  # (the storage node's watchdog)
@@ -2969,6 +3186,7 @@ class Service:
             app.router.add_post(p + "/api/admin/blobs/{sha}/delete", self.admin_blob_delete)
             app.router.add_get(p + "/api/admin/mod/{id}/image.jpg", self.admin_mod_image)
             app.router.add_post(p + "/api/admin/mod/{id}/{action}", self.admin_mod_action)
+            app.router.add_put(p + "/api/admin/mods/{id}/file", self.admin_mod_update_file)  # (a new version, owner kept)
             app.router.add_get(p + "/api/admin/users", self.admin_users)
             app.router.add_get(p + "/api/admin/reports", self.admin_reports)
             app.router.add_get(p + "/api/admin/report/{id}/replay.zip", self.admin_report_replay)
@@ -3192,6 +3410,10 @@ def main():
                          "code for online play (the accounts' old rules)")
     ap.add_argument("--activate", default=None, metavar="NAME",
                     help="let this account play online without a re-activation code, then exit")
+    ap.add_argument("--prune-accounts", type=float, default=None, metavar="DAYS",
+                    help="list the accounts made more than DAYS ago and not seen for DAYS (with --yes: delete them, "
+                         "as the dashboard's Delete does), then exit - with the server stopped")
+    ap.add_argument("--yes", action="store_true", help="(--prune-accounts) really delete")
     args = ap.parse_args()
     if args.set_admin_password:
         return aa.set_password_cli(args.admin_password_file or os.path.join(args.data, "admin_password"))
@@ -3208,6 +3430,27 @@ def main():
             store.db.commit()
         print("%s: %s" % (args.activate, "active" if n else "no such account"))
         sys.exit(0 if n else 1)
+    if args.prune_accounts is not None:
+        if args.role == "storage":
+            ap.error("--prune-accounts: a storage node has no accounts (run it where the core's data is)")
+        store = gs.Store(args.data)
+        accounts = Accounts(store)
+        leaderboards.Leaderboards(store)  # (its tables: a delete clears the account's rows)
+        cut = now() - args.prune_accounts * 86400
+        with store.lock:
+            rows = store.db.execute("SELECT id, name, created, last_seen, banned FROM accounts WHERE created < ? AND "
+                                    "COALESCE(last_seen, 0) < ? ORDER BY last_seen", (cut, cut)).fetchall()
+        day = lambda t: time.strftime("%Y-%m-%d", time.localtime(t)) if t else "never"
+        for aid, name, created, seen, banned in rows:
+            print("%6d  %-16s made %s  last seen %s%s" % (aid, name, day(created), day(seen),
+                                                          "  (banned)" if banned else ""))
+        print("%d account(s) made more than %g days ago and not seen since" % (len(rows), args.prune_accounts))
+        if not args.yes:
+            print("(nothing deleted: add --yes to delete them)")
+            sys.exit(0)
+        records = sum(accounts.delete(aid) for aid, *_ in rows)
+        print("deleted %d account(s) and %d Community Creations record(s)" % (len(rows), records))
+        sys.exit(0)
     if args.relay_edge and (not args.relay_secret or not args.relay_udp_port):
         ap.error("--relay-edge needs --relay-secret and --relay-udp-port")
     # (a storage node never relays: linked to the edge too, it took half the

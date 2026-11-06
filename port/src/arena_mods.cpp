@@ -73,6 +73,7 @@
 #include "../modmaker/svrfmt/pac.h"
 #include "../modmaker/svrfmt/texture.h"
 #include "../modmaker/svrfmt/jboy.h"
+#include "util.h"
 
 namespace {
 
@@ -86,8 +87,9 @@ fs::path g_game, g_overlay;
 bool g_overlay_ready = false;
 std::string g_redirect[100];  // arena number -> relative file ("" = original)
 int g_number_for[100];        // arena number -> the number a match there plays as (0: its own), see RedirectArena
-// arena number -> the arena a match picked there plays as (0: its own): a custom arena on another arena's tile plays
-// as its base arena (FollowCursor), whose file is the custom one
+// arena number -> the arena a match picked there plays as, + 1 (0: its own - stored + 1 so that a base of arena 0,
+// SmackDown, isn't taken for none: a mod built on SmackDown played its tile's stock arena, 30 Oct report): a custom
+// arena on another arena's tile plays as its base arena (FollowCursor), whose file is the custom one
 int g_plays_as[100];
 std::string g_default[100];   // arena number -> its file when no custom arena is on its tile (media mods: screens)
 // The served file's STG entries whose size differs from the shipped file's (RedirectArena): the game reads an entry
@@ -125,11 +127,7 @@ std::vector<std::pair<StgEntry, size_t>> StgEntries(const char* head, size_t n) 
   return out;
 }
 
-std::string Upper(std::string s) {
-  for (char& c : s) c = char(std::toupper(static_cast<unsigned char>(c)));
-  return s;
-}
-
+using svr2011::NowMs, svr2011::Upper;
 // Makes the file system see overlay/<name> as it is now: the host device
 // indexes a folder created after startup lazily, and keeps a file's size
 // from when it first saw it.
@@ -229,6 +227,7 @@ bool g_bpe_log = false;
 // u32 and byte) kept across requests; "hex:<bytes>" finds a byte pattern.
 void StartScan() {
   std::thread([] {
+    rex::thread::set_current_thread_name("arena scan");
     const fs::path trigger = g_game / "scan.txt";
     std::string last_text;
     std::vector<uint32_t> cand32, cand8;
@@ -589,10 +588,6 @@ void LoadCustomArenas() {
 
 int Pages() { return 1 + int(g_layout.size()); }
 
-int64_t NowMs() {
-  return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
-      .count();
-}
 
 // Finds each banner in guest physical memory (4 KB view) by a run of blocks.
 // A block of the banner to look for it by: one of two colours mixed (a flat
@@ -1288,7 +1283,7 @@ void PointAt(const CustomArena* c, int tile) {
   if (!c || tile < 0) return;
   svr2011::RedirectArena(as, TitantronFile(*c));
   g_redirected_host = tile, g_redirected_file = as;
-  if (as != tile) g_plays_as[tile] = as;
+  if (as != tile) g_plays_as[tile] = as + 1;  // (+1: 0 is none - a base of 0, SmackDown, is 1)
 }
 
 // The custom arena on the tile under the cursor is the one played.
@@ -1354,7 +1349,7 @@ void LiveArenaPlaysAs(uint8_t* base) {
   uint8_t* q = base + 0x82E3DE40;
   const uint32_t arena = uint32_t(q[0]) << 24 | uint32_t(q[1]) << 16 | uint32_t(q[2]) << 8 | q[3];
   if (arena >= 100 || !g_plays_as[arena]) return;
-  const uint32_t as = uint32_t(g_plays_as[arena]);
+  const uint32_t as = uint32_t(g_plays_as[arena] - 1);
   q[0] = uint8_t(as >> 24), q[1] = uint8_t(as >> 16), q[2] = uint8_t(as >> 8), q[3] = uint8_t(as);
   REXLOG_INFO("[svr2011] arena mods: the live settings' arena {} plays as arena {}", arena, as);
 }
@@ -1849,23 +1844,39 @@ bool UseArenaMod(const std::string& folder, int tile) {
 }
 
 int ArenaNumberFor(int arena) {
-  if (arena >= 0 && arena < 100 && g_plays_as[arena]) arena = g_plays_as[arena];
+  if (arena >= 0 && arena < 100 && g_plays_as[arena]) arena = g_plays_as[arena] - 1;
   return arena >= 0 && arena < 100 && g_number_for[arena] ? g_number_for[arena] : arena;
 }
 
 // (The match record copies the screen's arena when the match screen opens - sub_82773F00 - and again from this read
 // once one is picked: a WWE Universe match picked on page 2 played the tile's stock arena without it.)
-void ScreenArenaRead(uint8_t* base, uint32_t screen) {
+namespace {
+void ScreenPlaysAs(uint8_t* base, uint32_t screen) {
   constexpr uint32_t kScreenArena = 244;
-  LiveArenaPlaysAs(base);
-  g_loads_since_pick = 0;
   if (!screen) return;
   uint8_t* q = base + screen + kScreenArena;
   const uint32_t arena = uint32_t(q[0]) << 24 | uint32_t(q[1]) << 16 | uint32_t(q[2]) << 8 | q[3];
   if (arena >= 100 || !g_plays_as[arena]) return;
-  const uint32_t as = uint32_t(g_plays_as[arena]);
+  const uint32_t as = uint32_t(g_plays_as[arena] - 1);
   q[0] = uint8_t(as >> 24), q[1] = uint8_t(as >> 16), q[2] = uint8_t(as >> 8), q[3] = uint8_t(as);
   REXLOG_INFO("[svr2011] arena mods: the match screen's arena {} plays as arena {}", arena, as);
+}
+}  // namespace
+
+void ScreenArenaRead(uint8_t* base, uint32_t screen) {
+  LiveArenaPlaysAs(base);
+  g_loads_since_pick = 0;
+  ScreenPlaysAs(base, screen);
+}
+
+// (A match's load, sub_823EEB98 - before anything of it reads the arena: the INFERNO's fire set up at the load's
+// start with the tile's own number still in the live settings - a mod on another arena's tile had no ringside fire
+// and the temperature never rose, report 7a6b96; the screen read that turns it into the plays-as arena came ~2 s
+// later.)
+void ArenaPlaysAsAtLoad(uint8_t* base) {
+  LiveArenaPlaysAs(base);
+  const uint8_t* m = base + 0x82EDEB48;  // (the match screen)
+  ScreenPlaysAs(base, uint32_t(m[0]) << 24 | uint32_t(m[1]) << 16 | uint32_t(m[2]) << 8 | m[3]);
 }
 
 void ArenaSelectPad(uint32_t user, uint16_t buttons) {
@@ -2082,12 +2093,16 @@ void InstallArenaMods(rex::memory::Memory* memory, rex::filesystem::VirtualFileS
   }
   LoadCustomArenas();
   // Test aid: SVR2011_TEST_ARENA_MOD=<custom arena folder> - it is picked from the start, on its base arena's tile
-  // (SVR2011_TEST_MATCH arena=<that base> plays it).
+  // (SVR2011_TEST_MATCH arena=<that base> plays it); SVR2011_TEST_ARENA_TILE=<n> - on arena n's tile instead (as on
+  // a page where it sits on another arena's tile: SVR2011_TEST_MATCH arena=<n>). Tile 0 crashes at the load with a mod
+  // (FATAL call 0xA9AAAAAA, 2.1.8 too; a real pick on tile 0 plays) - use another tile.
   if (const char* v = std::getenv("SVR2011_TEST_ARENA_MOD"); v && *v) {
+    const char* t = std::getenv("SVR2011_TEST_ARENA_TILE");
     for (const auto& c : g_customs)
       if (c.id == v) {
-        PointAt(&c, c.base_arena >= 0 ? c.base_arena : 1);
-        REXLOG_INFO("[svr2011] arena mods: test - {} picked (plays as arena {})", c.name, g_redirected_file);
+        PointAt(&c, t && *t ? std::atoi(t) : c.base_arena >= 0 ? c.base_arena : 1);
+        REXLOG_INFO("[svr2011] arena mods: test - {} picked on arena {}'s tile (plays as arena {})", c.name,
+                    g_redirected_host, g_redirected_file);
       }
   }
   LoadBackstage();

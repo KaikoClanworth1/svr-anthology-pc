@@ -108,39 +108,55 @@ uint64_t FolderBytes(const fs::path& f) {
   return n;
 }
 
-// Measure (and with keep, trim: oldest folders out until under kTrimTo; "clear": everything) on a thread.
-void CacheJob(bool trim, bool clear_all, fs::path keep = {}) {
+// Measure on a thread; trim: the oldest work data out until under kTrimTo - only the converters' own dot folders in
+// each result's folder (.src_<game>: the disc's files copied, .work_*: steps), never a converted mod (its .svrmod,
+// its folder, report.json): the whole result folders went, oldest first, and a player converting eight 2K14
+// superstars kept the last three (reports 20261101-110225, 20261101-122401). clear_all (Clear it, asked first): every
+// result too; work_only with it: the work data alone.
+void CacheJob(bool trim, bool clear_all, fs::path keep = {}, bool work_only = false) {
   if (g_cache_busy.exchange(true)) return;
-  std::thread([dir = WorkDir(), trim, clear_all, keep] {
+  std::thread([dir = WorkDir(), trim, clear_all, keep, work_only] {
     std::error_code ec;
     struct Item {
       fs::path path;
       fs::file_time_type when;
       uint64_t bytes;
     };
-    std::vector<Item> items;
+    std::vector<Item> results, work;  // (result folders; the work data inside them)
     uint64_t total = 0;
     for (const auto& e : fs::directory_iterator(dir, ec)) {
       if (!e.is_directory(ec)) continue;
       const uint64_t b = FolderBytes(e.path());
-      items.push_back({e.path(), e.last_write_time(ec), b});
+      results.push_back({e.path(), e.last_write_time(ec), b});
       total += b;
+      for (const auto& w : fs::directory_iterator(e.path(), ec))
+        if (w.is_directory(ec) && w.path().filename().wstring().rfind(L".", 0) == 0)
+          work.push_back({w.path(), w.last_write_time(ec), FolderBytes(w.path())});
     }
     std::string removed;
-    if (clear_all || (trim && total > kTrimAbove)) {
-      std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) { return a.when < b.when; });
-      for (const auto& it : items) {
+    auto drop = [&](const Item& it) {
+      fs::remove_all(it.path, ec);
+      if (!ec) total -= std::min(total, it.bytes), removed += (removed.empty() ? "" : ", ") + Utf8(it.path.wstring().substr(dir.wstring().size() + 1));
+    };
+    const auto oldest = [](const Item& a, const Item& b) { return a.when < b.when; };
+    if (clear_all && !work_only) {
+      for (const auto& it : results) drop(it);
+    } else if (clear_all || (trim && total > kTrimAbove)) {
+      std::sort(work.begin(), work.end(), oldest);
+      for (const auto& it : work) {
         if (!clear_all && total <= kTrimTo) break;
-        if (!keep.empty() && fs::equivalent(it.path, keep, ec)) continue;
-        fs::remove_all(it.path, ec);
-        if (!ec) total -= it.bytes, removed += (removed.empty() ? "" : ", ") + Utf8(it.path.filename().wstring());
+        if (!clear_all && !keep.empty() && fs::equivalent(it.path.parent_path(), keep, ec)) continue;  // (the one just made)
+        drop(it);
       }
     }
+    const bool over = trim && total > kTrimAbove;  // (results alone over the limit: said, never removed)
     g_cache_bytes = total;
     g_cache_busy = false;
-    OnUiThread([removed] {
+    OnUiThread([removed, over, total] {
       g_cache_known = true;
-      if (!removed.empty()) Log("port: work folder trimmed: " + removed);
+      if (!removed.empty()) Log("port: work data removed: " + removed);
+      if (over) Log("port: the converted mods in Mods\\.convert\\port take " + Human(size_t(total)) +
+                    " - install or save the ones you want, then Clear it (nothing is removed by itself)");
     });
   }).detach();
 }
@@ -151,12 +167,19 @@ void CacheRow() {
   ImGui::TextDisabled("Port work folder: %s", g_cache_busy && !g_cache_known ? "measuring ..." : Human(size_t(b)).c_str());
   ImGui::SameLine();
   Hint("The converters' results and their copies of the disc's files (Mods\\.convert\\port in the game folder). "
-       "Converted mods open from here; once saved or installed they aren't needed. Above 3 GB the oldest are "
-       "removed after a conversion.");
+       "Converted mods open from here; once saved or installed they aren't needed. Above 3 GB the oldest copies "
+       "of disc files are removed after a conversion - never a converted mod.");
   ImGui::SameLine();
   ImGui::BeginDisabled(Busy() || g_cache_busy || !b);
-  if (ImGui::SmallButton("Clear it")) CacheJob(false, true);
+  if (ImGui::SmallButton("Clear it")) ImGui::OpenPopup("##clearwork");
   ImGui::EndDisabled();
+  if (ImGui::BeginPopup("##clearwork")) {  // (asked: a converted mod not yet installed or saved lives only here)
+    ImGui::TextUnformatted("Converted mods you haven't installed or saved are only in this folder.");
+    if (ImGui::Button("Remove the disc copies and work files only")) CacheJob(false, true, {}, true), ImGui::CloseCurrentPopup();
+    if (ImGui::Button("Remove everything, converted mods too")) CacheJob(false, true), ImGui::CloseCurrentPopup();
+    if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+  }
 }
 
 std::wstring Source() {
@@ -534,6 +557,7 @@ struct NativePac {
   std::string name;  // bgNN.pac
   int entry = -1;    // in the disc (-1: g_folder file)
   uint64_t size = 0;
+  std::wstring file;  // (a DLC package's, copied out by the converter's list: its dlc_file)
 };
 std::string g_native_for;
 std::vector<NativePac> g_native;
@@ -598,6 +622,13 @@ void NativeArenas(int k, const std::string& game, const std::string& game_name) 
     std::sort(g_native.begin(), g_native.end(), [](const NativePac& a, const NativePac& b) { return a.name < b.name; });
   }
   if (g_list_for != std::to_string(k) + "|" + want) List(k, game);  // (the converter's list: only each pac's status)
+  for (const Json& it : g_list.items)  // (the game's DLC packages have arenas too: arena_port --dlc)
+    if (const std::string f = it["dlc_file"].Str(); !f.empty()) {
+      const std::string name = ItemKey(it) + ".pac";
+      bool have = false;
+      for (const NativePac& np : g_native) have = have || Lower(np.name) == Lower(name);
+      if (!have) g_native.push_back({name, -1, 0, Wide(f)});
+    }
   if (g_embedded) ImGui::TextWrapped("The Mod Maker converts %s arenas itself: pick the arena.", game_name.c_str());
   else ImGui::TextWrapped("The Mod Maker converts %s arenas itself: pick the arena's pac, then finish below (extracted files) "
                           "(host arena, options, Convert).", game_name.c_str());
@@ -728,7 +759,9 @@ void NativeArenas(int k, const std::string& game, const std::string& game_name) 
     Progress("Copying " + p.name + " off the disc ...");
     Bytes b;
     bool ok = false;
-    if (p.entry >= 0) {
+    if (!p.file.empty()) {
+      ok = svrfmt::ReadFile(Utf8(p.file), b);
+    } else if (p.entry >= 0) {
       svrfmt::Disc disc;
       ok = disc.Open(image) && disc.ReadAll(p.entry, b);
     } else {
@@ -810,8 +843,10 @@ void OpenResult() {
 
 std::wstring PickOneFile() {
   static const COMDLG_FILTERSPEC kPac[1] = {{L"An arena, entrance or character file (*.pac)", L"*.pac"}};
-  return PickFile(false, L"One file from another game: an arena (pac\\bg\\bgNN.pac), an entrance (Nyujyo0.pac, Entrance01.pac) "
-                         L"or a character (pac\\ch\\chNNN.pac, a PS2 game's CH.PAC)", kPac, 1);
+  const std::wstring f = PickFile(false, L"One file from another game: an arena (pac\\bg\\bgNN.pac), an entrance (Nyujyo0.pac, Entrance01.pac) "
+                         L"or a character (pac\\ch\\chNNN.pac, a PS2 game's CH.PAC)", kPac, 1, nullptr, nullptr, OtherGameStart());
+  if (!f.empty()) OtherGamePicked(f);
+  return f;
 }
 bool CharacterName(const std::string& stem);
 // the one-file source, read as a character file (not named like an arena or entrance pac)
@@ -1095,8 +1130,9 @@ void DiscRow() {
         g_disc = i, g_folder.clear(), g_image.clear(), g_file.clear(), g_list = Json(), g_list_for.clear(), g_result = Json();
     ImGui::Separator();
     if (ImGui::Selectable("An extracted folder ...")) {
-      const std::wstring f = PickFolder(L"A folder with another game's files (an extracted disc)");
-      if (!f.empty()) g_folder = f, g_image.clear(), g_file.clear(), g_list = Json(), g_list_for.clear(), g_result = Json();
+      const std::wstring f = PickFolder(L"A folder with another game's files (an extracted disc)", OtherGameStart());
+      if (const std::string why = disc_list::NotGameFiles(f); !why.empty()) Status(why), Log("port: " + Utf8(f) + " - " + why);
+      else if (!f.empty()) OtherGamePicked(f), g_folder = f, g_image.clear(), g_file.clear(), g_list = Json(), g_list_for.clear(), g_result = Json();
     }
     if (ImGui::Selectable("One file: an arena, an entrance or a character (.pac) ...")) {
       const std::wstring f = PickOneFile();
@@ -1114,6 +1150,7 @@ void DiscRow() {
 }  // namespace
 
 void TestClear() { CacheJob(false, true); }
+void TestTrim() { CacheJob(true, false); }  // (--port-trim: the after-conversion trim, nothing kept)
 void TestFullPreview() { g_test_fp = true; }
 void TestAsAttire(const std::string& spec) { g_test_as_attire = spec; }
 // The ported entrance (g_result: its move pack and number), played whole by `who` before it is installed.

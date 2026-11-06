@@ -20,19 +20,23 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <vector>
 
 #include <rex/hook.h>
 #include <rex/logging.h>
 #include <rex/ppc.h>
 #include <rex/system/xmemory.h>
+#include <rex/thread.h>
 
 #include "arena_mods.h"
 #include "caw_limits.h"
 #include "frame_rate.h"
 #include "native/native_renderer.h"
 #include "fps_overlay.h"
+#include "match_box.h"
 #include "mem_trace.h"
 #include "generated/default/svr2011_init.h"
+#include "../modmaker/svrfmt/bytes.h"
 
 namespace {
 std::mutex g_mutex;
@@ -84,7 +88,8 @@ bool g_block_held[2] = {};      // (the reserves in place)
 uint32_t g_block_ptr[2] = {};   // (the block heap's blocks now, from XMemAlloc: given back to the reserves when freed)
 std::atomic<bool> g_blocks_all{false};  // (every window held or in the block heap's use: nothing to try)
 thread_local bool t_block_request = false;  // (inside the block heap's XMemAlloc)
-uint32_t Rd32(const uint8_t* base, uint32_t a);  // (below)
+using svrfmt::Rd32;
+using svrfmt::Wr32;
 
 bool BlockReserveOn() {
   static const bool on = std::getenv("SVR2011_TEST_BLOCKHEAP_RESERVE_OFF") == nullptr;
@@ -158,6 +163,7 @@ void StartLoadWatch(uint32_t lo, uint32_t hi, uint32_t size) {
   static std::once_flag started;
   std::call_once(started, [] {
     std::thread([] {
+      rex::thread::set_current_thread_name("model memory");
       static const int limit_s = [] {
         const char* v = std::getenv("SVR2011_TEST_OOM_WATCH_S");
 #if defined(__ANDROID__)
@@ -392,13 +398,15 @@ REX_HOOK_RAW(sub_8215A380) {
 // sub_8269B2D0, whose hook hands such a block back), so the match loads instead of hanging.
 // Test aids: SVR2011_TEST_CACHE_LOG=1 - every request of 1 MB or more; SVR2011_TEST_CACHE_FULL=<bytes> - the
 // cache finds no room for a request of at least that size (the hang, on purpose).
+namespace svr2011 {
+// (match_types.cpp: the cell's extra rule motions' read, '/MOT/RUWM' while pending)
+extern const char* const kExtraRuleMotionsRead;
+bool ExtraRuleMotionsPending();
+void ExtraRuleMotionsRead();
+}  // namespace svr2011
+
 namespace {
 constexpr uint32_t kLoaderCache = 0x82ED5FE8;
-
-uint32_t Rd32(const uint8_t* base, uint32_t a) {
-  const uint8_t* p = base + a;
-  return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
-}
 
 std::string GuestName(const uint8_t* base, uint32_t a) {
   std::string s;
@@ -505,6 +513,7 @@ REX_HOOK_RAW(sub_826BA928) {
     REXLOG_INFO("[svr2011] file cache: {} {} bytes -> {:08X} after {:.1f} s ({} tries)", name, size, ctx.r3.u32, s,
                 t_alloc.tries);
   t_alloc.active = false;
+  if (name == svr2011::kExtraRuleMotionsRead) svr2011::ExtraRuleMotionsRead();
 }
 
 // (inside sub_826BA928's retry loop: one call per failed try; r3 after it = the idle files it could still free)
@@ -517,10 +526,20 @@ REX_HOOK_RAW(sub_826B9FB8) {
   ++r.tries;
   if (r.stuck || ctx.r3.u32 != 0) return;
   const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - r.t0).count();
-  if (s < 3.0) return;
+  // (the cell's extra rule motions - match_types.cpp: Extreme Rules' RUWM read after the cell's own, when heap 16
+  // already holds the arena, the stage and the weapons' models - from the fallback memory at once, no 3 s wait)
+  // (nor for a file bigger than the cache's whole heap, with nothing idle left to free: packs' /MOTP/GAME, 30 MB in 20
+  // MB, waited 3 s at every match)
+  const uint32_t heap = Rd32(base, cache + 76), table = Rd32(base, 0x82EC5F48);
+  const bool too_big = heap < 54 && table && r.size > Rd32(base, table + heap * 36 + 4) - Rd32(base, table + heap * 36);
+  const bool at_once = too_big || (svr2011::ExtraRuleMotionsPending() && RequestName(base) == svr2011::kExtraRuleMotionsRead);
+  if (s < 3.0 && !at_once) return;
   r.stuck = true;
   r.name = RequestName(base);
-  LogLoaderCache(base, cache, r, s);
+  if (at_once)
+    REXLOG_INFO("[svr2011] file cache: no room for {} ({} bytes) - from the fallback memory", r.name, r.size);
+  else
+    LogLoaderCache(base, cache, r, s);
 }
 
 namespace svr2011 {
@@ -551,3 +570,268 @@ uint32_t LoaderCacheFallback(uint32_t size) {
   return p;
 }
 }  // namespace svr2011
+
+// -- A match's motion files ----------------------------------------------------
+//
+// A match's motions live in one 36 MB buffer of heap 42 (sub_821636D8: table +344 the buffer, +336 its size, +340 what
+// is used; the table's two sets: table + 352 * set, the one loading = *(table + 704) ^ 1). Each file of the group -
+// MOT/BM00, BM01, BM02, BM03 ... - is read so that it ENDS at the buffer's top (sub_82162960, sub_82162890: dest = buffer
+// + size - file), and sub_821646E8 trims its banks down to the used end (sub_82163808: only the motions this match can
+// play). Nothing compares the two: packs grew MOT/BM01 from 17 MB to 35 MB and its read landed on the banks BM00 had
+// already left there - slots 3 to 7 of the motion list junk (report d10f64: every motion of a strike bank gone, the
+// wrestlers stand in a motion no bank has; 89cfee: the game's search crashed on them). Such a file is read into the
+// fallback memory instead, and given back when its banks have been copied (sub_826A2D78: the read's answer).
+// Test aid SVR2011_TEST_BANK_FILE_OFF=1: the game's place (the report's junk).
+namespace {
+thread_local uint32_t t_motion_table = 0;  // (sub_82162960 / sub_82162890 running: the table)
+constexpr uint32_t kMotionFileMargin = 0x1000;
+struct MotionFileBlock {
+  uint32_t reader, block;
+};
+std::mutex g_motion_file_mutex;
+std::vector<MotionFileBlock> g_motion_file_blocks;
+}  // namespace
+
+namespace svr2011 {
+// (online.cpp's sub_826A2FA8 hook, before the game's: r3 the reader, r4 the name, r5 where it goes)
+void MotionFileRead(PPCContext& ctx, uint8_t* base) {
+  const uint32_t table = t_motion_table;
+  if (!table || !ctx.r5.u32) return;
+  static const bool off = std::getenv("SVR2011_TEST_BANK_FILE_OFF") != nullptr;
+  if (off) return;
+  const uint32_t set = table + 352 * (Rd32(base, table + 704) ^ 1), buffer = Rd32(base, set + 344);
+  const uint32_t size = Rd32(base, set + 336), used = Rd32(base, set + 340), dest = ctx.r5.u32;
+  if (dest >= buffer + used + kMotionFileMargin) return;
+  const uint32_t bytes = buffer + size - dest;  // (the game's place: its size, rounded up to 2 KB)
+  // (the virtual system heap: only the CPU reads it, and the physical pool may have no 37 MB in one piece by now)
+  const uint32_t block = FallbackBlock(bytes, true, 0x1000);
+  const std::string name = GuestName(base, ctx.r4.u32);
+  if (!block) {
+    REXLOG_ERROR("[svr2011] motion file {} ({} bytes): no fallback memory - it overwrites the motions before it", name, bytes);
+    return;
+  }
+  {
+    std::lock_guard lock(g_motion_file_mutex);
+    g_motion_file_blocks.push_back({ctx.r3.u32, block});
+  }
+  static int told = 0;
+  if (told++ < 8)
+    REXLOG_WARN("[svr2011] motion file {} ({:.1f} MB) doesn't fit above the {:.1f} MB of motions before it in the {:.0f} MB "
+                "buffer - read into the fallback memory, at {:08X}", name, bytes / 1048576.0, used / 1048576.0,
+                size / 1048576.0, block);
+  ctx.r5.u64 = block;
+}
+}  // namespace svr2011
+
+REX_EXTERN(__imp__sub_82162960);
+REX_HOOK_RAW(sub_82162960) {
+  t_motion_table = ctx.r4.u32;
+  __imp__sub_82162960(ctx, base);
+  t_motion_table = 0;
+}
+
+REX_EXTERN(__imp__sub_82162890);
+REX_HOOK_RAW(sub_82162890) {
+  t_motion_table = ctx.r4.u32;
+  __imp__sub_82162890(ctx, base);
+  t_motion_table = 0;
+}
+
+// sub_826A2D78(.., .., reader): a read has come - its answer (for a motion file, sub_821646E8) copies what it keeps
+REX_EXTERN(__imp__sub_826A2D78);
+REX_HOOK_RAW(sub_826A2D78) {
+  const uint32_t reader = ctx.r5.u32;
+  __imp__sub_826A2D78(ctx, base);
+  std::lock_guard lock(g_motion_file_mutex);
+  for (size_t i = 0; i < g_motion_file_blocks.size(); ++i)
+    if (g_motion_file_blocks[i].reader == reader) {
+      svr2011::CawHeapFree(g_motion_file_blocks[i].block);
+      g_motion_file_blocks.erase(g_motion_file_blocks.begin() + long(i));
+      break;
+    }
+}
+
+// -- A heap's free list ---------------------------------------------------------
+//
+// The game's heaps (sub_8269AAD8 frees; a critical section per heap, 28 bytes each from 0x82EC55B0; the table at
+// 0x82EC5F48, 36 bytes each: +0 start, +4 end). A block is 16 bytes of header in units of 16 bytes from the start:
+// +0 the next block by address (low 28 bits), +4 the one before, +8 the next free block (0 while it's in use), the
+// byte at +15 its heap. The free list starts at start + 8 and goes up by address, to a number at or past the end.
+// sub_8269AAD8 walks it with no limit, holding the heap's lock: when something has overwritten a link, it runs for
+// ever (reports 228dce, 73e349, 57b79b: "world update stuck in pass 20", the logic thread at a full core, the black
+// screen after a match). This is a safety net and not a fix: whatever wrote over the list isn't found. The block
+// being freed is left in use, the list made again from the blocks by address (the free ones have a next: alloc and
+// free walk it too; if the address links are bad too, the list ends at the bad link and what's after it is lost), and
+// the log says all it can see.
+// Test aids: SVR2011_TEST_FREE_LIST=<heap>,<n>[,loop|double|junk] - the <n>th free on that heap (99: on any) meets that damage;
+// SVR2011_TEST_FREE_GUARD_OFF=1 - the game's walk alone.
+namespace {
+constexpr uint32_t kHeapLocks = 0x82EC55B0, kHeapTable = 0x82EC5F48, kHeapEntrySize = 36, kHeapLockSize = 28;
+constexpr uint32_t kHeapCount = 64;
+
+std::string HeapWords(const uint8_t* base, uint32_t at, uint32_t count, uint32_t start, uint32_t end) {
+  std::string s;
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint32_t a = at + i * 4;
+    if (a < start || a + 4 > end) break;
+    s += fmt::format(" {:08X}", Rd32(base, a));
+  }
+  return s.empty() ? " (outside the heap)" : s;
+}
+
+std::string HeapCallers(const uint8_t* base, const PPCContext& ctx) {
+  std::string s = fmt::format("{:08X}", uint32_t(ctx.lr));
+  uint32_t sp = ctx.r1.u32;
+  const uint32_t top = sp + 0x40000;
+  for (int i = 0; i < 12 && sp >= 0x70000000 && sp < 0x80000000; ++i) {
+    const uint32_t prev = Rd32(base, sp);
+    if (prev <= sp || prev >= top) break;
+    s += fmt::format(" {:08X}", Rd32(base, prev - 8));
+    sp = prev;
+  }
+  return s;
+}
+
+// The free list again, from the blocks in address order; false if those links are bad as well (nothing changed).
+bool RebuildFreeList(uint8_t* base, uint32_t start, uint32_t size, uint32_t* kept) {
+  std::vector<uint32_t> free_blocks;
+  uint32_t cur = Rd32(base, start) & 0x0FFFFFFF;
+  while (cur < size) {
+    const uint32_t node = start + (cur << 4), to = Rd32(base, node) & 0x0FFFFFFF;
+    if (to <= cur || to > size) return false;
+    if (Rd32(base, node + 8)) free_blocks.push_back(cur);
+    cur = to;
+  }
+  uint32_t link = start + 8;
+  for (const uint32_t b : free_blocks) {
+    Wr32(base, link, b);
+    link = start + (b << 4) + 8;
+  }
+  Wr32(base, link, size);
+  *kept = uint32_t(free_blocks.size());
+  return true;
+}
+
+struct HeapDamage {
+  const char* what = nullptr;
+  uint32_t node = 0, next = 0, steps = 0, free_units = 0;  // (node: the list's block with the bad link, 0 none)
+};
+
+void TellHeapDamage(const uint8_t* base, const PPCContext& ctx, uint32_t heap, uint32_t p, uint32_t start, uint32_t end,
+                    const HeapDamage& d) {
+  static std::atomic<int> told{0};
+  const int n = ++told;
+  if (n > 8) {
+    if (n == 9) REXLOG_ERROR("[svr2011] heap free list: more damage - not told again this run");
+    return;
+  }
+  const uint32_t block = p - 16;
+  REXLOG_ERROR("[svr2011] heap free list: heap {}, freeing {:08X}: {} - the block stays in use (callers {})", heap, p, d.what,
+               HeapCallers(base, ctx));
+  REXLOG_ERROR("[svr2011] heap free list:   heap {:08X}-{:08X}, list head {}, {} free blocks ({} KB) walked before it stopped",
+               start, end, Rd32(base, start + 8), d.steps, d.free_units / 64);
+  REXLOG_ERROR("[svr2011] heap free list:   the block's header and start:{}", HeapWords(base, block, 12, start, end));
+  const uint32_t before = start + (Rd32(base, block + 4) << 4), after = start + ((Rd32(base, block) & 0x0FFFFFFF) << 4);
+  REXLOG_ERROR("[svr2011] heap free list:   the block before it {:08X}:{}", before, HeapWords(base, before, 12, start, end));
+  REXLOG_ERROR("[svr2011] heap free list:   the block after it {:08X}:{}", after, HeapWords(base, after, 12, start, end));
+  if (d.node) {
+    const uint32_t b4 = start + (Rd32(base, d.node + 4) << 4);
+    REXLOG_ERROR("[svr2011] heap free list:   the bad link: free block {:08X} (unit {}) says next {}:{}", d.node,
+                 (d.node - start) >> 4, d.next, HeapWords(base, d.node, 12, start, end));
+    REXLOG_ERROR("[svr2011] heap free list:   the 16 words before that block (a writer running on?):{}",
+                 HeapWords(base, d.node - 64, 16, start, end));
+    REXLOG_ERROR("[svr2011] heap free list:   the block before it by address {:08X} (what it holds says its owner):{}", b4,
+                 HeapWords(base, b4, 12, start, end));
+  }
+  svr2011::MatchBoxLog("a heap's free list was damaged");
+}
+}  // namespace
+
+REX_EXTERN(__imp__sub_8269AAD8);
+REX_HOOK_RAW(sub_8269AAD8) {
+  static const bool off = std::getenv("SVR2011_TEST_FREE_GUARD_OFF") != nullptr;
+  const uint32_t p = ctx.r3.u32;
+  const uint32_t table = p ? Rd32(base, kHeapTable) : 0;
+  if (!table || p < 0x10000) {
+    __imp__sub_8269AAD8(ctx, base);
+    return;
+  }
+  const uint32_t heap = base[p - 1];
+  const uint32_t entry = table + heap * kHeapEntrySize;
+  const uint32_t start = heap < kHeapCount ? Rd32(base, entry) : 0, end = heap < kHeapCount ? Rd32(base, entry + 4) : 0;
+  if (!start || p - 16 < start || p >= end) {  // (not one of these heaps' blocks: as the game)
+    __imp__sub_8269AAD8(ctx, base);
+    return;
+  }
+  const PPCContext saved = ctx;
+  ctx.r3.u64 = kHeapLocks + heap * kHeapLockSize;
+  REX_CALL_INDIRECT_FUNC(0x82D4753Cu);  // (RtlEnterCriticalSection: the game's own takes it again inside)
+  const uint32_t block = p - 16, self = (block - start) >> 4, size = (end - start) >> 4;
+
+  // Test aid: this free meets the damage.
+  static const struct TestDamage {
+    int heap = -1, at = 0;
+    std::string kind;
+  } test = [] {
+    TestDamage t;
+    if (const char* v = std::getenv("SVR2011_TEST_FREE_LIST")) {
+      char kind[16] = "loop";
+      if (std::sscanf(v, "%d,%d,%15s", &t.heap, &t.at, kind) >= 2) t.kind = kind;
+    }
+    return t;
+  }();
+  bool test_double = false;
+  if (test.heap == int(heap) || test.heap == 99) {  // (99: any heap)
+    static int count = 0;
+    if (++count == test.at) {
+      const uint32_t first = Rd32(base, start + 8);
+      REXLOG_WARN("[svr2011] heap free list: test - {} at free {} of heap {}", test.kind, count, heap);
+      if (test.kind == "double") test_double = true;
+      else if (test.kind == "junk") Wr32(base, block + 4, 0x03220B94);
+      else if (first < size) Wr32(base, start + (first << 4) + 8, first);
+    }
+  }
+
+  HeapDamage d;
+  const uint32_t to_next = Rd32(base, block) & 0x0FFFFFFF, to_before = Rd32(base, block + 4);
+  if (off) {
+  } else if (to_next > size || to_next <= self || to_before >= size || (self && to_before >= self)) {
+    d.what = "its header isn't a block's";
+  } else if (Rd32(base, block + 8) != 0) {
+    d.what = "it is free already (a second free)";
+  } else {
+    for (uint32_t cur = Rd32(base, start + 8); cur <= self;) {
+      const uint32_t node = start + (cur << 4), next = Rd32(base, node + 8);
+      if (next <= cur) {
+        d.what = "the free list has a bad link", d.node = node, d.next = next;
+        break;
+      }
+      const uint32_t to = Rd32(base, node) & 0x0FFFFFFF;
+      if (to > cur && to <= size) d.free_units += to - cur;
+      ++d.steps;
+      cur = next;
+    }
+  }
+  if (d.what) {
+    ctx = saved;
+    TellHeapDamage(base, ctx, heap, p, start, end, d);
+    if (d.node) {
+      uint32_t kept = 0;
+      if (RebuildFreeList(base, start, size, &kept)) {
+        REXLOG_ERROR("[svr2011] heap free list:   list made again from the address links: {} free blocks", kept);
+      } else {
+        Wr32(base, d.node + 8, size);
+        REXLOG_ERROR("[svr2011] heap free list:   the address links are bad too: the list ends at the bad link");
+      }
+    }
+  } else {
+    ctx = saved;
+    __imp__sub_8269AAD8(ctx, base);
+    if (test_double) {
+      ctx = saved;
+      sub_8269AAD8(ctx, base);
+    }
+  }
+  ctx.r3.u64 = kHeapLocks + heap * kHeapLockSize;
+  REX_CALL_INDIRECT_FUNC(0x82D4754Cu);  // (RtlLeaveCriticalSection)
+}

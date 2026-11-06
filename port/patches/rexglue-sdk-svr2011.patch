@@ -270,12 +270,16 @@ index 1cb3faa..7f9ef91 100644
  
  /// Create a default InputSystem with SDL + NOP drivers.
 diff --git a/include/rex/input/mnk/mnk_input_driver.h b/include/rex/input/mnk/mnk_input_driver.h
-index c8751b7..bb0dcb5 100644
+index c8751b7..6f045bb 100644
 --- a/include/rex/input/mnk/mnk_input_driver.h
 +++ b/include/rex/input/mnk/mnk_input_driver.h
-@@ -97,7 +97,9 @@ class MnkInputDriver final : public InputDriver,
+@@ -96,8 +96,13 @@ class MnkInputDriver final : public InputDriver,
+   // Guest thread to UI thread. The queued flag coalesces the posts.
    std::atomic<bool> mouse_capture_requested_{false};
    std::atomic<bool> mouse_capture_update_queued_{false};
++  // [svr2011] what the UI thread last settled on (0 released, 1 captured, -1 nothing yet): the guest thread posts only
++  // when the request differs (the pad read runs every frame - each post pushed an SDL event)
++  std::atomic<int> mouse_capture_applied_{-1};
  
 -  std::atomic<bool> has_focus_{true};
 +  // (the window's real focus: taken from it on attach, then its focus events -
@@ -5832,7 +5836,7 @@ index 7360ed9..dd6a163 100644
      case PaintResult::kPresented:
        surface_paint_connection_was_optimal_at_successful_paint_ = true;
 diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
-index b94fe9e..d30b98c 100644
+index b94fe9e..bedc1e7 100644
 --- a/src/ui/rex_app.cpp
 +++ b/src/ui/rex_app.cpp
 @@ -46,6 +46,11 @@
@@ -5856,6 +5860,19 @@ index b94fe9e..d30b98c 100644
      if (!config_.graphics) {
        // Fatal by design: no silent headless fallback.
        auto msg =
+@@ -602,8 +607,11 @@ void ReXApp::OnDestroy() {
+     window_->RemoveInputListener(this);
+     window_->RemoveListener(this);
+   }
+-  window_.reset();
++  // The runtime first: its input drivers (MnkInputDriver) detach from the window as they go - with the window
++  // gone first, ~MnkInputDriver's RemoveInputListener touched a deleted window (the game's own early exit,
++  // "Execution complete" -> QuitFromUIThread: SvR 2011 2.1.8 report 6fd821's shutdown crash).
+   runtime_.reset();
++  window_.reset();
+ }
+ 
+ void ReXApp::SetGuestFrameStats(ui::DebugOverlayDialog::FrameStatsProvider provider) {
 diff --git a/src/ui/surface_android.cpp b/src/ui/surface_android.cpp
 new file mode 100644
 index 0000000..b1ba2a6
@@ -6698,7 +6715,7 @@ index 2251429..9145077 100644
 +
  }  // namespace rex::ui
 diff --git a/src/ui/windowed_app_context_sdl.cpp b/src/ui/windowed_app_context_sdl.cpp
-index dc0b4c2..85004d0 100644
+index dc0b4c2..1d0aa10 100644
 --- a/src/ui/windowed_app_context_sdl.cpp
 +++ b/src/ui/windowed_app_context_sdl.cpp
 @@ -97,6 +97,28 @@ int SDLWindowedAppContext::RunMainMessageLoop() {
@@ -6758,6 +6775,27 @@ index dc0b4c2..85004d0 100644
      case SDL_EVENT_DROP_FILE: {
        if (WindowSDL* window = GetWindow(event.drop.windowID)) {
          window->HandleDropEvent(event);
+@@ -182,6 +225,7 @@ void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
+ 
+ bool SDLCALL SDLWindowedAppContext::WatchEvent(void* userdata, SDL_Event* event) {
+   auto* context = static_cast<SDLWindowedAppContext*>(userdata);
++#if REX_PLATFORM_MAC
+   if (event->type == SDL_EVENT_QUIT && SDL_IsMainThread() && context->IsInUIThread()) {
+     // Cocoa stops making Metal drawables available as part of its termination
+     // request. Handle the request synchronously while SDL is queueing it,
+@@ -189,6 +233,12 @@ bool SDLCALL SDLWindowedAppContext::WatchEvent(void* userdata, SDL_Event* event)
+     ++context->synchronously_handled_quit_events_;
+     context->ProcessQuitRequest();
+   }
++#else
++  // [svr2011] Elsewhere the quit goes through the message loop (ProcessEvent): handled here, inside SDL's event-watcher
++  // lock, it stops the guest threads while one of them can be pushing an event (waiting for that lock) - Alt+F4 hung.
++  (void)context;
++  (void)event;
++#endif
+   return true;
+ }
+ 
 diff --git a/src/ui/windowed_app_main_sdl.cpp b/src/ui/windowed_app_main_sdl.cpp
 index 77bb1dc..acc33de 100644
 --- a/src/ui/windowed_app_main_sdl.cpp
@@ -6786,7 +6824,7 @@ index 77bb1dc..acc33de 100644
    rex::cvar::ApplyEnvironment();
    rex::InitLoggingEarly();
 diff --git a/src/input/mnk/mnk_input_driver.cpp b/src/input/mnk/mnk_input_driver.cpp
-index 3f9422d..a1c95a0 100644
+index 3f9422d..d7119a9 100644
 --- a/src/input/mnk/mnk_input_driver.cpp
 +++ b/src/input/mnk/mnk_input_driver.cpp
 @@ -21,6 +21,7 @@
@@ -6893,8 +6931,46 @@ index 3f9422d..a1c95a0 100644
    uint16_t buttons = 0;
    if (IsBindPressed(key_down_, REXCVAR_GET(keybind_a)))
      buttons |= X_INPUT_GAMEPAD_A;
-@@ -423,7 +469,9 @@ void MnkInputDriver::ApplyMouseCaptureFromUIThread() {
+@@ -398,17 +444,31 @@ void MnkInputDriver::EnqueueKeystroke(uint16_t vk_pad, bool down) {
+ 
+ void MnkInputDriver::QueueMouseCaptureUpdate(bool should_capture) {
+   mouse_capture_requested_.store(should_capture, std::memory_order_relaxed);
++  // [svr2011] nothing to change, nothing posted
++  if (mouse_capture_applied_.load(std::memory_order_relaxed) == int(should_capture)) {
++    return;
++  }
+   bool already_queued = false;
+   if (!mouse_capture_update_queued_.compare_exchange_strong(already_queued, true)) {
+     return;
+   }
+-  std::lock_guard lock(state_mutex_);
+-  if (!attached_window_) {
++  rex::ui::WindowedAppContext* context = nullptr;
++  {
++    std::lock_guard lock(state_mutex_);
++    if (attached_window_) {
++      context = &attached_window_->app_context();
++    }
++  }
++  if (!context) {
+     mouse_capture_update_queued_.store(false, std::memory_order_relaxed);
+     return;
+   }
+   // Deferred, not CallInUIThread: running inline would re-enter state_mutex_.
+-  attached_window_->app_context().CallInUIThreadDeferred([this] {
++  // [svr2011] Posted with state_mutex_ released: the post pushes an SDL event, which runs SDL's event watchers under
++  // its lock - the UI thread can be in one waiting for state_mutex_ (a quit handled there detaches this driver), and
++  // with the lock held here neither went on: the pad read stuck (the world update with it) and Alt+F4 hung (2.1.9,
++  // mnk_mode).
++  context->CallInUIThreadDeferred([this] {
+     mouse_capture_update_queued_.store(false, std::memory_order_relaxed);
+     ApplyMouseCaptureFromUIThread();
+   });
+@@ -421,13 +481,17 @@ void MnkInputDriver::ApplyMouseCaptureFromUIThread() {
+   }
+   bool should_capture = mouse_capture_requested_.load(std::memory_order_relaxed);
    if (should_capture == mouse_captured_) {
++    mouse_capture_applied_.store(int(mouse_captured_), std::memory_order_relaxed);
      return;
    }
 -  if (!should_capture) {
@@ -6904,7 +6980,20 @@ index 3f9422d..a1c95a0 100644
      ReleaseMouseCaptureFromUIThread(window);
      return;
    }
-@@ -459,7 +507,7 @@ void MnkInputDriver::RecenterCursorFromUIThread(int32_t x, int32_t y) {
+   mouse_captured_ = true;
++  mouse_capture_applied_.store(1, std::memory_order_relaxed);
+   precapture_cursor_visibility_ = window->GetCursorVisibility();
+   window->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
+   window->CaptureMouse();
+@@ -442,6 +506,7 @@ void MnkInputDriver::ApplyMouseCaptureFromUIThread() {
+ }
+ 
+ void MnkInputDriver::ReleaseMouseCaptureFromUIThread(rex::ui::Window* window) {
++  mouse_capture_applied_.store(0, std::memory_order_relaxed);
+   if (!mouse_captured_) {
+     return;
+   }
+@@ -459,7 +524,7 @@ void MnkInputDriver::RecenterCursorFromUIThread(int32_t x, int32_t y) {
    }
    int32_t width = int32_t(window->GetActualPhysicalWidth());
    int32_t height = int32_t(window->GetActualPhysicalHeight());
@@ -9432,3 +9521,105 @@ index 76cc877..1932a1f 100644
      return false;
    }
  
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_io.cpp b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
+--- a/src/kernel/xboxkrnl/xboxkrnl_io.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
+@@ -221,11 +221,20 @@
+         io_status_block->information = bytes_read;
+       }
+ 
++      // [svr2011] An asynchronous file's read always completes through its APC
++      // and event - a failed one too, its status in the IO status block - and
++      // returns X_STATUS_PENDING. A failed read returned X_STATUS_PENDING (or
++      // END_OF_FILE) with no APC: a caller sleeping alertably for the completion
++      // (SvR 2011's loader: ReadFileEx + SleepEx(INFINITE, TRUE)) waited for
++      // ever. A synchronous file's read returns its status as before. (As
++      // NtReadFileScatter and NtWriteFile below already do.)
++      const bool async_file = !file->is_synchronous();
++
+       // Queue the APC callback. It must be delivered via the APC mechanism even
+       // though were are completing immediately.
+       // Low bit probably means do not queue to IO ports.
+       if ((uint32_t)apc_routine_ptr & ~1) {
+-        if (apc_context && result == X_STATUS_SUCCESS) {
++        if (apc_context && (result == X_STATUS_SUCCESS || async_file)) {
+           auto thread = XThread::GetCurrentThread();
+           uint32_t apc_routine = static_cast<uint32_t>(apc_routine_ptr) & ~1u;
+           uint32_t apc_ctx = apc_context.guest_address();
+@@ -241,7 +250,7 @@
+         }
+       }
+ 
+-      if (!file->is_synchronous() && result != X_STATUS_END_OF_FILE) {
++      if (async_file) {
+         result = X_STATUS_PENDING;
+       }
+ 
+diff --git a/src/system/xfile.cpp b/src/system/xfile.cpp
+index 4179e8b..8c6b6e1 100644
+--- a/src/system/xfile.cpp
++++ b/src/system/xfile.cpp
+@@ -19,14 +19,47 @@
+ #include <rex/system/xfile.h>
+ #include <rex/thread/mutex.h>
+ 
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
+ #include <span>
+ 
+ namespace rex::system {
+ 
++namespace {
++// Test aid SVR2011_TEST_IO_TRACE=<file>: every guest file open and read, a line each -
++// "<ms> <thread> open <path>" / "<ms> <thread> read <path> <offset> <bytes> <us>" (the load-time measurements).
++std::FILE* IoTrace() {
++  static std::FILE* f = [] {
++    const char* p = std::getenv("SVR2011_TEST_IO_TRACE");
++    return p && *p ? std::fopen(p, "w") : nullptr;
++  }();
++  return f;
++}
++
++void IoTraceLine(const char* kind, const std::string& path, uint64_t offset, uint64_t bytes, int64_t us) {
++  static std::mutex mutex;
++  static const auto t0 = std::chrono::steady_clock::now();
++  static std::atomic<int> threads{0};
++  thread_local const int thread = ++threads;
++  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++  std::lock_guard lock(mutex);
++  if (us < 0)
++    std::fprintf(IoTrace(), "%.1f %d %s %s\n", ms, thread, kind, path.c_str());
++  else
++    std::fprintf(IoTrace(), "%.1f %d %s %s %llu %llu %lld\n", ms, thread, kind, path.c_str(),
++                 (unsigned long long)offset, (unsigned long long)bytes, (long long)us);
++  std::fflush(IoTrace());
++}
++}  // namespace
++
+ XFile::XFile(KernelState* kernel_state, rex::filesystem::File* file, bool synchronous)
+     : XObject(kernel_state, kObjectType), file_(file), is_synchronous_(synchronous) {
+   async_event_ = rex::thread::Event::CreateAutoResetEvent(false);
+   assert_not_null(async_event_);
++  if (IoTrace()) IoTraceLine("open", path(), 0, 0, -1);
+ }
+ 
+ XFile::XFile() : XObject(kObjectType) {
+@@ -105,6 +138,15 @@ X_STATUS XFile::QueryDirectory(X_FILE_DIRECTORY_INFORMATION* out_info, size_t le
+ X_STATUS XFile::Read(uint32_t buffer_guest_address, uint32_t buffer_length, uint64_t byte_offset,
+                      uint32_t* out_bytes_read, uint32_t apc_context, bool notify_completion) {
+   std::lock_guard<std::mutex> lock(file_lock_);
++  if (IoTrace()) {
++    const uint64_t at = byte_offset == uint64_t(-1) ? position_ : byte_offset;
++    const auto t = std::chrono::steady_clock::now();
++    const X_STATUS r = ReadInternal(buffer_guest_address, buffer_length, byte_offset, out_bytes_read,
++                                    apc_context, notify_completion);
++    IoTraceLine("read", path(), at, buffer_length,
++                std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t).count());
++    return r;
++  }
+   return ReadInternal(buffer_guest_address, buffer_length, byte_offset, out_bytes_read, apc_context,
+                       notify_completion);
+ }

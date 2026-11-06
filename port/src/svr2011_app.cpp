@@ -6,6 +6,7 @@
 #include "anthology.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdlib>
 #include <fstream>
@@ -26,6 +27,7 @@
 #include <rex/audio/sdl/sdl_audio_system.h>
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
+#include <rex/hook.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/vfs.h>
 #include <rex/logging.h>
@@ -36,7 +38,9 @@
 #include "achievements_page.h"
 #include "jukebox.h"
 #include "backgrounds_page.h"
+#include "report_page.h"
 #include "weapons_page.h"
+#include "title_mods.h"
 #include "weapon_mods.h"
 #include "caw_logos.h"
 #include "paint_pages.h"
@@ -76,6 +80,8 @@
 #include "user_movies.h"
 #include "cae_mod_motions.h"
 #include "cam_mod_moves.h"
+#include "big_roster.h"
+#include "text_guard.h"
 #include "native/native_renderer.h"
 #include "frame_stats.h"
 #include "keyboard_typing.h"
@@ -106,6 +112,7 @@
 #include "p2p.h"
 #include "universe_mods.h"
 #include "universe_welcome.h"
+#include "util.h"
 #if defined(_WIN32)
 #include "xaudio2_audio.h"
 #endif
@@ -164,16 +171,7 @@ constexpr char kDefaultConfig[] =
 std::filesystem::path g_config_path;  // svr2011.toml (the GRAPHICS page saves there)
 
 // Value of an environment variable, or "" when unset.
-std::string Env(const char* name) {
-  char* value = nullptr;
-  size_t len = 0;
-  std::string result;
-  if (_dupenv_s(&value, &len, name) == 0 && value) {
-    result = value;
-    free(value);
-  }
-  return result;
-}
+using svr2011::Env;
 
 // A settings file's "basic strings" broken over lines joined again: a
 // `key = "...` line with no closing quote takes the next non-blank lines
@@ -311,6 +309,191 @@ std::vector<std::string> g_settings_notes;
 std::filesystem::path g_user_data;
 std::filesystem::path g_saves;
 
+// The disc's files the game folder lacks (online_files.h MissingGameFiles), at start: logged; one the game can't
+// start without stops it here with a message (Windows) - it crashed 0.3 s in otherwise, a read of guest 0x28 with
+// pac\_startup.pac and plist360.h missing (2.1.7 report ea8202). Not for another game's data (--game_data_root:
+// the Anthology's). (Test aid SVR2011_TEST_NO_DIALOGS=1: no box.)
+bool g_disc_data_beside = false;  // (the game data is the folder beside the program)
+void CheckGameFilesThere() {
+  if (!g_disc_data_beside) return;
+  const auto missing = svr2011::MissingGameFiles();
+  if (missing.empty()) return;
+  std::string list;
+  int essential = 0;
+  for (const auto& m : missing) {
+    essential += m.essential;
+    if (list.size() < 600) list += (list.empty() ? "" : ", ") + m.path;
+  }
+  if (!essential) {
+    REXLOG_WARN("game files: {} of the disc's files missing from the game folder: {}", missing.size(), list);
+    return;
+  }
+#if defined(_WIN32)
+  // (test aid SVR2011_TEST_FILES_LOG_ONLY=1: logged only, as on Android - the game runs on to DiscReadError)
+  const bool stop = !std::getenv("SVR2011_TEST_FILES_LOG_ONLY");
+#else
+  const bool stop = false;  // (no box this early on Android: the game stops at its first read of one - the disc read error's notice)
+#endif
+  REXLOG_ERROR("game files: {} of the disc's files missing from the game folder ({} the game can't start without): {}"
+               " - {} (reinstall from the Xbox 360 disc image: launcher Install, then Verify game files)",
+               missing.size(), essential, list, stop ? "not started" : "the game stops with a message when it reads one");
+  if (!stop) return;
+  rex::FlushLogging();
+#if defined(_WIN32)
+  if (!std::getenv("SVR2011_TEST_NO_DIALOGS")) {
+    std::wstring text =
+        L"The game files in this folder don't match the Xbox 360 disc - some are missing, so the game can't start:\n\n";
+    int shown = 0;
+    for (const auto& m : missing) {
+      if (!m.essential || ++shown > 8) continue;
+      text += L"    " + std::wstring(m.path.begin(), m.path.end()) + L"\n";
+    }
+    if (essential > 8) text += L"    ... and " + std::to_wstring(essential - 8) + L" more\n";
+    text += L"\nInstall the game again from your Xbox 360 disc image (ISO) with the launcher's Install tab, "
+            L"then use Verify game files.";
+    MessageBoxW(nullptr, text.c_str(), L"SvR 2011 - game files missing", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+  }
+  std::_Exit(3);
+#endif
+}
+
+}  // namespace
+
+// The game's disc read error (sub_82904DB8 -> XamShowDirtyDiscErrorUI): a file it needs couldn't be opened. The
+// runtime's box blamed "bad or unimplemented file IO calls" and then called exit(1) - static objects destroyed under
+// the still running render and audio threads: a SIGSEGV in native::OnLoadShaderConstants or a SIGABRT in the audio
+// worker seconds later (2.1.9 report edcc87, Android: pac/m.pac missing). Instead the missing files are named on
+// screen, the log is flushed and the game ends without destructors.
+[[noreturn]] static void EndForMissingFiles() {
+  static std::atomic<bool> ending{false};
+  if (ending.exchange(true))
+    for (;;) std::this_thread::sleep_for(std::chrono::seconds(1));
+  std::string names;
+  int listed = 0, more = 0;
+  if (g_disc_data_beside)
+    for (int pass = 0; pass < 2; ++pass)  // (the ones the game can't start without first)
+      for (const auto& m : svr2011::MissingGameFiles()) {
+        if (m.essential != (pass == 0)) continue;
+        if (listed == 3) {
+          ++more;
+          continue;
+        }
+        std::string p = m.path;
+        std::replace(p.begin(), p.end(), '\\', '/');
+        names += (listed++ ? ", " : "") + p;
+      }
+  if (more) names += " and " + std::to_string(more) + " more";
+  const std::string text =
+      names.empty() ? "A game file couldn't be read. Install the game again from your Xbox 360 disc image (launcher "
+                      "Install). The game will close."
+                    : "Game files missing: " + names + ". Install the game again from your Xbox 360 disc image "
+                      "(launcher Install). The game will close.";
+  REXLOG_ERROR("[svr2011] disc read error: {} - ending the game", names.empty() ? "a file couldn't be read" : names);
+  svr2011::ShowNotice(text, 15.0f);
+  rex::FlushLogging();
+  std::this_thread::sleep_for(std::chrono::seconds(15));
+  rex::FlushLogging();
+#if defined(_WIN32)
+  // (not _Exit alone: on Windows it still unloads the DLLs - rexruntime's static objects destroyed under the running
+  // threads, an abort() and a crash report)
+  TerminateProcess(GetCurrentProcess(), 4);
+#endif
+  std::_Exit(4);
+}
+
+REX_HOOK_RAW(sub_82904DB8) {
+  (void)ctx, (void)base;
+  EndForMissingFiles();
+}
+
+// The game's first pac read: with pac/_startup.pac missing it never reaches the disc read error above - its loader
+// reads guest 0x28 from the file it didn't get, a crash 1 s in (2.1.9 report 181cb0, Android: a folder with default.xex
+// but none of the disc's files; on Windows the start check stops first, unless SVR2011_TEST_FILES_LOG_ONLY=1).
+REX_EXTERN(__imp__sub_826A7C58);
+REX_HOOK_RAW(sub_826A7C58) {
+  static std::atomic<bool> checked{false};
+  if (!checked.exchange(true) && g_disc_data_beside)
+    for (const auto& m : svr2011::MissingGameFiles())
+      if (m.path == "pac\\_startup.pac") EndForMissingFiles();
+  __imp__sub_826A7C58(ctx, base);
+}
+
+// The pac loader asked to open a null name (sub_826A1D38's request +72): a pac it wanted isn't there. With an essential
+// file really missing (pac/com.pac renamed on a phone, not one of the launcher's must-haves) that is the missing file: the
+// notice, not the crash in here. With none missing (report 11ffd2's kind) the game goes on as before.
+REX_EXTERN(__imp__sub_826BB8A0);
+REX_HOOK_RAW(sub_826BB8A0) {
+  if (!ctx.r4.u32 && g_disc_data_beside)
+    for (const auto& m : svr2011::MissingGameFiles())
+      if (m.essential) EndForMissingFiles();
+  __imp__sub_826BB8A0(ctx, base);
+}
+
+namespace {
+
+// A Mac through Wine / CrossOver (Wine's ntdll says the host is Darwin): its Vulkan is MoltenVK, which lacks what the
+// game's Vulkan path needs - the game aborted in winevulkan a moment in, a black window (2.1.7 report f331f8, Apple
+// M1). Logged, and a question (Windows): play anyway, or quit. Test aid SVR2011_TEST_MAC_WINE=1 (as if on one).
+void CheckMacWine() {
+#if defined(_WIN32)
+  bool mac = std::getenv("SVR2011_TEST_MAC_WINE") != nullptr;
+  if (HMODULE ntdll = GetModuleHandleW(L"ntdll.dll"))
+    if (auto host = reinterpret_cast<void (*)(const char**, const char**)>(GetProcAddress(ntdll, "wine_get_host_version"))) {
+      const char *sysname = nullptr, *release = nullptr;
+      host(&sysname, &release);
+      REXLOG_INFO("platform: Wine on {} {}", sysname ? sysname : "?", release ? release : "");
+      mac |= sysname && !std::strcmp(sysname, "Darwin");
+    }
+  if (!mac) return;
+  REXLOG_WARN("platform: a Mac through Wine / CrossOver - not supported (its Vulkan driver, MoltenVK, lacks what the "
+              "game needs: a black window or a crash at start are likely)");
+  rex::FlushLogging();
+  if (std::getenv("SVR2011_TEST_NO_DIALOGS")) return;
+  const int answer = MessageBoxW(
+      nullptr,
+      L"This looks like a Mac running the game through Wine or CrossOver. That isn't supported: the Vulkan driver "
+      L"there (MoltenVK) lacks what the game needs, so it usually shows a black window or closes at start.\n\n"
+      L"Try anyway?",
+      L"SvR 2011 - Mac through Wine isn't supported", MB_YESNO | MB_ICONWARNING | MB_SETFOREGROUND);
+  if (answer != IDYES) {
+    REXLOG_INFO("platform: the player chose not to try");
+    rex::FlushLogging();
+    std::_Exit(4);
+  }
+  REXLOG_INFO("platform: the player chose to try anyway");
+#endif
+}
+
+// default.xex from another release of the game (online_files.h DefaultXexSupported): the port's code is the
+// supported xex's, recompiled, so another's ran a moment and quit without a word ("No function registered at
+// 8216B140": the Japanese disc, 2.1.8 report 6fd821). Stopped here with a message (Windows) instead.
+void CheckSupportedXex() {
+  if (!g_disc_data_beside) return;
+  uint64_t size, want_size;
+  uint32_t crc, want_crc;
+  const int ok = svr2011::DefaultXexSupported(&size, &crc);
+  if (ok != 0) {
+    if (ok < 0) REXLOG_WARN("game files: default.xex couldn't be read to check its release");
+    return;
+  }
+  svr2011::SupportedXex(&want_size, &want_crc);
+  REXLOG_ERROR("game files: default.xex is from another release of the game ({} bytes{}; the port's is {} bytes, CRC "
+               "{:08X} - the US / Europe disc) - not started",
+               size, crc ? fmt::format(", CRC {:08X}", crc) : std::string(), want_size, want_crc);
+  rex::FlushLogging();
+#if defined(_WIN32)
+  if (!std::getenv("SVR2011_TEST_NO_DIALOGS")) {
+    const std::wstring text =
+        L"This game folder's default.xex is from a different release of WWE SmackDown vs. Raw 2011 than the one "
+        L"this port was made from - for example the Japanese disc.\n\n"
+        L"The port only runs the US / Europe Xbox 360 release (title 5451085D). Install the game from that disc "
+        L"image (ISO) with the launcher's Setup -> The game, then use Verify game files.";
+    MessageBoxW(nullptr, text.c_str(), L"SvR 2011 - unsupported game release", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+  }
+  std::_Exit(3);
+#endif
+}
+
 }  // namespace
 
 void Svr2011App::OnConfigurePaths(rex::PathConfig& paths) {
@@ -334,6 +517,7 @@ void Svr2011App::OnConfigurePaths(rex::PathConfig& paths) {
   // otherwise.
   if (paths.game_data_root.empty()) {
     paths.game_data_root = exe_dir;
+    g_disc_data_beside = true;
   }
 #if defined(_WIN32)
   // The SvR Anthology build started on its own (not with the launcher's PLAY): the Anthology folder the
@@ -489,6 +673,9 @@ void Svr2011App::OnPreSetup(rex::RuntimeConfig& config) {
   }
   for (const auto& note : g_settings_notes) REXLOG_WARN("{}", note);  // (OnConfigurePaths' repairs)
   g_settings_notes.clear();
+  CheckGameFilesThere();  // (a game folder without the disc's essential files: a message, not a crash)
+  CheckSupportedXex();     // (another release's default.xex: a message, not a silent exit)
+  CheckMacWine();          // (a Mac through Wine: told it isn't supported, may still try)
   // A settings file that couldn't be read (every setting ignored) still draws.
   if (config.gpu_plugin.empty()) {
     rex::cvar::SetFlagByName("gpu_plugin", "xenos");
@@ -612,6 +799,7 @@ void Svr2011App::OnConfigureFonts(ImFontAtlas* atlas) {
   svr2011::SetJukeboxPageFonts(menu, title ? title : menu);
   svr2011::SetBackgroundsPageFonts(menu, title ? title : menu);
   svr2011::SetWeaponsPageFonts(menu, title ? title : menu);
+  svr2011::SetReportPageFonts(menu, title ? title : menu);
   svr2011::SetMatchHudFonts(menu, title ? title : menu);
 }
 
@@ -646,8 +834,8 @@ void Svr2011App::OnPostLoadXexImage() {
                      "frame_rate full_speed unlock_30fps "
                      "process_priority"},
         {"effects", "depth_of_field motion_blur soft_filter"},
-        {"gameplay", "replays managers_tile mixed_gender_matches caw_logos_anywhere unlock_everything user_language"},
-        {"input", "input_backend mnk_mode touch_controls touch_auto_layout vibration device_vibration"},
+        {"gameplay", "replays managers_tile mixed_gender_matches caw_logos_anywhere unlock_everything user_language per_mod_saves"},
+        {"input", "input_backend mnk_mode touch_controls touch_auto_layout vibration device_vibration pad_map_p1 pad_map_p2 pad_map_p3 pad_map_p4"},
         {"audio", "audio_backend audio_mute"},
         {"online", "online_enabled online_server"},
         {"storage", "saves_folder"},
@@ -671,12 +859,22 @@ void Svr2011App::OnPostLoadXexImage() {
       REXLOG_INFO("settings ({}): {}", group[0], line);
     }
   }
-  // Test aid: SVR2011_TEST_CRASH=1 - a bad memory access 20 s after start
+  // Test aid: SVR2011_TEST_CRASH=1 - a bad memory access 20 s after start, =stack a stack overflow
   // (checks the crash report and its lines in the log).
-  if (!Env("SVR2011_TEST_CRASH").empty()) {
-    std::thread([] {
+  if (const std::string crash = Env("SVR2011_TEST_CRASH"); !crash.empty()) {
+    std::thread([crash] {
       std::this_thread::sleep_for(std::chrono::seconds(20));
-      REXLOG_WARN("SVR2011_TEST_CRASH: crashing on purpose");
+      REXLOG_WARN("SVR2011_TEST_CRASH: crashing on purpose ({})", crash == "stack" ? "stack overflow" : "bad access");
+      if (crash == "stack") {
+        struct Deep {
+          static int Go(volatile int n) {
+            volatile char pad[4096];
+            pad[0] = char(n);
+            return Go(n + 1) + pad[0];
+          }
+        };
+        Deep::Go(0);
+      }
       *static_cast<volatile int*>(nullptr) = 1;
     }).detach();
   }
@@ -781,6 +979,8 @@ void Svr2011App::OnPostLoadXexImage() {
     if (std::string dir = Env("SVR2011_MOVIES"); !dir.empty()) movies = dir;
     svr2011::InstallCaeModMotions(runtime()->memory());  // (CREATE AN ENTRANCE's MODS rows)
     svr2011::InstallCamModMoves(runtime()->memory());    // (CREATE A MOVE-SET's MOD rows)
+    svr2011::InstallTextGuard(runtime()->memory());      // (no byte of a name stalls the game's text walks)
+    svr2011::InstallBigRoster(runtime()->memory());      // (cvar big_roster: the per-index tables past 241)
     std::error_code ec;
     std::filesystem::create_directories(movies, ec);
     // (HD movies' stubs, hd_movies.h: the folder made before the mount - the
@@ -822,6 +1022,7 @@ void Svr2011App::OnPostLoadXexImage() {
   // PC keyboard typing in the game's on-screen keyboard (keyboard_typing.h).
   svr2011::InstallKeyboardTyping(window());
   svr2011::InstallFreeCam(window());  // (F5-F8: free_cam.h)
+  svr2011::InstallPadIconsKeys(window());
   // 10 pages of Paint Tool logos (paint_pages.h).
   svr2011::InstallPaintPages(runtime()->memory(),
                              static_cast<rex::input::InputSystem*>(runtime()->input_system()), g_saves);
@@ -843,6 +1044,7 @@ void Svr2011App::OnPostLoadXexImage() {
   svr2011::KeepWindowAlive();
   svr2011::InstallArenaMods(runtime()->memory(), runtime()->file_system());
   svr2011::KeepWindowAlive();
+  svr2011::InstallTitleMods(runtime()->memory());  // (championships' names, belts, pictures: title_mods.h)
   // Ring Kit: rope heights and rules from a custom arena's manifest (ring_rules.h).
   svr2011::InstallRingRules(runtime()->memory());
   svr2011::InstallCawLimits(runtime()->memory());  // (the CAW editor's part heap fallback: caw_limits.h)
@@ -855,6 +1057,11 @@ void Svr2011App::OnPostLoadXexImage() {
   svr2011::InstallModelMem(runtime()->memory());  // (model_mem.cpp)
 #endif
   svr2011::SetThreadsSaves(g_saves);  // (the mods' Superstar Threads slots, kept by folder)
+  {
+    char title[16];
+    std::snprintf(title, sizeof(title), "%08X", runtime()->kernel_state()->title_id());
+    svr2011::SetThreadsDlc(g_user_data / "0000000000000000" / title / "00000002");  // (the DLCs' own Threads lists)
+  }
   svr2011::SetSuperstarModsSaves(g_saves);  // (a fetched mod's id as the save file has it)
   svr2011::InstallSuperstarMods(runtime()->memory(), runtime()->file_system());
   svr2011::InstallUniverseWelcome(g_saves, g_user_data);  // (the Universe welcome kept as seen once accepted)
@@ -875,6 +1082,9 @@ void Svr2011App::OnPostLoadXexImage() {
     svr2011::InstallJukeboxPage(imgui_drawer(), static_cast<rex::input::InputSystem*>(runtime()->input_system()));
     svr2011::InstallBackgroundsPage(imgui_drawer(), static_cast<rex::input::InputSystem*>(runtime()->input_system()));
     svr2011::InstallWeaponsPage(imgui_drawer(), static_cast<rex::input::InputSystem*>(runtime()->input_system()));
+    svr2011::InstallReportPage(imgui_drawer(), immediate_drawer(), window(),
+                               static_cast<rex::input::InputSystem*>(runtime()->input_system()), runtime()->memory(),
+                               g_user_data);  // (report_page.h)
     svr2011::InstallGraphicsPage(
         imgui_drawer(), window(),
         static_cast<rex::input::InputSystem*>(runtime()->input_system()), g_config_path);

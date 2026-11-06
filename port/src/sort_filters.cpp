@@ -38,16 +38,15 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xmemory.h>
 
+#include "big_roster.h"
 #include "generated/default/svr2011_init.h"
 #include "rtwm_streak.h"
 #include "superstar_mods.h"
+#include "../modmaker/svrfmt/bytes.h"
 
 namespace {
 
-uint32_t Rd32(const uint8_t* p) { return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3]; }
-void Wr32(uint8_t* p, uint32_t v) {
-  p[0] = uint8_t(v >> 24), p[1] = uint8_t(v >> 16), p[2] = uint8_t(v >> 8), p[3] = uint8_t(v);
-}
+using svrfmt::Rd32, svrfmt::Wr32;
 
 constexpr uint32_t kListSize = 2580, kMaxEntries = 322, kFlags = 4 + 1288;
 constexpr uint32_t kSmackDown = 1, kRaw = 2, kNpc = 3, kMods = 5;
@@ -171,9 +170,9 @@ void DumpRoster(uint8_t* base) {
   out << "# id\tname\t+209\tselectable\tgender(1 diva)\tdlc\n";
   int n = 0;
   for (uint32_t id = 1; id < 1000; ++id) {
-    const uint32_t index = uint32_t(base[kIdToIndex + id * 2]) << 8 | base[kIdToIndex + id * 2 + 1];
+    const uint32_t index = svr2011::RosterIndex(base, id);
     if (index >= 1000) continue;
-    const uint8_t* rec = base + kRecords + index * kRecordSize;
+    const uint8_t* rec = base + svr2011::RosterEntry(kRecords, kRecordSize, index);
     if ((uint32_t(rec[32]) << 8 | rec[33]) != id) continue;
     const std::string name(reinterpret_cast<const char*>(rec + 34), strnlen(reinterpret_cast<const char*>(rec + 34), 32));
     if (name.empty()) continue;

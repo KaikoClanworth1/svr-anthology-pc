@@ -31,6 +31,7 @@
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
 #include <rex/logging.h>
+#include <rex/thread.h>
 
 #include "match_types.h"
 #include "online_net.h"
@@ -208,6 +209,7 @@ bool VersionNewer(const std::string& a, const std::string& b) {
 }
 
 void CheckVersion(fs::path user_data) {
+  rex::thread::set_current_thread_name("version check");
   const std::string mine = svr2011::PortVersion();
   if (mine.empty() || !std::isdigit(static_cast<unsigned char>(mine[0]))) {  // (a developer build: no check)
     g_version = Version::kLatest;
@@ -272,7 +274,9 @@ std::string ManifestValue(const fs::path& manifest, const char* key) {
 bool Cosmetic(const fs::path& p) { return svrfmt::CosmeticFile(p); }
 
 // A mod folder's CRC for the set: its files but the cosmetic ones in a stable order, each one's path and CRC
-// folded (the same for a downloaded copy: mod_transfer.cpp checks it against the host's).
+// folded (the same for a downloaded copy: mod_transfer.cpp checks it against the host's). The manifest by the lines
+// that are the mod's, not this PC's (mod_travel.h): the launcher's level stamp made every bundled mod differ on every
+// PC (report b7e708).
 uint32_t FolderCrc(const fs::path& dir) {
   std::error_code ec;
   std::vector<fs::path> files;
@@ -282,8 +286,16 @@ uint32_t FolderCrc(const fs::path& dir) {
   uint32_t crc = 0;
   for (const fs::path& f : files) {
     uint32_t c = 0;
-    if (!FileCrc(f, false, &c)) continue;
     const std::string rel = fs::relative(f, dir, ec).generic_string();
+    if (rel == "manifest.txt") {
+      std::ifstream in(f, std::ios::binary);
+      if (!in) continue;
+      const std::string text = svrfmt::ManifestKeyText(std::string(std::istreambuf_iterator<char>(in), {}));
+      std::call_once(g_crc_once, CrcInit);
+      c = CrcUpdate(0, reinterpret_cast<const uint8_t*>(text.data()), text.size());
+    } else if (!FileCrc(f, false, &c)) {
+      continue;
+    }
     crc = CrcUpdate(crc, reinterpret_cast<const uint8_t*>(rel.data()), rel.size());
     crc = CrcUpdate(crc, reinterpret_cast<const uint8_t*>(&c), 4);
   }
@@ -386,6 +398,48 @@ uint32_t Crc32(uint32_t crc, const void* data, size_t n) {
 
 bool FileCrc32(const fs::path& file, uint32_t* out) { return FileCrc(file, false, out); }
 
+std::vector<MissingGameFile> MissingGameFiles() {
+  std::vector<MissingGameFile> out;
+  const char* test = std::getenv("SVR2011_TEST_MISSING_GAME_FILE");
+  std::error_code ec;
+  for (const GameFile& g : kFiles) {
+    const std::wstring p = g.path;
+    if (Optional(p)) continue;
+    std::string u;
+    for (wchar_t c : p) u += char(c);  // (the list's names are ASCII)
+    // (slashes, as the online check: on Android a backslash is part of a name - every file in a subfolder counted as
+    // missing there, "360 of the disc's files missing (265 ...)" in every Android 2.1.9 log)
+    std::string rel = u;
+    std::replace(rel.begin(), rel.end(), '\\', '/');
+    if (fs::exists(g_game_root / fs::path(rel), ec) && !(test && u == test)) continue;
+    const bool essential = p == L"default.xex" || p.rfind(L"plist360", 0) == 0 || p.rfind(L"pac\\", 0) == 0;
+    out.push_back({u, essential});
+  }
+  return out;
+}
+
+void SupportedXex(uint64_t* size, uint32_t* crc) {
+  *size = 0, *crc = 0;
+  for (const GameFile& g : kFiles)
+    if (std::wstring(g.path) == L"default.xex") *size = g.size, *crc = g.crc;
+}
+
+int DefaultXexSupported(uint64_t* size, uint32_t* crc) {
+  uint64_t want_size;
+  uint32_t want_crc;
+  std::error_code ec;
+  const fs::path xex = g_game_root / "default.xex";
+  *size = 0, *crc = 0;
+  SupportedXex(&want_size, &want_crc);
+  if (!want_size || !fs::exists(xex, ec)) return 1;
+  *size = uint64_t(fs::file_size(xex, ec));
+  if (ec) return -1;
+  if (const char* t = std::getenv("SVR2011_TEST_OTHER_XEX"); t && *t == '1') return 0;
+  if (*size != want_size) return 0;   // (a different size: no need to read it)
+  if (!FileCrc32(xex, crc)) return -1;
+  return *crc == want_crc ? 1 : 0;
+}
+
 void StartGameFilesCheck() {
   static std::once_flag once;
   std::call_once(once, [game_root = g_game_root, user_data = g_user_data] {
@@ -394,6 +448,7 @@ void StartGameFilesCheck() {
     fs::path root = game_root;
     if (const char* v = std::getenv("SVR2011_TEST_FILES_ROOT"); v && *v) root = v;
     std::thread([root, user_data] {
+      rex::thread::set_current_thread_name("file check");
       // (background priority, low disk priority too: a first check - every
       // file hashed - mustn't compete with the game's own loading)
 #if defined(_WIN32)
@@ -506,6 +561,8 @@ std::string ModsOnlineMessage() {
       return out + line;
     }
   }
+  // (big_roster's ids 323-511 play online as any other mod's: the lobby's key translation, a mod an "added"
+  // superstar at any id and its match slot filled - superstar_mods.cpp; part 5, proven in LAN matches)
   const auto& mods = ActiveMatchMods();
   const int server = g_mods_server.load();
   const bool blocked = !mods.empty() && !(server == 1 && g_mods_online.load());
@@ -587,6 +644,92 @@ uint64_t GameplayModSetHash() {
   uint64_t h = 0xCBF29CE484222325ull;
   for (unsigned char ch : s) h = (h ^ ch) * 0x100000001B3ull;
   return h;
+}
+
+const std::string& DlcSet() {
+  static const std::string set = [] {
+    std::vector<std::string> lines;
+    const fs::path title = UserDataFolder() / "0000000000000000" / "5451085D";
+    std::error_code ec;
+    for (const auto& pkg : fs::directory_iterator(title / "00000002", ec)) {
+      if (!pkg.is_directory(ec)) continue;
+      // (its game files: names and sizes, the pac folder's - movies, sounds and the catalog don't play)
+      std::vector<std::pair<std::string, uint64_t>> files;
+      for (const auto& f : fs::recursive_directory_iterator(pkg.path() / "pac", ec)) {
+        if (!f.is_regular_file(ec)) continue;
+        std::string rel = fs::relative(f.path(), pkg.path(), ec).generic_string();
+        std::transform(rel.begin(), rel.end(), rel.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+        if (rel.rfind("pac/string", 0) == 0) continue;  // (PatchOnlineStrings: the wording)
+        files.push_back({rel, uint64_t(f.file_size(ec))});
+      }
+      if (files.empty()) continue;  // (a catalog only: Fan Axxess)
+      std::sort(files.begin(), files.end());
+      uint64_t h = 0xCBF29CE484222325ull;
+      for (const auto& [name, size] : files) {
+        for (unsigned char ch : name) h = (h ^ ch) * 0x100000001B3ull;
+        for (int i = 0; i < 8; ++i) h = (h ^ uint8_t(size >> (8 * i))) * 0x100000001B3ull;
+      }
+      // (its name: the content header's, UTF-16BE at 8 - "WWE SmackDown vs. Raw 2011 - Vol02" -> "DLC Vol02")
+      std::string name;
+      {
+        std::ifstream in(title / "Headers" / "00000002" / (pkg.path().filename().string() + ".header"), std::ios::binary);
+        std::vector<uint8_t> d((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        for (size_t i = 8; i + 1 < d.size() && i < 8 + 256; i += 2) {
+          const uint16_t c = uint16_t(d[i] << 8 | d[i + 1]);
+          if (!c) break;
+          name += c >= 0x20 && c < 0x7F ? char(c) : c == 0x2013 || c == 0x2014 ? '-' : '?';
+        }
+      }
+      for (const char* game : {"WWE SmackDown vs. Raw 2011", "WWE SmackDown vs Raw 2011"})
+        if (name.rfind(game, 0) == 0) name = name.substr(std::strlen(game));
+      while (!name.empty() && (name.front() == ' ' || name.front() == '-' || name.front() == ':')) name.erase(0, 1);
+      while (!name.empty() && name.back() == ' ') name.pop_back();
+      if (name.empty()) name = pkg.path().filename().string().substr(0, 12);
+      if (name.rfind("DLC", 0) != 0) name = "DLC " + name;
+      char hex[24];
+      std::snprintf(hex, sizeof(hex), "%016llX", static_cast<unsigned long long>(h));
+      lines.push_back(std::string("DLC\t") + hex + "\t-\t" + hex + "\t" + name);
+    }
+    std::sort(lines.begin(), lines.end());
+    std::string out;
+    for (const std::string& l : lines) out += l + "\n";
+    REXLOG_INFO("online: DLC packages with game files: {}", out.empty() ? std::string("none") : "\n" + out);
+    return out;
+  }();
+  // (test aid: SVR2011_TEST_DLC_SET=none | "<fingerprint>|<name>,..." - this game's set instead: two test games
+  // share one user data's DLC)
+  if (const char* v = std::getenv("SVR2011_TEST_DLC_SET"); v && *v) {
+    static const std::string test = [v] {
+      std::vector<std::string> lines;
+      std::stringstream ss(std::string(v) == "none" ? std::string() : std::string(v));
+      for (std::string item; std::getline(ss, item, ',');) {
+        const size_t bar = item.find('|');
+        if (bar == std::string::npos) continue;
+        lines.push_back("DLC\t" + item.substr(0, bar) + "\t-\t" + item.substr(0, bar) + "\t" + item.substr(bar + 1));
+      }
+      std::sort(lines.begin(), lines.end());
+      std::string out;
+      for (const std::string& l : lines) out += l + "\n";
+      REXLOG_INFO("online: DLC packages (test aid SVR2011_TEST_DLC_SET): {}", out.empty() ? std::string("none") : "\n" + out);
+      return out;
+    }();
+    return test;
+  }
+  return set;
+}
+
+std::string DlcDifference(const std::string& mine, const std::string& theirs) {
+  const auto a = ParseSet(mine), b = ParseSet(theirs);
+  std::vector<std::string> parts;
+  for (const auto& [key, l] : b)
+    if (!a.count(key)) parts.push_back("they have " + l.name + ", you don't");
+  for (const auto& [key, l] : a)
+    if (!b.count(key)) parts.push_back("you have " + l.name + ", they don't");
+  if (parts.empty()) return "";
+  std::string out = "Your downloadable content doesn't match: ";
+  for (size_t i = 0; i < parts.size() && i < 2; ++i) out += (i ? "; " : "") + parts[i];
+  if (parts.size() > 2) out += "; and " + std::to_string(parts.size() - 2) + " more";
+  return out + ".";
 }
 
 std::string ModSetDifference(const std::string& mine, const std::string& theirs, bool superstars) {

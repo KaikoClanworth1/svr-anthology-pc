@@ -46,6 +46,23 @@ page (`port/docs/MOVE_MODDING.md`).
   (a player's 2K17 Blue Thunder Bomb, Sami Zayn). A move ported with 2.1.5 or older from these games has to be
   ported again.
 
+### 2.3b No empty records in a motion
+
+A keyframe motion's record is `0x60 + u16 size` or `0x60 + size`. The game has no size check: an empty record (`60 00 00`,
+a key whose only events were dropped) makes it read what follows as that key's record, so pose bytes run as events - no
+stock track has one (0 of 24746). Sabu's Springboard DDT 3 ended early at key 111, where `36 BF 5A` read as a jump to
+motion 23231, which no bank has, and both wrestlers stayed in it (report 7017d6). `ymks.build_stream` writes a one-key
+skip instead; `move_packs` does the same to a pack's keyframe motions when it merges (`DropEmptyRecords`, movepacks 15),
+so existing mods need no new port. Test aids: `SVR2011_TEST_HW_WATCH_MOTION=<person>,<motion>` (who writes the next
+motion), `SVR2011_TEST_FOLLOW_LOG=1` (a jump event's bytes and address).
+
+### 2.3c Templates a match type alone has
+
+A move only in a match type's banks (Rumble's 83xx / 84xx: `MOT/RU*` + `MVMT/RUMB`) has no motions in other matches: both
+wrestlers stand still in it. A template search with no category skips them (`choose_template`). The moveset's rope
+elimination slots (0x026-0x02A, 0x088 and kin, bank RUMB) ask for RUMB by name and rightly get them, so a move in such a
+slot can't be tested with a forced start in a normal match.
+
 ### 2.4 Ids
 
 - **Below every template bank's last id.** A bank's directory is sorted and ends at its highest id (16000 in
@@ -55,6 +72,14 @@ page (`port/docs/MOVE_MODDING.md`).
 - **Not 9000-9999 for a keyframe move.** The game treats 9000-9779 as streamed (YMBs) motions by its flag
   table; a keyframe move there plays through the wrong path.
 - The converter picks a free record (one 2011 keeps without motions) within those limits; `--id` chooses.
+- **Not 16000 and up outside the template's thousand** (the game never starts it: move_packs.cpp NeverStarts),
+  **nor a DLC move**: 2011's DLC brings 282 records the disc keeps cut back to life with its own motions and adds
+  18 (`tools/dlc_move_ids.json`, 303 ids) - 273 of the disc's "free" records. One rule for every picker:
+  `Game11.free_ids` (free_record, moveset_port, the Mod Doctor's renumber); a passed `--id` outside it is picked
+  again (4 Nov, reports db3291 / d97b88 / e47af7 / 3b5056).
+- **A move on YMBs banks (a submission) takes minutes**: 2K15's Kimura Lock solves 5 hold phases in ~172 s. The
+  move-set port's limit (120 s a move) gives such a move `YMBS_EXTRA` (480 s) more - before, it was stopped and the
+  base move kept ("missing from CREATE A MOVE-SET").
 
 ### 2.5 The template
 
@@ -115,9 +140,19 @@ page (`port/docs/MOVE_MODDING.md`).
   closest length) before the category vote - a coded category mixes holds with other moves (2K15's M013 is
   mostly reversals: its vote said STAT and the Patriot Lock got Mule Kick Reversal 2; now Single Leg Boston
   Crab 21308).
-- Open: a forced ported hold doesn't play out (25 Oct: it stays in the motion for the whole run, Ankle Lock 3
-  or Boston Crab alike; before it played x 0 and ended): it doesn't run the hold / struggle loop the stock one
-  does (the loop comes from the template's records and the game's submission state, not yet matched).
+- **Open: the game tells a submission by its id** (4 Nov): in a hold = the motion in 21000-21499 (sub_821B57F8 for
+  an id, sub_821B58F8 a fighter's current one), standing 21000-21099 (sub_821B2540), the sub-kinds 21100s / 21200-249 /
+  21250-299 / 21300-349 / 21350-399 / 21400-449 / 21450-499 (sub_821B2560 / 5818 / 5838 / 5858 / 5878 / 5898 / 58B8),
+  a front grapple 4500-5549 ... (sub_821B9E80), submissions among the moveset's slots 101-103 / 107-109
+  (sub_821BBAF0). Every 21000s record is a stock submission, so a ported hold sits elsewhere: its victim stands up when
+  x 0 ends. Tried (branch kimura-ground, not merged): those four tests answering for the move's wazecopy source - a
+  forced hold then stayed in its hold, but one the CPU applied (SVR2011_TEST_SLOT_MOVE + SVR2011_TEST_MOMENTUM) never
+  ended (230 s; the stock Crossface the same way ended in 40 s) - a stuck match, worse than the stand-up: taken out.
+  A forced start skips the game's submission state (stock holds loop forever too): taps and breaks need a CPU-applied
+  hold.
+- **Standing or on the mat**: choose_submission takes the template whose victim is as high as the source's at the
+  start and in the hold (x 2; standing holds keep him at -7..-11 model units, mat holds -1..-5). 2K15's Kimura Lock
+  (standing start, on the mat: -8.8 / -3.3) got Bearhug, a standing hold - now Crossface 21004 (-8.8 / -1.5).
 
 ## 3. Testing a ported move
 
@@ -251,6 +286,49 @@ page (`port/docs/MOVE_MODDING.md`).
   (seen 3 times in 10 runs, 27 Oct), and wait while a build runs - a starved test game took 215 s to its test
   match and never reached the move. The porter's `MOVES_PORT_TRACE=1` logs both people's root paths and each
   phase's attacker heights.
+
+### SvR 2007 / 2008 / 2009 (31 Oct, from the Anthology study)
+
+Their banks are 2011's own format, their move ids and WAZE layout too (situation at +0x73, the same values), so
+the porter copies the source's tracks instead of retargeting (`convert0789`). What a match needs, learnt by
+comparing with Yumboy11's SVR Anthology (numbers only - `runs\anthology_moves_report.md`; nothing of it is in
+the repo):
+
+- **Every track goes into the match copy.** MOTP/GAME holds cameras (y 50-57), ropes / turnbuckles (10-21),
+  parts (30-32) and props (60) as well as the people - 867 of 2011's 988 moves with a camera keep it there. Only
+  the people went in before. Those other tracks keep the unpacked conventions in MOTP; only y 0 / 1 are packed.
+- **SvR 2009 ships its own packed match copy** (`MOTP/GAME/<child>`), which 2011's packed codec reads, keyed
+  every 1-4 frames (2011: 1-5): it goes into 2011's MOTP as it is. 2007 / 2008 have none (their `MOT/GAME` is
+  keyframes): their packed people are built as before.
+- **No pack without a match copy.** A template needs a keyframe (YMKs) bank in MOTP/GAME; the convert fails
+  otherwise. Ankle Lock 1 on Powerful Knee Strike 5090 got a menu bank only: forced, both people stood frozen.
+- **The move's own record.** All of the study's moves land on a record 2011 keeps without motions (a cut move):
+  its situation, damage and ratings are the move's, only its 16 category bytes are empty. The pack sets those
+  (`waze`, the template's bits) instead of copying the template's record (`wazecopy`), which started Frog Splash
+  Pin as a running move (16 instead of 9), Iron Claw running too, Running STO in situation 1.
+- **Template by situation and category first**, then start gap and length: the source's menu category (2009's
+  STND / DIVI / ROPE ... -> STN1+STN2 / CORN / ROPE), the move's situation. Running STO: Spear 3 (was Roll Up).
+- **Holds (x 101-103)** take banks and records from a keyframe hold - 2011 has three usable, all ground holds:
+  Sleeper & Body Scissors 6019, Ankle Lock 2 6181, Cloverleaf Pain 6212 - and the category bits from the
+  template of their own situation. Forced, Ankle Lock 1 on 6019 / 6181's banks takes Cena down and holds the
+  ankle; on a standing grapple's banks the pair let go after the takedown.
+- **Event ops 192 / 193 are kept**: 2007-2011 all size them 2 / 3 (the old "2008-only" drop was wrong). 2011
+  ignores 192 (sub_8239D750 skips it); 193 is a sound / voice cue (u16 id), kept only for an id 2011's own match
+  copies play (`Game11.cue_ids`; SvR 2009 has 6 of them in all its match copies, 3 of 4 ids shared).
+- **An in-ring dive leaves out the source's floor flights x 110 / 111** (2011 keeps them for Leap of Faith alone
+  and plays x 110 as the miss: SvR 2009's Frog Splash Pin flew out onto the floor) and takes the template's miss,
+  x 50, which the source doesn't have (without it the attacker hung at the corner after the flight).
+
+In-match (forced, hidden; `scratchpad anth\an_run1-5.ps1`, sheets `runs\an_*_sheet.png`, n = this porter, b = 2.1.8's):
+
+| Move | Before | Now |
+|---|---|---|
+| Chokeslam 5 (corner, placed) | plays | plays the same, all 7 tracks in the match copy |
+| Ankle Lock 1 (submission) | frozen, never animates | takedown + ankle hold, every start |
+| DDT 8 (7 cameras) | pair frozen outside the ring after one start | plays in the ring with its cameras, every start |
+| Atomic Leg Drop 1 (rope) | - | plays; its own low camera at the end |
+| Frog Splash Pin (dive) | miss flies onto the floor | flies off the corner, ends in the ring - the dive aid's victim is far away (stock 3555 misses there too): not proven |
+| Running STO (running) | - | forced from standing the attacker drops out after 16 frames (a running start is needed); the CPU didn't pick it in 180 s: not proven |
 
 ## 5. Parked: a reversal test aid
 

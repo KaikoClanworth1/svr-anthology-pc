@@ -36,11 +36,13 @@
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
 #include <rex/logging.h>
+#include <rex/thread.h>
 
 #include "../modmaker/svrfmt/mod_travel.h"
 #include "online_files.h"
 #include "online_mods.h"
 #include "p2p.h"
+#include "util.h"
 
 REXCVAR_DEFINE_BOOL(online_mods_load, false, "Online",
                     "This run also loads the mods fetched from a session's host (<user data>\\OnlineMods; set by the "
@@ -52,7 +54,7 @@ REXCVAR_DEFINE_INT32(online_mod_upload_kbs, 4096, "Online",
 REXCVAR_DEFINE_INT32(online_mod_upload_peers, 2, "Online",
                      "Hosting: how many joiners may fetch this game's mods at once (the others wait)");
 REXCVAR_DEFINE_INT32(online_mod_max_mb, 300, "Online", "Joining: the largest mod (MB) fetched from a host");
-REXCVAR_DEFINE_INT32(online_mods_max_mb, 1024, "Online",
+REXCVAR_DEFINE_INT32(online_mods_max_mb, 4096, "Online",
                      "Joining: the most MB of mods fetched from one host for a session");
 
 namespace fs = std::filesystem;
@@ -105,10 +107,7 @@ std::vector<std::string> Split(const std::string& s, char by) {
   return out;
 }
 
-std::string Lower(std::string s) {
-  for (char& c : s) c = char(std::tolower(static_cast<unsigned char>(c)));
-  return s;
-}
+using svr2011::Lower;
 
 int64_t NowMs() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
@@ -201,6 +200,7 @@ void RefreshSet() {
 // thread's). A file that changes gameplay but can't travel makes the mod unsendable (the joiner's copy would
 // never match the host's key). Works on a copy, stored if the set is still the same.
 void ListMod(uint32_t gen, size_t index, HostMod m) {
+  rex::thread::set_current_thread_name("mod transfer list");
   std::error_code ec;
   std::vector<fs::path> all;
   for (const auto& e : fs::recursive_directory_iterator(m.dir, ec))
@@ -679,6 +679,7 @@ bool FetchFile(uint32_t gen, uint16_t mod, uint16_t index, const Listed& f, cons
 }
 
 void Run(std::vector<ModOffer> wanted) {
+  rex::thread::set_current_thread_name("mod transfer");
   std::string error;
   uint32_t gen = 0;
   const auto t0 = Clock::now();
@@ -694,7 +695,9 @@ void Run(std::vector<ModOffer> wanted) {
   std::vector<std::pair<uint16_t, ModOffer>> plan;
   uint64_t total = 0;
   const uint64_t max_mod = uint64_t(std::max(1, REXCVAR_GET(online_mod_max_mb))) << 20;
-  const uint64_t max_all = uint64_t(std::max(1, REXCVAR_GET(online_mods_max_mb))) << 20;
+  // (1024 was 2.1.6's default, which every launcher wrote into the settings: read as the new default)
+  const int mods_mb = REXCVAR_GET(online_mods_max_mb) == 1024 ? 4096 : REXCVAR_GET(online_mods_max_mb);
+  const uint64_t max_all = uint64_t(std::max(1, mods_mb)) << 20;
   for (const ModOffer& w : wanted) {
     auto it = std::find_if(set.begin(), set.end(), [&](const ModOffer& s) {
       return s.kind == w.kind && s.id == w.id && s.crc == w.crc;
@@ -857,19 +860,30 @@ void LobbyLoop() {
         for (const std::string& l : OnlineModsLackedFromHost()) offer.unsendable.push_back(l + ": " + why);
         if (offer.unsendable.empty()) continue;
       }
-      std::set<std::string> mine;
+      std::map<std::string, std::pair<std::string, std::string>> mine;  // (kind, id -> version, CRC)
       for (const std::string& line : Split(GameplayModSet(), '\n')) {
         const auto f = Split(line, '\t');
-        if (f.size() >= 4) mine.insert(f[0] + "\t" + f[1] + "\t" + f[3]);
+        if (f.size() >= 4) mine[f[0] + "\t" + f[1]] = {f[2], f[3]};
       }
       for (const ModOffer& o : offers) {
-        if (!all && mine.count(o.kind + "\t" + o.id + "\t" + o.crc)) continue;
+        const auto have = mine.find(o.kind + "\t" + o.id);
+        if (!all && have != mine.end() && have->second.second == o.crc) continue;
+        if (!all && have != mine.end()) {
+          const std::string name = o.name.empty() ? o.id : o.name;
+          offer.differ.push_back(have->second.first == o.version || o.version == "-" || have->second.first == "-"
+                                     ? name + " (your copy isn't the same as the host's)"
+                                     : name + ": you have " + have->second.first + ", the host has " + o.version);
+          REXLOG_INFO("mod transfer: {} {}: this game has {} ({}), the host {} ({})", o.kind, o.id, have->second.first,
+                      have->second.second, o.version, o.crc);
+          continue;
+        }
         if (!o.unsendable.empty()) offer.unsendable.push_back((o.name.empty() ? o.id : o.name) + ": " + o.unsendable);
         else offer.mods.push_back(o), offer.bytes += o.bytes;
       }
-      REXLOG_INFO("mod transfer: the host has {} mod(s), {} this game lacks ({:.1f} MB), {} it can't send",
-                  offers.size(), offer.mods.size(), offer.bytes / 1048576.0, offer.unsendable.size());
-      if (offer.mods.empty() && offer.unsendable.empty()) continue;
+      REXLOG_INFO("mod transfer: the host has {} mod(s), {} this game lacks ({:.1f} MB), {} it can't send, {} it has "
+                  "another copy of", offers.size(), offer.mods.size(), offer.bytes / 1048576.0, offer.unsendable.size(),
+                  offer.differ.size());
+      if (offer.mods.empty() && offer.unsendable.empty() && offer.differ.empty()) continue;
     }
     if (const char* answer = std::getenv("SVR2011_TEST_MOD_ANSWER")) {
       REXLOG_INFO("mod transfer: test: the offer answered {}", answer);

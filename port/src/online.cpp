@@ -29,6 +29,7 @@
 #include <rex/ppc.h>
 #include <rex/logging.h>
 #include <rex/system/xmemory.h>
+#include <rex/thread.h>
 
 #include "caw_logos.h"
 #include "entrance_media.h"
@@ -39,6 +40,7 @@
 #include "online_chat.h"
 #include "p2p.h"
 #include "paint_pages.h"
+#include "../modmaker/svrfmt/bytes.h"
 
 namespace svr2011 {
 
@@ -201,6 +203,7 @@ constexpr size_t kLogoSize = 1024 + 65536;  // a stored logo: palette + pixels (
 // uploaded but whose logos it doesn't have: the ones this player has go up.
 // (The game's own upload carries only the Superstar file.)
 void LogoUploads() {
+  rex::thread::set_current_thread_name("logo uploads");
   for (;;) {
     auto wanted = net::ServerRequest("GET", "/api/logos/wanted");
     if (wanted && wanted->status == 200) {
@@ -266,15 +269,7 @@ constexpr uint32_t kDownloadMax = 0xC00000;
 constexpr uint32_t kCawFileSize = 1347532, kPaintFileSize = 394516, kReelFileSize = 1555802;
 constexpr uint32_t kStoryMax = 0x6CCC94;
 
-uint32_t Rd32(const uint8_t* base, uint32_t a) {
-  const uint8_t* p = base + a;
-  return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3];
-}
-void Wr32(uint8_t* base, uint32_t a, uint32_t v) {
-  uint8_t* p = base + a;
-  p[0] = uint8_t(v >> 24), p[1] = uint8_t(v >> 16), p[2] = uint8_t(v >> 8), p[3] = uint8_t(v);
-}
-
+using svrfmt::Rd32, svrfmt::Rd16, svrfmt::Wr32;
 std::atomic<bool> g_importing{false};  // a download is being saved
 
 // Copies a save file before a download replaces it: Saves\.backup\<name>.<time>
@@ -394,7 +389,7 @@ uint32_t OnlineString(uint32_t id) {
     const std::string why = P2PHiddenReason(&sessions);
     if (why.empty()) return 0;
     // (the game's own wording - its C67E / C67C messages - then the details)
-    const bool mods = why.rfind("Your mods", 0) == 0;
+    const bool mods = why.rfind("Your mods", 0) == 0 || why.rfind("Your downloadable content", 0) == 0;
     const std::string head = mods ? "Unable to join the session due to a difference in downloadable content."
                                   : "Unable to join the session due to a difference in game versions.";
     if (id == kNoSessionsId)
@@ -709,10 +704,13 @@ REX_HOOK_RAW(sub_8273BB60) {
   __imp__sub_8273BB60(ctx, base);
 }
 
+namespace svr2011 { void MotionFileRead(PPCContext& ctx, uint8_t* base); }  // (model_mem.cpp)
+
 // Test aid (SVR2011_TEST_IMG_LOG): the pictures the menus load by name
 // (sub_826A2FA8(image, "/DSC1/R123", ...), 16 characters at most).
 REX_EXTERN(__imp__sub_826A2FA8);
 REX_HOOK_RAW(sub_826A2FA8) {
+  svr2011::MotionFileRead(ctx, base);  // (a match's motion file that doesn't fit its buffer: model_mem.cpp)
   static const bool log = std::getenv("SVR2011_TEST_IMG_LOG") != nullptr;
   if (log && ctx.r4.u32) {
     const char* p = reinterpret_cast<const char*>(base + ctx.r4.u32);
@@ -993,18 +991,31 @@ uint32_t OnlineScratch() { return g_scratch; }
 }  // namespace svr2011
 
 // The game's DLC check on joining (sub_824CDE90: attribute 5 of the session's
-// search entry - one number the host's game advertises - must be 113, else
-// "Unable to join the session due to a difference in downloadable content",
-// C67E). Not a list of packs; what the number means isn't known yet: logged
-// (the entry +48 the attribute) for the reports.
+// search entry must be 113, else "Unable to join. You must have the same
+// downloadable content..." C67E). The entry's attribute block (+24: word 0,
+// then attribute k at word k + 1) comes from the found session's properties:
+// attribute 5 is property 0x1000000B, the host's session settings' constant
+// 113 (sub_824F3E00 +24, copied by sub_8288F098) - not a list of packs. p2p.cpp
+// makes every match session carry it (2.1.8 report 38981a: 0). Logged with
+// the block when it isn't 113.
 REX_EXTERN(__imp__sub_824FDFC8);
 REX_HOOK_RAW(sub_824FDFC8) {
+  const uint32_t entry = ctx.r3.u32;
   __imp__sub_824FDFC8(ctx, base);
-  static uint32_t last = 0;
+  static uint32_t last = 0xFFFFFFFF;  // (0 is logged too: "no attribute")
   if (ctx.r3.u32 != last) {
     last = ctx.r3.u32;
     REXLOG_INFO("online: a session's DLC attribute is {} (the game wants 113{})", ctx.r3.u32,
                 ctx.r3.u32 == 113 ? "" : " - it says 'a difference in downloadable content'");
+    if (ctx.r3.u32 != 113 && entry) {  // (the entry's +8 and its attribute block +24: word 0, attributes 0-11)
+      auto rd = [&](uint32_t a) {
+        const uint8_t* p = base + a;
+        return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
+      };
+      std::string words;
+      for (uint32_t i = 0; i < 13; ++i) words += fmt::format(" {}", int32_t(rd(entry + 24 + 4 * i)));
+      REXLOG_INFO("online: that session's entry +8 {}, attributes{}", rd(entry + 8), words);
+    }
   }
 }
 
@@ -1038,7 +1049,6 @@ constexpr uint8_t kCamSlot[224] = {  // (cam_mod_moves.cpp kSlotCategory != 128:
     1, 0, 1, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1,
     1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 0};
 
-uint16_t Rd16(const uint8_t* base, uint32_t a) { return uint16_t(base[a] << 8 | base[a + 1]); }
 
 // The pack a move comes from (its folder's name), "" if none.
 std::string PackOfMove(uint16_t id) {

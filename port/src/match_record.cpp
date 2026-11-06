@@ -7,6 +7,7 @@
 // when the session object (sub_82573F18) +0 is set, else the next byte of the table at 0x82037B98 by the counters at
 // 0x82EC6A2C / +1 (loaded.txt). The C runtime's rand() (sub_828F2430, its state per thread) is used besides, about 20
 // places in a match (replay research: SVR2011_TEST_RAND_LOG / SVR2011_TEST_RAND_FIXED).
+#include "superstar_mods.h"
 #include "match_record.h"
 
 #include <algorithm>
@@ -34,6 +35,7 @@
 #include <rex/hook.h>
 #include <rex/logging.h>
 #include <rex/ppc.h>
+#include <rex/thread.h>
 
 #include "arena_mods.h"
 #include "caw_limits.h"
@@ -44,6 +46,7 @@
 #include "pad_types.h"
 
 #include "generated/default/svr2011_init.h"
+#include "../modmaker/svrfmt/bytes.h"
 
 #ifndef SVR2011_PORT_VERSION
 #define SVR2011_PORT_VERSION "dev"
@@ -88,13 +91,7 @@ constexpr uint32_t kObjects = 0x82DE0220, kObjectSlots = 72;
 constexpr uint32_t kSeedCounters = 0x82EC6A2C;  // (u8 x2: the seed table's next index, by caller kind)
 constexpr uint32_t kInputsVersion = 1;  // (1: + the frames' world updates, user 0xFF)
 
-uint32_t Rd32(const uint8_t* p) { return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3]; }
-float RdF(const uint8_t* p) {
-  const uint32_t v = Rd32(p);
-  float f;
-  std::memcpy(&f, &v, 4);
-  return f;
-}
+using svrfmt::Rd32, svrfmt::RdF;
 
 std::string Json(const std::string& s) {  // (a JSON string, quoted)
   std::string o = "\"";
@@ -284,6 +281,7 @@ void WriteJson(bool complete) {  // (under g_rec)
 
 // The mods, in load order per kind (sorted folder names, as the game reads them), into mods.txt - a thread of its own.
 void ListMods(fs::path game, fs::path out, std::set<std::pair<std::string, std::string>> used, std::vector<ModInfo>* list) {
+  rex::thread::set_current_thread_name("match record mods");
   static const std::set<std::string> kGenerated = {"ArenaOverlay", "ArenaCrowdless", "PacOverlay", "ArenaTest"};
   std::error_code ec;
   std::vector<fs::path> kinds;
@@ -715,6 +713,7 @@ void MatchRecordMatchLoads() {
   g_load_frame = g_updates;
   if (g_base) std::memcpy(g_load_table.data(), g_base + kTableIndexes, 4);
   REXLOG_INFO("[svr2011] record: a match loads - its rand() seed {:08X}", seed);
+  svr2011::CaeMenuLoads();
 }
 
 void MatchRecordUpdate(PPCContext& ctx, uint8_t* base) {
@@ -903,6 +902,17 @@ void MatchRecordEnded(const std::string& box) {
   if (FILE* f = std::fopen((g.dir / "done.txt").string().c_str(), "wb")) std::fclose(f);
   REXLOG_INFO("[svr2011] record: the match's folder done ({})", g.dir.filename().string());
   g.on = false;
+}
+
+std::string MatchRecordFolder() {
+  std::lock_guard lock(g_rec);
+  if (g.dir.empty()) return {};
+  if (g.on) {
+    if (g.inputs) std::fflush(g.inputs);
+    WriteJson(false);
+  }
+  const std::u8string u = g.dir.u8string();
+  return std::string(u.begin(), u.end());
 }
 
 void MatchRecordCrashText(FILE* f) {

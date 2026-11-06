@@ -34,6 +34,7 @@
 #include "cae_mod_motions.h"
 
 #include "generated/default/svr2011_init.h"
+#include "../modmaker/svrfmt/bytes.h"
 
 namespace {
 
@@ -50,16 +51,8 @@ std::map<int, std::string> g_ids;             // id -> file name (ASCII)
 std::set<std::string> g_pending;              // files being written (ReserveUserMovie)
 std::map<std::string, uint32_t> g_labels;     // label -> guest string
 
-uint32_t Rd32(uint8_t* base, uint32_t a) {
-  uint32_t v;
-  std::memcpy(&v, base + a, 4);
-  return __builtin_bswap32(v);
-}
+using svrfmt::Rd32, svrfmt::Wr32;
 int16_t Rd16(uint8_t* base, uint32_t a) { return int16_t(base[a] << 8 | base[a + 1]); }
-void Wr32(uint8_t* base, uint32_t a, uint32_t v) {
-  v = __builtin_bswap32(v);
-  std::memcpy(base + a, &v, 4);
-}
 
 // A path for the log (UTF-8).
 std::string Utf8(const std::filesystem::path& p) {
@@ -69,6 +62,19 @@ std::string Utf8(const std::filesystem::path& p) {
 
 bool Ascii(const std::wstring& s) {
   return std::all_of(s.begin(), s.end(), [](wchar_t c) { return c >= 32 && c < 127; });
+}
+
+// The same bytes (a copy).
+bool SameFile(const std::filesystem::path& a, const std::filesystem::path& b) {
+  std::error_code ec;
+  if (std::filesystem::file_size(a, ec) != std::filesystem::file_size(b, ec) || ec) return false;
+  std::ifstream fa(a, std::ios::binary), fb(b, std::ios::binary);
+  std::vector<char> x(65536), y(65536);
+  while (fa && fb) {
+    fa.read(x.data(), x.size()), fb.read(y.data(), y.size());
+    if (fa.gcount() != fb.gcount() || std::memcmp(x.data(), y.data(), size_t(fa.gcount()))) return false;
+  }
+  return true;
 }
 
 // Rescans the folder: ids for new .bik files, drops files that are gone.
@@ -95,6 +101,16 @@ void Refresh() {
     const std::string bik = e.path().stem().string() + ".bik";
     static std::set<std::string> no_decoder;  // (probed once per run)
     if (no_decoder.count(bik)) continue;
+    // (a mod's own .mp4 under that name - prepared first, superstar / media mods - plays, not this one: the
+    // launcher's Shrink movies made "<name>.mp4" here from the game's copy of the mod's .bik - its fallback, or its
+    // HD stub: a black movie - and this scan took the mod's tron over for good)
+    if (const auto mp4 = svr2011::HdMovieMp4(bik); !mp4.empty() && !std::filesystem::equivalent(mp4.parent_path(), g_folder, ec)) {
+      static std::set<std::string> told;
+      if (told.insert(bik).second)
+        REXLOG_INFO("user movies: {} left out - a mod's own movie plays under that name ({})", e.path().filename().string(),
+                    mp4.string());
+      continue;
+    }
     if (!svr2011::PrepareHdMovie(g_folder, bik, e.path())) no_decoder.insert(bik);
   }
   for (const auto& e : std::filesystem::directory_iterator(g_folder, ec)) {
@@ -116,6 +132,12 @@ void Refresh() {
       const bool usable = stem.find_first_not_of(L" ._-") != std::wstring::npos;
       const std::wstring plain = stem + L".bik";
       const auto to = g_folder / plain;
+      // (an older copy of a superstar mod's movie under its accented name, the plain-letters one there now: dropped)
+      if (usable && std::filesystem::exists(to, ec) && SameFile(to, p) && std::filesystem::remove(p, ec)) {
+        REXLOG_INFO("user movies: removed {} (the same as {})", Utf8(p.filename()), to.filename().string());
+        continue;
+      }
+      ec.clear();
       if (!usable || std::filesystem::exists(to, ec) || (std::filesystem::rename(p, to, ec), ec)) {
         REXLOG_WARN("user movies: skipping {} (use plain letters in the name)", Utf8(p.filename()));
         ec.clear();
