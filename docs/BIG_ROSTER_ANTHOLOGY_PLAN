@@ -1,0 +1,195 @@
+# More than 242 superstars in SVR Anthology PC: a step-by-step plan ("route B")
+
+From Piloun1, 2026-11-07, for KaikoClanworth1 (svr-anthology-pc). Companion of `REQUEST_KAIKO_ANTHOLOGY_SLOTS.md`.
+
+All addresses below come from a **static analysis of the SvR 2011 disc program** (`Original\default.xex`, the base your
+Anthology build recompiles; base 0x82000000, `.text` 0x82150000-0x82D484EC, 39 054 `.pdata` functions, 48 402
+function starts once `bl` targets are added). Read-only work: nothing of yours was run or rebuilt. Full function map:
+`big_roster_map_svr2011.csv` (1 637 functions, one line each: table references, save-block references, compare
+immediates, multipliers, calls to the functions named here). Call counts are direct `bl` calls only (calls through
+pointers are not counted).
+
+---
+
+## 0. Short version
+
+- The id <-> index tables are read **only** by 5 tiny leaf functions (plus 2 that walk the index table). Replace those 7
+  and the id <-> index mapping becomes dynamic for the whole game. Small.
+- The save data is reached through a **small accessor module** (0x8257A208-0x8257BDB8), block A through a pointer
+  (0x82E407B4). Route extended indices to extension buffers there. Small to medium.
+- New ids must be **322 and up** and new indices **292 and up**: indices 242-291 are already the 50 CAWs in the index
+  table and in the 272 / 292-long lists.
+- The big part is the per-id arrays inside heap objects: **210 functions** compare an id with 322. The CSV groups them
+  by the globals they use, to triage them.
+- Keep `SaveData.dat` byte-compatible (Xenia players move saves): extension data in a side file, extended ids replaced
+  by stand-ins in the stock save (your `refs.bin` idea).
+- Gate everything behind `big_roster`: off = stock behaviour, which also gives a regression test.
+
+---
+
+## 1. What the game does today
+
+### 1.1 Ids and indices (table contents read from the xex)
+
+| Ids | Index (`u16[322]` at 0x82DB3610) | What |
+|---|---|---|
+| 0-49 | none (512) | CAWs (save block A +0x13F9C, 50 x 1 724 B) |
+| 50-69 | 0-19 | probably the "+20" of the 242 / 292-long lists (DLC-style ids) |
+| 70-99 | none (512) | present, no index (DLC ids; all used by Anthology) |
+| 100-321 | 20-241 | regular superstars |
+
+Index -> id (`u16[292]` at 0x82DB3898): 0-19 -> 50-69, 20-241 -> 100-321, **242-291 -> 0-49 (the CAWs)**.
+Present (`u8[322]` at 0x82DB3AE0): 1 for 255 ids (0-49 and 70-99 included). The three tables are packed against other
+data: they cannot grow in place, they must move.
+
+### 1.2 The accessors (leaf functions, no `.pdata` entry)
+
+| Function | What it does (from the disassembly) | Direct callers |
+|---|---|---|
+| `sub_828B7038` IdToIndex(id) | `id < 322 (unsigned) ? u16[0x82DB3610 + 2*id] : 512` | 20 |
+| `sub_828B7060` IndexToId(idx) | `u16[0x82DB3898 + 2*idx]`, no bound check | 19 |
+| `sub_828B7078` IsPresent(id) | `id < 322 (signed) ? u8[0x82DB3AE0 + id] == 1 : 0` | 6 |
+| `sub_828B70E0` RosterListLength(a, b) | `n = a ? 272 : 222; return b ? n + 20 : n` (222 / 242 / 272 / 292) | 9 |
+| `sub_828B70A8` KindNumberToId(n, kind) | kind 1: n + 100, kind 2: n + 50, kind 3: n, else 512 | 1 |
+| `sub_828B6CB0` IsCaw(id) | `0 <= id < 50` | 180 (may be folded with other "< 50" tests) |
+| `sub_828B83B0`, `sub_828B84F8` | walk IndexToId entries 0-241 (**end pointer = table + 484**, not a compare), and for each id look for a given id in 2 x 5 words of a per-id structure (`sub_8257BCC8`) | 1 each |
+
+No other function references the three tables directly (every `lis 0x82DB` + `addi`/load in `.text` was checked).
+Watch out for `sub_828B83B0` / `sub_828B84F8`: their loop bound is an address (`+484` = 242 x 2), so searching for
+"242" does not find it.
+
+### 1.3 The save layer (block A through the pointer at 0x82E407B4, block B fixed at 0x82E7C918)
+
+`sub_8257AE40` sets `*(0x82E407B4) = 0x82E407C0` and clears 0x3C154 bytes; `sub_8257A4A8` returns 0x82E7C918 (block B,
+221 direct callers).
+
+| Accessor | Returns | Callers |
+|---|---|---|
+| `sub_8257AF18` GetRecord(id) | CAW: A + id x 1724 + 0x13F9C ; else A + IdToIndex(id) x 260 (512 -> nothing) | 29 |
+| `sub_8257BB48` GetProfile(id) | CAW: CAW + 260 ; else 0x82E7C918 + 8 + idx x 1056 | 15 |
+| `sub_8257BBD8` GetEntry40(id) | CAW: CAW + 1316 ; else 0x82E7C918 + 0x3E648 + idx x 40 | 1 |
+| `sub_8257A238` RecordByIndex(idx) | A + idx x 260 | — |
+| `sub_8257A2C0` (idx, src) | memcpy 260 into A + idx x 260 | — |
+| `sub_8257A338` | A + 0xF5C8 + i x 270 (tag teams, 70 x 270) | — |
+| `sub_8257A2D8`, `sub_8257A470` | A + 0x29054 + i x 216 (Create-a-Finisher) | — |
+| `sub_8257A3A8`, `sub_8257A3C8`, `sub_8257A450` | A + 0x13F9C + i x 1724 (CAWs) | — |
+| `sub_8257A250` / `sub_8257A288`, `sub_8257A318` (memcpy 26 168) / `sub_8257A420` / `sub_8257A438` / `sub_8257A490` | A + 0xF5C8 / + 0x2FE54 / + 0x3648C / + 0x364A8 / + 0x364B4 | — |
+| `sub_8257AFB8`, `sub_8257B180`, `sub_8257B1D0` | A + 0x14658, + 0x2912C, + 0x29192 | — |
+| `sub_8257B210`, `sub_8257B240`, `sub_8257BC70` / `sub_8257B858` / `sub_8257B268` | B + 0x420E4 (x 8) / B + 0x42104 / B + 0x41A38 | — |
+| `sub_8257A748`, `sub_8257B888` | copy 260 + 1056 + 4 bytes (record + profile + 1 word) | — |
+
+Functions that compute record / profile addresses themselves (not through the accessors), to review one by one:
+- x 260: `8243A920 8243AD48 8243C068 824C3BA0 82513C48 82514860 82514A20 82514C60 82515460 82515ED0 82517188
+  8259C7D0 8259C8A8 8259C9A8 8259CAA8 8259CBF8 82BBB678 82BBBAD8 82BBBCC0` (some may be another 260-byte structure);
+- x 1056: `824C3B48 82594C78 82595240 8259C838 8259C8A8 8259C9A8 8259CAA8`.
+
+Direct callers, for the record:
+- IdToIndex: `82438BA0 82438C30 8243A920 8243AD48 8243C068 824C3BA0 8257AF18 8257BB48 8257BBD8 8257BDB8 8259C7D0
+  8259C838 8259C8A8 8259C9A8 8259CAA8 8259CBF8 825A65D8 82741668 82741FC0 828A3F98`
+- IndexToId: `82438008 82439910 82439A50 8243A380 8243A488 8243A590 8243A9E0 8243AAA0 8243AB60 8243AC98 824A79D8
+  824AD060 82594C78 82595240 82628B10 82734828 82736C68 82736FD8 82B89E50`
+- RosterListLength: `82439910 82439A50 824A50B8 824A79D8 824AD060 82628B10 82734828 82736C68 82736FD8`
+- IsPresent: `82594C78 82595240 8263BBD0 8263BCB0 8263BD40 82B89E50`
+- GetRecord: `821AB168 823794C8 824C3C28 82517528 82519710 825C1690 825C1740 825D5EB8 82733F08 8273D1D0 8274E198
+  8274E230 8274EFE8 8274F158 82750ED8 8275C110 828B5BC0 828B6950 828B6DF0 828B6F70 828B6F98 828B74A8 828B7E70
+  828B8038 828B8678 828B8740 828CE650 82B94D28 82B94DF0`
+- GetProfile: `8217B650 822FDCD8 8243DD10 82462650 8257BC98 825BA858 8262B350 8263B5C0 8273F150 8274F040 828B5BC0
+  828B9E40 828C3318 828CE650 82B94D28`
+- roster lists `sub_82736C68` (stride 2580): `82448A90 8244AE00 8244B238`; the 12 functions with x 2580:
+  `8245E2C8 8245EE58 8245F1C0 8245F5F8 8245FFA0 82460228 824611B8 82462CF8 82462E58 82463948 82464560 82734970`
+- 242 x 980 table `sub_82626EB0`: `822FD4B8 82628710 82628B10 82635160`; portrait cache `sub_82741FC0` (268):
+  `82742078`; roster snapshot `sub_8243B6F0`: `82439C70 8246E548 82BAFFA0 82BB00C0`
+- save copy `sub_8257A218`: `82487B78 82487D28 827237B0`; save writer `sub_827235D8`: no direct `bl` (called
+  through a pointer).
+
+### 1.4 The other "322" and "242"
+
+- **322** (`cmpwi` / `cmplwi` / `li`) appears in **210 functions** (your D14 note says ~211). Only 17
+  of them call a roster accessor: the others check an id before indexing a per-id array inside an object. Most used
+  globals in those functions (16-byte blocks): 0x82EDE630 (45 functions), 0x82EDE620 (17), 0x82EDDBE0 (9), 0x82E3CD40
+  (8), 0x82E3DB60 (7), 0x82EC4B50 (7), 0x82E3C1F0 (6), 0x82E3CC50, 0x82EDEB40, 0x82EC1A60, 0x82EDEC30, 0x82EED290,
+  0x82DCE970 (5 each). Strides seen in them: x 68 (9 functions), x 1352 (8), x 204 (5), x 1056 (4), x 645 (3), x 260,
+  x 280, x 2580, x 88, x 2116, x 100.
+- **242** appears in **30 functions** (16 call roster accessors): `821B7040 822C9F48 822E2350 822ECDF8 823BA890
+  8243A380 8243A488 8243A590 8243A9E0 8243AAA0 8243AB60 8243AC98 82522D38 825230E8 8257A230 82594C78 82595240
+  8259C7D0 8259C838 8259C8A8 8259C9A8 8259CAA8 8259CBF8 825ACFF8 825E0E90 82626EB0 82626F48 82741FC0 82749D58
+  8274A880`.
+- 222 / 272 / 292 as immediates (27 / 95 / 18 functions) never sit next to a roster accessor: probably unrelated
+  (UI sizes), except where `RosterListLength` is called.
+
+---
+
+## 2. Design
+
+- `big_roster` cvar. `N` extension slots (e.g. 256). **Extended ids: 322 .. 321 + N. Extended indices: 292 .. 291 + N**
+  (after the CAW part, so the 222 / 242 / 272 / 292 list layouts keep their meaning).
+- Ids, indices and storage of the stock roster never move: `SaveData.dat` keeps its exact layout.
+- Extension storage allocated once at boot (`g_memory->SystemHeapAlloc`, like your `GrowDirectory`): records N x 260,
+  profiles N x 1 056, entries N x 40, plus the moved tables: IdToIndex `u16[322 + N]`, IndexToId `u16[292 + N]`,
+  Present `u8[322 + N]` (stock contents copied first).
+- Which ids exist: at boot, after chEtc is mounted, the CHAR/DAT keys >= 322 found in the game's and the last DLC's
+  chEtc.pac, sorted (stable across sessions); everything is keyed **by id** on disk (never by extended index).
+
+## 3. Phases
+
+### Phase 1 — dynamic id tables (small)
+Replace the 7 functions of 1.2:
+- IdToIndex / IsPresent: bound `322 + N` instead of 322, read the moved tables;
+- IndexToId: moved table;
+- `sub_828B83B0` / `sub_828B84F8`: walk indices 0-241 **and** 292 .. 291 + N;
+- RosterListLength: return `+ N` only for callers that build the full list, and only if they allocate from the
+  returned length (check its 9 callers: `82439910 82439A50 824A50B8 824A79D8 824AD060 82628B10 82734828 82736C68
+  82736FD8`);
+- KindNumberToId: maybe a 4th "kind" for extended numbers, if the menus use it.
+Test: `big_roster` on with N = 0 must behave exactly like stock.
+
+### Phase 2 — storage (small to medium)
+- In GetRecord / GetProfile / GetEntry40 and RecordByIndex (`sub_8257A238`) / `sub_8257A2C0` / `sub_8257A748` /
+  `sub_8257B888`: index >= 292 -> extension buffer (`ext + (idx - 292) * size`).
+- Review the inline x 260 / x 1056 users listed in 1.3: loops over 0-241 can stay (they will just ignore extended
+  superstars) unless they must include them (reset, copy, stats); direct computations from an index must be routed.
+
+### Phase 3 — content for ids >= 322 (small to medium)
+Once phases 1-2 exist, the CHAR/DAT and CHAR/PRO loaders should fill the extension through GetRecord / GetProfile;
+check them for their own `< 322` test (your `Remember` / `ApplyRecords` run right after them). Per-id content that a
+new superstar needs (what Piloun1's tool writes today for an id): COS attire records (by id: table capacity, see the
+request's R1), model (`ch\NNN.pac`, or attires hosted in an existing pac, which the game already finds by name),
+renders SSFA / SSFB / SSFC / SSFD by id, name text ids, crowd-sign ids (id x 10 + n), announcer name, music / movie /
+entrance in the profile, victory scene 6000 + id (6322+ is inside Anthology's 50-999 range, A17).
+
+### Phase 4 — per-id arrays in objects (large: the real work)
+For each object behind the globals of 1.4 (start with 0x82EDE630 and 0x82EDE620, 62 functions between them): find the
+allocation of the per-id array (size 322 x stride + header), allocate `322 + N` instead, and raise the bound in the
+functions that index it. In your generated C++ the bound is a literal 322 inside these functions, so it can be done
+like `anthology_redo.py`: an "A25" list of `(function, '322', 'g_bigRosterIds', count)` substitutions, written after
+reviewing each function (the CSV lists them; column `compare_immediates`). Do not replace 322 blindly: some may be
+something else that happens to be 322.
+
+### Phase 5 — select screen and lists (medium)
+`sub_82736C68` (lists of 322 entries x stride 2580) and the 12 x 2580 functions; the 242 x 980 table
+(`sub_82626EB0`); the 268-entry portrait cache (`sub_82741FC0`); the roster snapshot (`sub_8243B6F0`). For the UI, the
+1.0.2 "Downloaded Superstars" tile is the natural place: a paged list that can hold the extended ids too.
+
+### Phase 6 — saving (medium)
+- Side file next to `SaveData.dat` (e.g. `BigRoster.dat`): header, CRC, then by id: record 260, profile 1 056,
+  entry 40. Written in your hook of the save writer (`sub_827235D8`), read after the save copy (`sub_8257A218`).
+- References to extended ids stored in the stock save must be replaced by stand-ins before the stock write and put
+  back after load (else Xenia's stock program would read ids >= 322): tag teams (A + 0xF5C8, 70 x 270, members u16 at
+  +2..+10), title holders (B + 0x40C18), Universe (A + 0x364B4 and following), Story Designer, highlight reels.
+
+### Phase 7 — tests (Piloun1 can do them)
+1. N = 0: identical to stock (regression).
+2. N = 1: a clone of an existing superstar on id 322 (same record / profile / attires / model): select screen, match,
+   edit, save, reload, Xenia still loads the stock save.
+3. N = 10, then 50: memory, lists, Royal Rumble (30 entrants), title / team references to extended ids.
+Piloun1's tool can produce the test content (CHAR/DAT and CHAR/PRO entries for ids >= 322, COS records, hosted
+attires, renders) and check the save files.
+
+## 4. Things to check first
+
+- Yumboy11's A12 / A15 / A22 / A23 compare "ids" (0-49, >= 100, 20-24): make sure they are not superstar ids, or
+  adapt them.
+- Ids stored in one byte anywhere (replays, online, menus) would break at 256: ids already go to 321, so most storage
+  is u16, but check the D15 online translation.
+- The 8 Anthology modes (8 `.h` lists, 4 COS tables): extension content must be visible in every mode.
+- Pac directory memory (A1, 0x4B000) when many new pacs are mounted (your `GrowDirectory` already moves it).
