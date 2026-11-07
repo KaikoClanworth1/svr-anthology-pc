@@ -2368,7 +2368,7 @@ uint32_t KeyAlias(uint8_t* base, const char* n) {
                                   std::none_of(g_mods.begin(), g_mods.end(), [v](const Mod& x) { return x.key == v; })));
     if (empty_id && !standin_off && (kind % 10 == 0 || kind % 10 == 2)) {
       static std::atomic<int> said{0};
-      if (said++ < 8)
+      if (!svr2011::kAnthology && said++ < 8)  // (the Anthology: said by the lookup's hook, only on a real miss)
         REXLOG_WARN("[svr2011] superstar mods: '/EMD/{:06}{:02}' - no mod on id {}: the model of id 139 stands in", v, kind, v);
       std::snprintf(out, sizeof out, "%.*sEMD/00013902", int(n[0] == '/'), n);
     } else if (p == asked) {
@@ -2415,7 +2415,21 @@ REX_HOOK_RAW(sub_826B87B0) {
     }
   }
   // a superstar mod's model / renders: its key's entries (KeyAlias)
-  else if (const uint32_t key = KeyAlias(base, reinterpret_cast<const char*>(base + ctx.r4.u32))) ctx.r4.u64 = key;
+  else if (const uint32_t key = KeyAlias(base, reinterpret_cast<const char*>(base + ctx.r4.u32))) {
+    // (the Anthology: Yumboy11 has his own superstars on the pool ids - the empty-id stand-in only if the name really misses)
+    bool his_own = false;
+    if (svr2011::kAnthology) {
+      auto probe = ctx;
+      __imp__sub_826B87B0(probe, base);
+      his_own = probe.r3.u32 != 0;
+    }
+    if (svr2011::kAnthology && !his_own) {
+      static std::atomic<int> said{0};
+      if (said++ < 8)
+        REXLOG_WARN("[svr2011] anthology: no model for '{:.16}': the model of id 139 stands in", reinterpret_cast<const char*>(base + ctx.r4.u32));
+    }
+    if (!his_own) ctx.r4.u64 = key;
+  }
   // Test aid: SVR2011_TEST_VFS_TRACE=<text> - every lookup whose name holds that text: the result and the
   // out record's first 16 bytes (which archive answered), once per name and result
   static const std::string trace = [] { const char* e = std::getenv("SVR2011_TEST_VFS_TRACE"); return std::string(e ? e : ""); }();
