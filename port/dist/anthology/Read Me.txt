@@ -2,6 +2,11 @@ SVR ANTHOLOGY by Yumboy11 - on the WWE SmackDown vs. Raw 2011 PC recomp
 ==========================================================================
 SVR Anthology PC 1.0.3 (on the SvR 2011 PC recomp 2.2.0 + the 2.2.1 fixes by KaikoClanworth)
 
+Updates: from 1.0.3 on, the launcher looks for a new version each time it starts (it asks
+GitHub, nothing else) and shows an Update button at the bottom of its sidebar. The update
+replaces this program's files only. Your saves, settings and Yumboy11's Anthology folder
+stay as they are.
+
 SVR Anthology is made by Yumboy11. All credit for it goes to Yumboy11 and the
 people he thanks in his own Readme.txt (in his installer's folder):
 Brienj, Red Rooster, ryokudou, littlebase631, theviper12, xtremebrett,

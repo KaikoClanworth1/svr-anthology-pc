@@ -29,9 +29,19 @@
 #include "update_log.h"
 
 #define GAME_EXE     L"svr2011.exe"
+#ifdef SVR2011_ANTHOLOGY_RELEASE   /* (SVR Anthology's own: its launcher, its releases - never the port's) */
+#define LAUNCHER_EXE L"SvR Anthology Launcher.exe"
+#define UPDATER_EXE  L"SvR Anthology Updater.exe"
+#define TITLE        L"SVR Anthology PC - Updater"
+#define UPDATED_TEXT L"SVR Anthology PC is updated. Your saves, settings and Yumboy11's Anthology folder were not touched. The launcher starts again now."
+#define START_TEXT   L"Start the SvR Anthology launcher: it offers an update when there is one."
+#else
 #define LAUNCHER_EXE L"SvR2011 Launcher.exe"
 #define UPDATER_EXE  L"SvR2011 Updater.exe"
 #define TITLE        L"SvR 2011 PC port - Updater"
+#define UPDATED_TEXT L"The PC port is updated. The launcher starts again now."
+#define START_TEXT   L"Start the SvR 2011 launcher and use its Update button."
+#endif
 
 static WCHAR s_game[MAX_PATH], s_launcher[MAX_PATH], s_self[MAX_PATH];
 static HWND s_wnd, s_text, s_bar;
@@ -398,7 +408,7 @@ static int install_release(const UpdateInfo *info, WCHAR *err, size_t errn)
     WIN32_FIND_DATAW fd;
     HANDLE h;
     download_dir(dir);
-    swprintf_s(name, 80, L"SvR2011-PC-v%s.zip", info->version);
+    swprintf_s(name, 80, UPDATE_ZIP_PREFIX_W L"v%s.zip", info->version);
     join(zip, dir, name);
     if (!file_exists(zip)) {
         say(L"Downloading version %s\x2026", info->version);
@@ -410,7 +420,7 @@ static int install_release(const UpdateInfo *info, WCHAR *err, size_t errn)
             return 0;
         }
     }
-    if (join(pat, dir, L"SvR2011-PC-v*.zip") && (h = FindFirstFileW(pat, &fd)) != INVALID_HANDLE_VALUE) {
+    if (join(pat, dir, UPDATE_ZIP_PREFIX_W L"v*.zip") && (h = FindFirstFileW(pat, &fd)) != INVALID_HANDLE_VALUE) {
         do {   /* (older releases' zips) */
             if (join(other, dir, fd.cFileName) && _wcsicmp(other, zip))
                 DeleteFileW(other);
@@ -419,7 +429,21 @@ static int install_release(const UpdateInfo *info, WCHAR *err, size_t errn)
     }
     if (s_bar)
         PostMessageW(s_bar, PBM_SETPOS, 100, 0);
+#ifdef SVR2011_ANTHOLOGY_RELEASE
+    {   /* (no repair page here to use the zip again: a good update leaves nothing behind; a failed one keeps it) */
+        WCHAR tools[MAX_PATH], downloads[MAX_PATH];
+        if (!install_zip(zip, err, errn))
+            return 0;
+        DeleteFileW(zip);
+        if (join(tools, s_launcher, L"Tools") && join(downloads, tools, L".downloads") && same_dir(downloads, dir)) {
+            RemoveDirectoryW(downloads);
+            RemoveDirectoryW(tools);   /* (only when empty: adb may live there) */
+        }
+        return 1;
+    }
+#else
     return install_zip(zip, err, errn);
+#endif
 }
 
 /* The launcher again (shown normally, whatever started us); `updated` = after a good update. */
@@ -618,7 +642,7 @@ static int repair_install(const WCHAR *version, int *count, WCHAR *err, size_t e
         }
         if (!bad.n)
             continue;
-        swprintf_s(name, 80, L"SvR2011-PC-v%s.zip", rc.version);
+        swprintf_s(name, 80, UPDATE_ZIP_PREFIX_W L"v%s.zip", rc.version);
         join(zip, ddir, name);
         if (file_exists(zip))
             z.file = CreateFileW(zip, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
@@ -689,7 +713,7 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         if (wp && s_repair) {   /* (a quiet success: no box, the launcher just comes back) */
             start_launcher(1);
         } else if (wp) {
-            MessageBoxW(w, L"The PC port is updated. The launcher starts again now.", TITLE, MB_OK | MB_ICONINFORMATION);
+            MessageBoxW(w, UPDATED_TEXT, TITLE, MB_OK | MB_ICONINFORMATION);
             start_launcher(1);
         } else {
             WCHAR msg[800];
@@ -797,7 +821,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
         *slash = 0;
     wcscpy_s(s_game, MAX_PATH, s_launcher);
     if (!argv || argc < 2) {
-        MessageBoxW(NULL, L"Start the SvR 2011 launcher and use its Update button.", TITLE, MB_OK | MB_ICONINFORMATION);
+        MessageBoxW(NULL, START_TEXT, TITLE, MB_OK | MB_ICONINFORMATION);
         return 1;
     }
     if (!wcscmp(argv[1], L"--repair-cli") && argc >= 3) {   /* <game folder> [<version>] (tests, no window) */
@@ -876,6 +900,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
         cprint(L"updated %s from %s\n", s_game, argv[2]);
         return 0;
     }
-    MessageBoxW(NULL, L"Start the SvR 2011 launcher and use its Update button.", TITLE, MB_OK | MB_ICONINFORMATION);
+    MessageBoxW(NULL, START_TEXT, TITLE, MB_OK | MB_ICONINFORMATION);
     return 1;
 }

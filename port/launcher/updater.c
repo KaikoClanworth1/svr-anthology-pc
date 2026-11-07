@@ -25,7 +25,11 @@
 
 #pragma comment(lib, "winhttp.lib")
 
+#ifdef SVR2011_ANTHOLOGY_RELEASE
+#define AGENT L"SvR-Anthology-PC-Launcher"
+#else
 #define AGENT L"SvR2011-PC-Launcher"
+#endif
 
 typedef struct { HINTERNET session, connect, request; } Http;
 
@@ -216,10 +220,11 @@ static int update_read(const WCHAR *api, UpdateInfo *out, WCHAR *err, size_t err
     if (!json_string(rel, end, "tag_name", tag, sizeof tag)) goto bad;
     json_string(json, end, "html_url", page, sizeof page);
     out->prerelease = json_bool(json, end, "prerelease");
-    /* its zip: the first asset named SvR2011-PC-*.zip */
+    /* its zip: the first asset named SvR2011-PC-*.zip (the Anthology's: SvR-Anthology-PC-*.zip) */
     snprintf(prefix, sizeof prefix, "https://github.com/%ls/releases/download/", UPDATE_REPO);
     for (a = rel; (a = json_string(a, end, "name", name, sizeof name)) != NULL;) {
-        if (!strncmp(name, "SvR2011-PC-", 11) && strlen(name) > 4 && !_stricmp(name + strlen(name) - 4, ".zip")) {
+        if (!strncmp(name, UPDATE_ZIP_PREFIX, sizeof UPDATE_ZIP_PREFIX - 1) && strlen(name) > 4 &&
+            !_stricmp(name + strlen(name) - 4, ".zip")) {
             const char *u = json_string(a, end, "browser_download_url", url, sizeof url);
             const char *sz = strstr(a, "\"size\"");
             if (!u || strncmp(url, prefix, strlen(prefix))) break;   /* only this repository's downloads */
@@ -247,7 +252,7 @@ static int update_direct(const WCHAR *version, UpdateInfo *out, WCHAR *err, size
     char one;
     uint64_t total = 0;
     memset(out, 0, sizeof *out);
-    swprintf_s(out->url, 1024, L"https://github.com/" UPDATE_REPO L"/releases/download/v%s/SvR2011-PC-v%s.zip",
+    swprintf_s(out->url, 1024, L"https://github.com/" UPDATE_REPO L"/releases/download/v%s/" UPDATE_ZIP_PREFIX_W L"v%s.zip",
                version, version);
     swprintf_s(out->page, 512, L"https://github.com/" UPDATE_REPO L"/releases/tag/v%s", version);
     wcsncpy_s(out->version, 32, version, _TRUNCATE);

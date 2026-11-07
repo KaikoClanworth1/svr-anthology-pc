@@ -50,12 +50,17 @@ int release_check(const WCHAR *dir, const WCHAR *list, int hashes, ReleaseCheck 
         return 0;
     if (_wfopen_s(&f, lp, L"rb") || !f)
         return 0;
-    if (!fgets(line, sizeof line, f) || strncmp(line, "SvR2011 release ", 16)) {
+#ifdef SVR2011_ANTHOLOGY_RELEASE
+#define LIST_HEADER "SvR Anthology release "   /* (tools/package_anthology.ps1) */
+#else
+#define LIST_HEADER "SvR2011 release "
+#endif
+    if (!fgets(line, sizeof line, f) || strncmp(line, LIST_HEADER, sizeof LIST_HEADER - 1)) {
         fclose(f);
         return 0;
     }
     line[strcspn(line, "\r\n")] = 0;
-    MultiByteToWideChar(CP_UTF8, 0, line + 16, -1, out->version, 32);
+    MultiByteToWideChar(CP_UTF8, 0, line + sizeof LIST_HEADER - 1, -1, out->version, 32);
     while (fgets(line, sizeof line, f)) {
         char *t1, *t2, hex[65];
         unsigned long long size;

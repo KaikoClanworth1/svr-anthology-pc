@@ -21,6 +21,12 @@
  *                            (his saves into <dest>\Saves, his DLC packages into <dest>\DLC)
  *                        --capture <play|settings|setup> <file.bmp>
  *                            (the window drawn off-screen, never shown or activated, saved as a BMP)
+ *                        --capture update <file.bmp>
+ *                            (the Play page with the update button, nothing asked of GitHub)
+ *
+ * Updates: at the window's start one look at this program's GitHub releases; a newer one puts an Update button in
+ * the sidebar. The button starts SvR Anthology Updater.exe (updater_main.c) and closes: it replaces this
+ * program's own files only, from this program's own release zip - never anything of Yumboy11's.
  */
 #define COBJMACROS
 #include <windows.h>
@@ -100,12 +106,16 @@ enum {
     ID_SHOWFPS, ID_MSAA, ID_RENDERER, ID_PREPARE, ID_TEXTURES, ID_INPUT, ID_AUDIO, ID_MUTE, ID_PRIORITY, ID_LANGUAGE,
     ID_UNLOCK_ALL, ID_MATCH_CAMERA, ID_DEFAULTS, ID_SAVE, ID_SETTINGS_STATUS,
     /* Phone */
-    ID_PHONE_INSTALL, ID_PHONE_CANCEL, ID_PHONE_PROGRESS, ID_PHONE_STATUS
+    ID_PHONE_INSTALL, ID_PHONE_CANCEL, ID_PHONE_PROGRESS, ID_PHONE_STATUS,
+    ID_UPDATE
 };
 #define WM_INSTALLER_DONE (WM_APP + 1)
 #define WM_PHONE (WM_APP + 2)        /* wParam: progress 0-1000, PHONE_OK / PHONE_FAILED; lParam: a text */
 #define PHONE_OK 2000
 #define PHONE_FAILED 2001
+#define WM_UPDATE_FOUND (WM_APP + 3)  /* lParam: the UpdateInfo of a newer release */
+#define PAGE_NONE (-2)                /* (a control shown on its own terms: the update button) */
+#define UPDATER_EXE L"SvR Anthology Updater.exe"
 
 static HWND s_wnd;
 static HINSTANCE s_hinst;
@@ -119,6 +129,7 @@ static WCHAR s_iso[MAX_PATH], s_inst[MAX_PATH], s_game[MAX_PATH];
 static HANDLE s_installer;     /* Yumboy11's installer while it runs */
 static HANDLE s_game_proc;
 static int s_ready;            /* the Anthology is set up: PLAY can start it */
+static UpdateInfo s_update;    /* a newer release (version empty: none known) */
 
 static int S(int v) { return MulDiv(v, s_dpi, 96); }
 
@@ -600,6 +611,7 @@ static void refresh(void)
         wcscpy_s(t, 400, L"SVR Anthology isn't set up yet: open Setup (your ISO, Yumboy11's installer, his saves and DLC).");
     set_text(ID_STATUS, t);
     ShowWindow(ctl(ID_GO_SETUP), s_page == PAGE_PLAY && !s_ready ? SW_SHOWNOACTIVATE : SW_HIDE);
+    ShowWindow(ctl(ID_UPDATE), s_update.version[0] ? SW_SHOWNOACTIVATE : SW_HIDE);
     InvalidateRect(s_wnd, NULL, FALSE);
 }
 
@@ -1007,12 +1019,75 @@ static void credits(void)
                 L"Credits - SVR Anthology by Yumboy11", MB_ICONINFORMATION);
 }
 
+/* ---- updates ---- */
+
+/* One look at this program's releases (nothing downloaded); never in the way when GitHub can't be reached. */
+static DWORD WINAPI update_check_thread(LPVOID unused)
+{
+    static UpdateInfo info;
+    WCHAR err[700];
+    (void)unused;
+    if (update_check(&info, err, 700) && version_newer(info.version, PORT_VERSION))
+        PostMessageW(s_wnd, WM_UPDATE_FOUND, 0, (LPARAM)&info);
+    return 0;
+}
+
+static void update_start(void)
+{
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    WCHAR exe[MAX_PATH], cmd[3 * MAX_PATH + 64], ask[500];
+    if (s_installer || IsWindowEnabled(ctl(ID_PHONE_CANCEL))) {
+        MessageBoxW(s_wnd, L"Wait for Yumboy11's installer or the phone install to finish first.", WINDOW_TITLE, MB_ICONINFORMATION);
+        return;
+    }
+    if (s_game_proc && WaitForSingleObject(s_game_proc, 0) == WAIT_TIMEOUT) {
+        MessageBoxW(s_wnd, L"Close the game first, then update.", WINDOW_TITLE, MB_ICONINFORMATION);
+        return;
+    }
+    if (!join(exe, s_dir, UPDATER_EXE) || !has_file(s_dir, UPDATER_EXE)) {
+        MessageBoxW(s_wnd, UPDATER_EXE L" is missing beside the launcher: download the newest release from "
+                           L"github.com/" UPDATE_REPO L"/releases instead.", WINDOW_TITLE, MB_ICONWARNING);
+        return;
+    }
+    swprintf_s(ask, 500, L"Update from version %s to %s? It downloads about %llu MB from this program's GitHub "
+                         L"releases and the launcher starts again after it.\n\nYour saves, settings and Yumboy11's "
+                         L"Anthology folder are not touched.\n\nThe Android app isn't updated by this: use the Phone page after it.",
+               PORT_VERSION, s_update.version, (unsigned long long)(s_update.size >> 20));
+    if (MessageBoxW(s_wnd, ask, WINDOW_TITLE, MB_YESNO | MB_ICONQUESTION) != IDYES)
+        return;
+    swprintf_s(cmd, 3 * MAX_PATH + 64, L"\"%s\" --apply \"%s\" \"%s\" --version %s", exe, s_dir, s_dir, s_update.version);
+    ZeroMemory(&si, sizeof si);
+    si.cb = sizeof si;
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_SHOWNORMAL;
+    if (!CreateProcessW(exe, cmd, NULL, NULL, FALSE, 0, NULL, s_dir, &si, &pi)) {
+        MessageBoxW(s_wnd, L"Could not start " UPDATER_EXE L".", WINDOW_TITLE, MB_ICONWARNING);
+        return;
+    }
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    DestroyWindow(s_wnd);   /* (the updater waits for this program to close) */
+}
+
+/* The updater's own new copy, which it can't put in place while it runs. */
+static void update_place_new_updater(void)
+{
+    WCHAR exe[MAX_PATH], nw[MAX_PATH + 8];
+    if (!join(exe, s_dir, UPDATER_EXE)) return;
+    swprintf_s(nw, MAX_PATH + 8, L"%s.new", exe);
+    if (GetFileAttributesW(nw) != INVALID_FILE_ATTRIBUTES)
+        MoveFileExW(nw, exe, MOVEFILE_REPLACE_EXISTING);
+}
+
 /* ---- the pages ---- */
 
 static void build_window(void)
 {
     HWND h;
     int i;
+    /* The sidebar's Update button, above the credit line (hidden until a newer release is known). */
+    add(PAGE_NONE, L"Button", L"Update", BS_DEFPUSHBUTTON | WS_TABSTOP, 16 - X0, 516, SB_W - 32, 42, ID_UPDATE);
     /* Play: the Anthology's card (his cover art on the right), the state, the credit. */
     card(PAGE_PLAY, 0, 0, 724, 360, NULL);
     add(PAGE_PLAY, L"Button", L"Play", BS_DEFPUSHBUTTON | WS_TABSTOP, 28, 212, 190, 60, ID_PLAY);
@@ -1333,7 +1408,12 @@ static void draw_button(const DRAWITEMSTRUCT *d)
     WCHAR text[128];
     COLORREF fill, line, ink;
     HDC dc = d->hDC;
-    FillRect(dc, &r, p && p->card ? s_card_brush : s_page_brush);
+    if (GetDlgCtrlID(d->hwndItem) == ID_UPDATE) {   /* (it stands on the sidebar) */
+        HBRUSH b = CreateSolidBrush(C_SIDEBAR);
+        FillRect(dc, &r, b);
+        DeleteObject(b);
+    } else
+        FillRect(dc, &r, p && p->card ? s_card_brush : s_page_brush);
     if (primary) {
         fill = disabled ? RGB(48, 51, 58) : down ? C_ACCENT_DOWN : C_ACCENT;
         line = THEME_NONE;
@@ -1410,6 +1490,7 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
             break;
         }
         case ID_PLAY: play(); break;
+        case ID_UPDATE: update_start(); break;
         case ID_CREDITS: credits(); break;
         case ID_README: {
             WCHAR p[MAX_PATH];
@@ -1431,6 +1512,14 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_INSTALLER_DONE: installer_done((DWORD)wp); return 0;
     case WM_PHONE: phone_message(wp, (WCHAR *)lp); return 0;
+    case WM_UPDATE_FOUND: {
+        WCHAR t[64];
+        s_update = *(const UpdateInfo *)lp;
+        swprintf_s(t, 64, L"Update to %s", s_update.version);
+        set_text(ID_UPDATE, t);
+        refresh();
+        return 0;
+    }
     case WM_LBUTTONDOWN: {
         const int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
         if (x < S(SB_W) && y >= S(NAV_TOP) && y < S(NAV_TOP + PAGE_COUNT * NAV_H))
@@ -1571,6 +1660,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR args, int show)
     WNDCLASSW wc = {0};
     MSG m;
     int argc = 0, capture_page = -1;
+    int capture_update = 0;
     const WCHAR *capture_file = NULL;
     WCHAR **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     (void)prev; (void)args;
@@ -1617,6 +1707,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR args, int show)
                          : !wcscmp(argv[2], L"report") ? PAGE_REPORT : !wcscmp(argv[2], L"myreports") ? PAGE_MY_REPORTS
                          : !wcscmp(argv[2], L"phone") ? PAGE_PHONE : PAGE_PLAY;
             capture_file = argv[3];
+            capture_update = !wcscmp(argv[2], L"update");
         }
     }
     /* Test aid: --adb-install <out file> - Install to phone without the window (the result in the file). */
@@ -1641,8 +1732,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR args, int show)
         return write_result(argv[2], r) || !(game && xex && app);
     }
     /* (a test aid with too few arguments, or an unknown one: never the window) */
-    if (argv && argc >= 2 && argv[1][0] == L'-' && argv[1][1] == L'-' && !capture_file)
+    if (argv && argc >= 2 && argv[1][0] == L'-' && argv[1][1] == L'-' && !capture_file && wcscmp(argv[1], L"--updated"))
         return 2;
+    update_place_new_updater();
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     InitCommonControls();
@@ -1690,6 +1782,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR args, int show)
         WCHAR why[300];
         show_page(capture_page >= 0 ? capture_page : check_game(s_game, why, 300) ? PAGE_PLAY : PAGE_SETUP);
     }
+    if (capture_update) {   /* (test aid: as if GitHub had a newer release, nothing asked of it) */
+        static UpdateInfo fake;
+        wcscpy_s(fake.version, 32, L"9.9.9");
+        wnd_proc(s_wnd, WM_UPDATE_FOUND, 0, (LPARAM)&fake);
+    }
     if (capture_file) {
         /* Drawn off-screen, never activated (tests run beside the user's work). */
         SetWindowPos(s_wnd, NULL, -8000, -8000, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
@@ -1710,6 +1807,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR args, int show)
     }
     ShowWindow(s_wnd, SW_SHOWNORMAL);
     UpdateWindow(s_wnd);
+    CloseHandle(CreateThread(NULL, 0, update_check_thread, NULL, 0, NULL));
     /* The credit first: on the first start, who made the Anthology. */
     if (!GetPrivateProfileIntW(L"Anthology", L"CreditsShown", 0, s_ini)) {
         credits();

@@ -3,7 +3,15 @@
 #include <windows.h>
 #include <stdint.h>
 
+#ifdef SVR2011_ANTHOLOGY_RELEASE   /* (SVR Anthology's launcher and updater: its own releases, its own zip) */
+#define UPDATE_REPO L"KaikoClanworth1/svr-anthology-pc"
+#define UPDATE_ZIP_PREFIX "SvR-Anthology-PC-"
+#define UPDATE_ZIP_PREFIX_W L"SvR-Anthology-PC-"
+#else
 #define UPDATE_REPO L"KaikoClanworth1/wwe-svr2011-pc"
+#define UPDATE_ZIP_PREFIX "SvR2011-PC-"
+#define UPDATE_ZIP_PREFIX_W L"SvR2011-PC-"
+#endif
 
 typedef struct UpdateInfo {
     WCHAR version[32];         /* the newest release, "0.2.0" (tag without the v) */
