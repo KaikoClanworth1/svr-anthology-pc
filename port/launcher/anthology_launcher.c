@@ -1215,8 +1215,8 @@ static void build_window(void)
     add(PAGE_PHONE, L"Static", L"", SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS, 0, 248, 724, 22, ID_PHONE_STATUS);
     card(PAGE_PHONE, 0, 286, 724, 160, L"No USB debugging? Copy by cable instead");
     add(PAGE_PHONE, L"Static",
-        L"Install the app (Android\SvR Anthology.apk in this folder) and open it once. Connect the phone, choose "
-        L"File transfer, and copy these into the phone's games  3A SVR Anthology folder: the \"" ANTHOLOGY_GAME
+        L"Install the app (Android\\SvR Anthology.apk in this folder) and open it once. Connect the phone, choose "
+        L"File transfer, and copy these into the phone's games\\SVR Anthology folder: the \"" ANTHOLOGY_GAME
         L"\" folder, the \"Original\" folder from this launcher's folder (made when you press Play here), and "
         L"(optional) the \"" ANTHOLOGY_SAVES L"\" folder. The app's Setup tab checks them.",
         SS_LEFT | SS_NOPREFIX, 18, 320, 690, 72, 0);
