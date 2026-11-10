@@ -4,6 +4,7 @@
 #   svrtest.ps1 match --p1 EDGE --p2 KANE [--p3 ..] [--attire 2,1] [--arena 9] [--rule 3C] [--entrances]
 #                     [--shot 5s] [--shots every:2s:5] [--state 8s] [--fast 2] [--until "<log text>"] [--quit 15s]
 #                     [--boot] [--cpu all]   (--boot, dbg only: straight into the match - no title, no menus)
+#                     [--rumble 2:111,6:114]  (with --rule 0x14..0x18: those list positions get those superstar ids)
 #   svrtest.ps1 entrance --p1 EDGE [--attire 2] [--shots every:6s:20]        (until "entrances over")
 #   svrtest.ps1 route <name> [--shot 3s] [--quit 10s]                       (script_input.cpp kRoutes)
 #   svrtest.ps1 lan --p1 EDGE --p2 KANE [--arena 1] [--rule 3C] [--pad1 <file>] [--pad2 <file>] [--clock 600,1200]
@@ -17,6 +18,7 @@
 #         --fresh (the user data may have no save: a first-start test - else svrtest refuses one without
 #         Saves\SaveData.dat, the game would sit in its first-time screens)
 #         --arg "<game option>" (more of the game's --options, repeatable)
+#         --keep-caw-index (Mods\SuperstarOverlay as the last run left it: CAW parts' index, a removed part mod)
 #         --keep-overlay (Mods\PacOverlay as the last run left it: a start that finds the overlay up to date)
 #
 # Each run: refuses when the player's game runs or 4 test games already do (any chat); refreshes the private
@@ -65,6 +67,7 @@ for ($i = 0; $i -lt $Rest.Count; $i++) {
         '^--attire$' { $o.attire = $v; $i++; continue }
         '^--arena$' { $o.arena = $v; $i++; continue }
         '^--rule$' { $o.rule = $v; $i++; continue }
+        '^--rumble$' { $env:SVR2011_TEST_RUMBLE_ENTRANTS = $v; $i++; continue }  # ("<pos>:<id>,..": a Royal Rumble's entrants - slobber_knocker.cpp)
         '^--entrances$' { $o.entrances = $true; continue }
         '^--shot$' { $o.shot += $v; $i++; continue }
         '^--shots$' { $o.every = $v; $i++; continue }
@@ -87,6 +90,7 @@ for ($i = 0; $i -lt $Rest.Count; $i++) {
         '^--name$' { $o.name = $v; $i++; continue }
         '^--keep$' { $o.keep = $true; continue }
         '^--keep-overlay$' { $o.keepoverlay = $true; continue }
+        '^--keep-caw-index$' { $o.keepcaw = $true; continue }
         '^--arg$' { $o.args += $v; $i++; continue }
         default { if (-not $o.target -and $a -notlike "--*") { $o.target = $a } else { throw "svrtest: unknown option $a" } }
     }
@@ -147,7 +151,9 @@ foreach ($f in "default.xex", "plist360.arc", "plist360_4x3.arc") {
 }
 $build = switch ($o.exe) { "release" { Join-Path $port "out\build\SourceRelease" } "dbg" { Join-Path $port "out\build\DebugSuite" } default { Split-Path $o.exe -Parent } }
 $exeName = switch ($o.exe) { "release" { "svr2011.exe" } "dbg" { "svr2011_dbg.exe" } default { Split-Path $o.exe -Leaf } }
-foreach ($f in $exeName, "rexruntime.dll", "rexgpu-xenos.dll") {
+foreach ($f in $exeName, "rexruntime.dll", "rexgpu-xenos.dll", "rexffmpeg.dll", "rexmspack.dll") {
+    # (the two LGPL DLLs: not in a build from an SDK copy without them)
+    if ($f -in "rexffmpeg.dll", "rexmspack.dll" -and -not (Test-Path (Join-Path $build $f))) { continue }
     $src = Join-Path $build $f
     if (-not (Test-Path $src) -and $f -ne $exeName) { $src = Join-Path $port "out\build\SourceRelease\$f" }
     if (-not (Test-Path $src)) { throw "svrtest: no $f in $build - build it first" }
@@ -159,8 +165,8 @@ foreach ($f in $exeName, "rexruntime.dll", "rexgpu-xenos.dll") {
     }
 }
 # its Mods: only --mods (a mod folder is placed by its manifest's type)
-$kinds = @{ superstar = "Superstars"; attire = "Attires"; arena = "Arenas"; moves = "Moves"; backstage = "Backstage"; signs = "Signs"; media = "Media"; backgrounds = "Backgrounds"; matchtype = "MatchTypes"; weapon = "Weapons"; title = "Titles" }
-Get-ChildItem (Join-Path $game "Mods") -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne ".convert" -and -not ($o.keepoverlay -and $_.Name -eq "PacOverlay") } | Remove-Item -Recurse -Force
+$kinds = @{ superstar = "Superstars"; attire = "Attires"; arena = "Arenas"; moves = "Moves"; backstage = "Backstage"; signs = "Signs"; media = "Media"; backgrounds = "Backgrounds"; matchtype = "MatchTypes"; weapon = "Weapons"; title = "Titles"; cawpart = "CawParts" }
+Get-ChildItem (Join-Path $game "Mods") -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne ".convert" -and -not ($o.keepoverlay -and $_.Name -eq "PacOverlay") -and -not ($o.keepcaw -and $_.Name -eq "SuperstarOverlay") } | Remove-Item -Recurse -Force
 if ($o.mods -and $o.mods -ne "none") {
     foreach ($m in $o.mods -split ',') {
         $man = Join-Path $m "manifest.txt"

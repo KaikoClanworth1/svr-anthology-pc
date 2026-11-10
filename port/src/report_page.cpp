@@ -51,6 +51,7 @@
 #include <rex/logging.h>
 #include <rex/ppc.h>
 #include <rex/system/xmemory.h>
+#include <rex/ui/keybinds.h>
 #include <rex/ui/imgui_dialog.h>
 #include <rex/ui/immediate_drawer.h>
 #include <rex/ui/window.h>
@@ -61,6 +62,7 @@
 #include "frame_rate.h"
 #include "match_diag.h"
 #include "match_record.h"
+#include "keyboard_typing.h"
 #include "native/native_renderer.h"
 
 #include "../launcher/report_urls.h"
@@ -69,6 +71,8 @@
 extern "C" {
 #include "report_flow.h"
 }
+#elif defined(__SWITCH__)
+#include "../switch/nx_report.h"
 #endif
 
 #ifndef SVR2011_PORT_VERSION
@@ -92,6 +96,25 @@ constexpr const char* kKindText[] = {"The game crashed (closed by itself)", "The
                                   "Something else"};
 constexpr const char* kHappensText[] = {"Every time", "Sometimes", "It happened once"};
 constexpr const char* kNeedWhat = "Please say what happened first.";  // (report_flow_check's words)
+
+// 2.2.1: the Discord name (the contact) is needed - the server's rule (reports.discord_name, report_send.c
+// report_discord_check): 2-32 characters, lowercase letters, digits, "_" and ".", no two dots in a row. Capitals are
+// made lower case. "" with the name in *out, else why.
+std::string DiscordWhy(const std::string& text, std::string* out) {
+  std::string s;
+  for (char c : text) s += char(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c);
+  while (!s.empty() && s.front() == ' ') s.erase(s.begin());
+  while (!s.empty() && s.back() == ' ') s.pop_back();
+  if (s.empty()) return "Add your Discord name - we answer there.";
+  if (s.find('@') != std::string::npos) return "Write your Discord name without the @.";
+  if (s.find('/') != std::string::npos || s.find(':') != std::string::npos) return "Write your Discord name, not a link.";
+  bool ok = s.size() >= 2 && s.size() <= 32 && s.find("..") == std::string::npos;
+  for (char c : s) ok = ok && ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '.');
+  if (!ok) return "That isn't a Discord name: 2-32 characters - lowercase letters, digits, _ and . (no spaces).";
+  *out = s;
+  return {};
+}
+std::string SavedDiscordName();  // (the last one sent from a form here - below, per platform)
 
 rex::ui::ImGuiDrawer* g_imgui = nullptr;
 rex::ui::ImmediateDrawer* g_drawer = nullptr;
@@ -224,6 +247,7 @@ struct Sent {
   bool done = false, ok = false;
   std::string id, why;
   int seen_before = 0;
+  bool account = false;  // (refused for the sign-in or the Discord name: the reason says what to do)
 };
 std::mutex g_sent_mutex;
 Sent g_sent;
@@ -272,12 +296,22 @@ Sent SendNow(const Send& s) {
   if (!picture.empty()) f.images[0] = picture.c_str(), f.n_images = 1;
   f.pictures_later = s.pictures_later;
   f.progress = Progress;
+  // (2.2.1: the launcher's saved sign-in, as leaderboards.cpp and p2p.cpp use it)
+  static std::string token;
+  token = rex::cvar::Query<std::string>("online_token");
+  f.token = token.c_str();
   static ReportResult r;
   out.ok = report_flow_send(&f, &r) != 0;
   out.id = r.id;
   out.seen_before = r.seen_before;
   out.why = r.why[0] ? Narrow(r.why) : "no answer from the server.";
+  out.account = r.code[0] != 0;  // (the server's account / Discord refusal: its words say what to do)
   return out;
+}
+std::string SavedDiscordName() {
+  WCHAR w[80];
+  report_discord_load(g_game_dir.wstring().c_str(), w, 80);
+  return Narrow(w);
 }
 #elif defined(__ANDROID__)
 // The app's class (from the activity's class loader: FindClass on a native thread sees only the system's).
@@ -353,7 +387,82 @@ Sent SendNow(const Send& s) {
     if (t2 != std::string::npos) out.seen_before = std::atoi(r.c_str() + t2 + 1);
   } else {
     out.why = t1 == std::string::npos ? "no answer from the server." : r.substr(t1 + 1);
+    out.account = r.rfind("account\t", 0) == 0;  // ("account\t<why>": the server's sign-in / Discord refusal)
   }
+  return out;
+}
+// The Discord name the app remembers (GameReport.discordName(): its settings, as its own report form keeps it).
+std::string SavedDiscordName() {
+  JNIEnv* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
+  jclass cls = env ? GameReportClass(env) : nullptr;
+  jmethodID m = cls ? env->GetStaticMethodID(cls, "discordName", "()Ljava/lang/String;") : nullptr;
+  if (!m) {
+    if (env && env->ExceptionCheck()) env->ExceptionClear();
+    return {};
+  }
+  auto res = static_cast<jstring>(env->CallStaticObjectMethod(cls, m));
+  if (env->ExceptionCheck()) env->ExceptionClear(), res = nullptr;
+  std::string name;
+  if (res) {
+    const char* c = env->GetStringUTFChars(res, nullptr);
+    name = c ? c : "";
+    if (c) env->ReleaseStringUTFChars(res, c);
+    env->DeleteLocalRef(res);
+  }
+  return name;
+}
+#elif defined(__SWITCH__)
+void SwitchProgress(uint64_t sent, uint64_t total) { g_progress_sent = sent, g_progress_total = total; }
+
+// The Discord name sent last (UserData/report_discord.txt, the PC launcher's file).
+std::string SavedDiscordName() {
+  std::ifstream in(g_game_dir / "UserData" / "report_discord.txt");
+  std::string name;
+  std::getline(in, name);
+  while (!name.empty() && (name.back() == '\r' || name.back() == ' ')) name.pop_back();
+  return name;
+}
+void SaveDiscordName(const std::string& name) {
+  std::error_code ec;
+  fs::create_directories(g_game_dir / "UserData", ec);
+  std::ofstream(g_game_dir / "UserData" / "report_discord.txt", std::ios::binary | std::ios::trunc) << name << "\n";
+}
+
+Sent SendNow(const Send& s) {
+  Sent out;
+  std::string server = s.server;
+#if defined(SVR_NX_REPORTS_LIVE)
+  if (server.empty()) server = "https://sho-ti.me/svr";
+#else
+  // A test build sends only where svr2011.toml says, and never to the public server.
+  if (server.empty() || server.find("sho-ti.me") != std::string::npos) {
+    out.why = "Test build: set online_server in svr2011.toml to a private server.";
+    return out;
+  }
+#endif
+  nx_report::Input in;
+  const std::u8string dir = g_game_dir.u8string();
+  in.game_dir.assign(dir.begin(), dir.end());
+  in.server = server;
+  in.version = SVR2011_PORT_VERSION;
+  in.problem = kKindText[s.answers.kind];
+  in.happens = kHappensText[s.answers.happens];
+  in.what = s.answers.what;
+  in.before = s.answers.before;
+  in.contact = s.answers.contact;  // (the Discord name, checked by the page)
+  in.token = rex::cvar::Query<std::string>("online_token");
+  in.match_dir = s.match_dir;
+  in.picture = s.picture;
+  in.with_save = s.with_save;
+  in.pictures_later = s.pictures_later;
+  in.progress = SwitchProgress;
+  const nx_report::Output r = nx_report::Send(in);
+  out.ok = r.ok;
+  out.id = r.id;
+  out.seen_before = r.seen_before;
+  out.why = r.why.empty() ? "no answer from the server." : r.why;
+  out.account = r.account;
+  if (r.ok) SaveDiscordName(s.answers.contact);
   return out;
 }
 #else
@@ -362,6 +471,7 @@ Sent SendNow(const Send&) {
   out.why = "Reports can't be sent from this build.";
   return out;
 }
+std::string SavedDiscordName() { return {}; }
 #endif
 
 void StartSend(Send s) {
@@ -533,9 +643,13 @@ std::string NewestMatch() {
 void ReportPage::Open() {
   from_pause_ = g_from_pause.load();
   a_ = {};
+  a_.contact = SavedDiscordName();  // (2.2.1: needed - the one sent last, ready)
   sel_ = 0;
   picture_ = kScreenshot;
   with_mods_ = with_save_ = true;
+#if defined(__SWITCH__)
+  with_mods_ = false;  // (the console's report doesn't send mods)
+#endif
   match_dir_ = NewestMatch();
   with_match_ = from_pause_ && !match_dir_.empty();  // (the match being played; from the menus the player picks)
   editing_ = -1;
@@ -573,7 +687,9 @@ void ReportPage::Activate(int row, int dir) {
     case kHappens: a_.happens = (a_.happens + int(std::size(kHappensText)) + step) % int(std::size(kHappensText)); break;
     case kPicture: picture_ = (picture_ + 3 + step) % 3; break;
     case kMatch: if (!match_dir_.empty()) with_match_ = !with_match_; break;
+#if !defined(__SWITCH__)
     case kMods: if (with_match_) with_mods_ = !with_mods_; break;
+#endif
     case kSave: with_save_ = !with_save_; break;
     case kWhat:
     case kBefore:
@@ -602,10 +718,17 @@ void ReportPage::SendIt() {
   }
   // (the server's rule too: no web addresses)
   const bool url_what = report_text_has_url(a_.what.c_str()), url_before = report_text_has_url(a_.before.c_str());
-  if (url_what || url_before || report_text_has_url(a_.contact.c_str())) {
+  if (url_what || url_before) {
     status_ = REPORT_NO_URLS, status_bad_ = true;
-    sel_ = url_what ? kWhat : url_before ? kBefore : kContact;
+    sel_ = url_what ? kWhat : kBefore;
     return;
+  }
+  if (std::string name, why = DiscordWhy(a_.contact, &name); !why.empty()) {
+    status_ = why, status_bad_ = true;
+    sel_ = kContact;
+    return;
+  } else {
+    a_.contact = name;
   }
   Send s;
   s.answers = a_;
@@ -634,6 +757,7 @@ void ReportPage::KeyPress(int r, int c) {
   if (r < 4) {
     char ch = kKeys[r][c];
     if (shift_ && ch >= 'a' && ch <= 'z') ch = char(ch - 'a' + 'A');
+    if (shift_ && ch == '\'') ch = '_';  // (Discord names have _)
     io.AddInputCharacter(uint32_t(uint8_t(ch)));
     return;
   }
@@ -716,6 +840,7 @@ bool ReportPage::DrawEditor(ImGuiIO& io, ImDrawList* dl, float s, const std::fun
       if (r < 4) {
         char ch = kKeys[r][c];
         if (shift_ && ch >= 'a' && ch <= 'z') ch = char(ch - 'a' + 'A');
+        if (shift_ && ch == '\'') ch = '_';
         k[0] = ch, k[1] = 0;
       } else {
         std::snprintf(k, sizeof k, "%s", c == 0 ? (shift_ ? "SHIFT ON" : "SHIFT") : c == 3 ? "SPACE" : c == 6 ? "DELETE" : "DONE");
@@ -769,7 +894,7 @@ void ReportPage::OnDraw(ImGuiIO& io) {
     if (g_sent.done) {
       sent_ = g_sent;
       state_ = sent_.ok ? State::kSent : State::kForm;
-      status_ = sent_.ok ? "" : "Not sent: " + sent_.why + " Check you're online, then try again.";
+      status_ = sent_.ok ? "" : "Not sent: " + sent_.why + (sent_.account ? "" : " Check you're online, then try again.");
       status_bad_ = !sent_.ok;
     }
   }
@@ -860,11 +985,16 @@ void ReportPage::OnDraw(ImGuiIO& io) {
     }
 #if defined(__ANDROID__)
     const char* where = "It's in the app's My reports: you'll see there when it's fixed or if we need more.";
+#elif defined(__SWITCH__)
+    const std::string where_text = "Your report number is " + sent_.id + ". Keep it if you want to ask about this report.";
+    const char* where = where_text.c_str();
 #else
     const char* where = "It's in the launcher's Reports tab: you'll see there when it's fixed or if we need more.";
 #endif
     Text(dl, g_menu_font, 18 * s, P(100, 280), kGrey, where, wrap);
+#if !defined(__SWITCH__)
     if (picture_ == kLater) Text(dl, g_menu_font, 18 * s, P(100, 320), kGold, "Add your pictures to it there.", wrap);
+#endif
     Hint(dl, P(84, 0).x, P(0, 660).y, s, "B", IM_COL32(200, 40, 40, 255), "CLOSE");
     if ((pressed & (X_INPUT_GAMEPAD_A | X_INPUT_GAMEPAD_B | X_INPUT_GAMEPAD_START)) || !taps.empty() ||
         ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_Enter, false))
@@ -922,8 +1052,8 @@ void ReportPage::OnDraw(ImGuiIO& io) {
         if (a_.before.empty()) vc = kGrey;
         break;
       case kContact:
-        value = a_.contact.empty() ? "(optional)" : cut(a_.contact);
-        if (a_.contact.empty()) vc = kGrey;
+        value = a_.contact.empty() ? "(needed - A to type)" : cut(a_.contact);
+        if (a_.contact.empty()) vc = kGold;
         break;
       case kPicture:
         value = picture_ == kScreenshot ? (shot_.rgb.empty() ? "SCREENSHOT (none yet)" : "SCREENSHOT")
@@ -1121,6 +1251,18 @@ void InstallReportPage(rex::ui::ImGuiDrawer* drawer, rex::ui::ImmediateDrawer* i
   g_game_dir = user_data.parent_path();
   if (window) window->app_context().CallInUIThread([window] { window->AddInputListener(&g_touch, 951); });
   new ReportPage(drawer);  // lives for the whole run
+  // F12 (the keyboard only; rebindable: bind_report_problem) opens the page at once - suggestion 072930. Not while
+  // something is being typed in (the game's keyboard, an overlay's field, an ImGui text box) or while it's open.
+  rex::ui::RegisterBind("bind_report_problem", "F12", "Report a problem (opens REPORT A PROBLEM)", [] {
+    if (g_open || g_open_requested || g_wait_release) return;
+    if (GameKeyboardOpen() || OverlayTyping() || (ImGui::GetCurrentContext() && ImGui::GetIO().WantTextInput)) {
+      REXLOG_INFO("[svr2011] report page: F12 left alone (text is being typed)");
+      return;
+    }
+    const bool paused = g_memory && PauseMenuUp(g_memory->virtual_membase());   // (the pause menu's own way then)
+    REXLOG_INFO("[svr2011] report page: F12 - opened{}", paused ? " (from the pause menu)" : "");
+    OpenReportPage(paused);
+  });
 }
 
 void SetReportPageFonts(ImFont* menu, ImFont* title) {

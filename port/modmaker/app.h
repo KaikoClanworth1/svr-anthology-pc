@@ -343,7 +343,7 @@ struct ProjectIn {
 
 // The project's type is its page. Pages the rail shows.
 enum class PageId { kArena, kEditor, kBackstage, kStar, kMoves, kSigns, kBackgrounds, kMedia, kMatch, kOther, kCaw, kAssets, kAnims, kIcons, kHelp, kPort, kAttire, kInstalled, kDiscs, kPortEntrance, kPortMoves, kPortTaunts,
-                    kStarPort, kArenaPort, kMovesPort, kBelts, kThreads, kTitle, kForFun, kCount };  // (the last four: "From another game" / belt tabs)
+                    kStarPort, kArenaPort, kMovesPort, kBelts, kThreads, kTitle, kForFun, kCawPart, kCount };  // (the last four: "From another game" / belt tabs)
 // What only a project holds (materials, the FBX steps, Reduce detail, gear picks, an arena's camera...) for a mod:
 // the page's project keys without its files, every absolute path cut to its file name (nothing of the author's
 // folders goes out with a shared mod). UI thread (it reads the page). "" for a page with no project keys.
@@ -470,7 +470,7 @@ extern PageHooks hooks; std::string SlotName(int slot); void ShowPose(int motion
                       const std::wstring& picture, const std::wstring& save);
                       void SetModel(const std::wstring& ch_pac);  // (a converted model)
                       void TestFiles(const std::wstring& song, const std::wstring& movie, const std::wstring& voice, int call);
-                      void TestHeight(float scale); void TestCallGain(float db); void TestMoveset(const std::string& spec); void ThreadsDraw(); void ThreadsTest(const std::string& spec); void TestCae(const std::string& id); void TestImportMoveset(const std::string& spec); void TestEntrance(int n); void TestVictory(int n); void TestVictoryPort(const std::string& spec); void TestInstall(); void TestWatchSlot(int off); void TestFull(const std::wstring& png); void TestLoad(const std::wstring& png); void TestHometown(const std::string& h); void TestPose(int id);
+                      void TestHeight(float scale); void TestCallGain(float db); void TestVictorySong(const std::wstring& file, float db); void TestMoveset(const std::string& spec); void ThreadsDraw(); void ThreadsTest(const std::string& spec); void TestCae(const std::string& id); void TestImportMoveset(const std::string& spec); void TestEntrance(int n); void TestVictory(int n); void TestVictoryPort(const std::string& spec); void TestInstall(); void TestWatchSlot(int off); void TestFull(const std::wstring& png); void TestLoad(const std::wstring& png); void TestHometown(const std::string& h); void TestPose(int id);
                       void TestFbx(const std::wstring& fbx, const std::string& map); void TestSimple(int step); void TestSimpleFrom(int step); void TestSimpleChain(const std::string& spec);
                       // entrance gear from another superstar (tools/svr11_build.py --gear-from / --onto): the game superstars
                       // with gear, a popup to pick one, and the transplant onto <target pac>'s attire (done(new pac) on success)
@@ -491,9 +491,10 @@ namespace signs_page { extern PageHooks hooks; void TestStart(const std::vector<
                        std::vector<ZipEntry> PackFiles(const std::string& id, const std::string& name, const std::string& author,
                                                        const std::vector<std::pair<std::string, Image>>& signs);
                        bool InstallPack(const std::string& id, const std::vector<ZipEntry>& files); }
+namespace caw_part_page { extern PageHooks hooks; void TestStart(const std::wstring& spec, const std::wstring& save); }
 namespace title_page { extern PageHooks hooks; void TestStart(const std::wstring& spec, const std::wstring& save); }
 namespace backgrounds_page { extern PageHooks hooks; void TestStart(const std::vector<std::wstring>& files, const std::wstring& save); }
-namespace media_page { extern PageHooks hooks; void SetTab(int tab); int Tab();  // 0 videos, 1 menus & renders, 2 audio
+namespace media_page { extern PageHooks hooks; void SetTab(int tab); int Tab(); void TestVictory(int id, const std::wstring& song);  // 0 videos, 1 menus & renders, 2 audio
                        void TestStart(int arena, const std::wstring& video,
                        const std::vector<std::wstring>& pictures, const std::wstring& save); }
 namespace moves_page { extern PageHooks hooks; void OpenPack(const std::wstring& folder); void TestPut(const std::wstring& spec); void TestOpen(const std::wstring& folder); void TestSave(const std::wstring& file); }
@@ -631,8 +632,9 @@ bool BinkFromVideoButton(const char* label, std::wstring& movie, const std::stri
 void ViewFooter();
 // WWE '12 - 2K17 "bgNN" pacs from 60 up aren't arenas (docs/ARENA_PORT_RESULTS.md, special stages): backstage rooms
 // (bg67, bg78 - which crashes on an arena slot) and studio / photo stages (a white mat over a black void). The
-// number of a "...bgNN..." file / source name (-1: none), and whether it is one of those.
+// number of a "...bgNN..." file / source name (-1: none), and whether it is one of those. A DLC package's pac
+// ("bg60_dlc40.pac": 2K16's DLC arenas are bg60-65) is an arena, as arena_port.py lists it (report fec877).
 int ArenaPacNumber(const std::string& name);
-inline bool SpecialStage(const std::string& name) { return ArenaPacNumber(name) >= 60; }
+bool SpecialStage(const std::string& name);
 
 }  // namespace mm

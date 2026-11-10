@@ -11,11 +11,13 @@
 //   wait <ms>                   idle
 //   type <text>                 type on the PC keyboard (keyboard_typing.h)
 //   key <BACK|ENTER|ESC|LEFT|RIGHT|UP|DOWN>   press a PC keyboard key
+//   bindkey <F1-F12|...>        a window key through the key binds (rex/ui/keybinds.h), e.g. F12 REPORT A PROBLEM
 //   set <cvar> <value>          sets a setting at once (not queued; tests of live changes)
 //   connect                     an idle "Test Pad" connects now (not queued; late-controller tests;
 //                               SVR2011_TEST_SCRIPT_AS_KEYBOARD=1 lists the script as the keyboard)
 //   touch <x> <y> <ms>          a finger on the on-screen controller at x, y
 //                               (fractions of the window) for ms
+//   click <x> <y> [ms]          the mouse's left button at x, y (fractions of the window): the menus by mouse
 //   drag <x0> <y0> <x1> <y1> <ms>   a finger down at x0, y0, moved to x1, y1
 //
 // Steps that wait for the game instead of a fixed time (so a slow phone and a
@@ -62,6 +64,7 @@ namespace svr2011 {
 // entry named label in that group (-1: none) and the group's row count; the
 // group's names; how many entries have been chosen (and the last one).
 bool ScriptMenuState(uint32_t* group, uint32_t* row);
+void ScriptMenuSetRow(uint32_t row);  // (menu_touch: the cursor, directly)
 int ScriptMenuRow(uint32_t group, const std::string& label, int* rows);
 std::string ScriptMenuTexts(uint32_t group);
 uint32_t ScriptMenuSelects(uint32_t* group, uint32_t* row);
@@ -105,7 +108,9 @@ class ScriptInputDriver final : public rex::input::InputDriver {
     bool paste = false, copy = false;
     int sd = 0;  // ("sdcopy" 1 / "sdpaste" 2: story_designer.h)  // ("paste <text>" / "copy": keyboard_typing.h test aids)
     uint16_t key = 0;  // PC keyboard key pressed when the step starts
+    std::string hotkey;  // a key bind's key (hotkey: rex::ui::ProcessKeyEvent)
     bool touch = false;  // a finger (touch_controls.h) from x0, y0 to x1, y1
+    bool mouse = false;  // ... the mouse's left button instead (the menus by mouse: "click")
     float x0 = 0, y0 = 0, x1 = 0, y1 = 0;
     enum Kind : uint8_t { kPlain, kTitle, kMenu, kUntil, kPressUntil, kWhere } kind = kPlain;  // (a step that waits for the game)
     std::string arg;  // its label / text

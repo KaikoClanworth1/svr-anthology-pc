@@ -33,6 +33,7 @@
 #include "fast_start.h"
 #include "pad_icons.h"
 #include "pad_map.h"
+#include "pad_types.h"
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -280,6 +281,39 @@ void DumpGuestThreads(uint8_t* base) {
 }
 std::atomic<int64_t> g_dbg_since{0};
 
+// The motion fast-forward, sub_8239A6B0(obj) (its own code): while the object's +1316 is set it steps the motion -
+// vtable[21](obj, 0) - until a step returns non-zero (the motion at its end), puts its time (+272) back, clears
+// +1316 and runs one real step, vtable[21](obj, 1). A motion that never reaches its end kept that loop going for
+// ever: the logic thread at a full core and a black screen (report be776c: a Universe triple threat, before the
+// 3rd entrance). The steps are capped here - past the cap the rest of that motion is skipped, as if it had ended,
+// and a line names it (its id +260, x +264, y +268). Test aids: SVR2011_TEST_FF_CAP=<steps> (0: no cap, the
+// game's own loop), SVR2011_TEST_FF_LOG=1 (a line for every fast-forward).
+constexpr uint32_t kFfCap = 20000;  // (normal ones: 1 or 2 steps in entrances and matches, 8 Nov tests)
+std::atomic<uint32_t> g_ff_obj{0}, g_ff_key{0}, g_ff_steps{0};
+
+uint32_t FfCap() {
+  static const uint32_t cap = [] {
+    const char* v = std::getenv("SVR2011_TEST_FF_CAP");
+    return v ? uint32_t(std::strtoul(v, nullptr, 10)) : kFfCap;
+  }();
+  return cap;
+}
+
+uint32_t MotionKey(uint8_t* base, uint32_t obj) {
+  return (G32(base, obj + 260) & 0xFFFF) << 16 | (G32(base, obj + 264) & 0xFF) << 8 | (G32(base, obj + 268) & 0xFF);
+}
+
+std::string MotionText(uint32_t key) {
+  return fmt::format("{} x {} y {}", key >> 16, (key >> 8) & 0xFF, key & 0xFF);
+}
+
+void MotionStep(PPCContext& ctx, uint8_t* base, uint32_t obj, uint32_t r4) {  // obj->vtable[21](obj, r4)
+  ctx.r3.u64 = obj;
+  ctx.r4.u64 = r4;
+  ctx.ctr.u64 = G32(base, G32(base, obj) + 84);
+  REX_CALL_INDIRECT_FUNC(ctx.ctr.u32);
+}
+
 // obj->vtable[slot](obj, r4, r5)
 void Virt(PPCContext& ctx, uint8_t* base, uint32_t obj, int slot, uint32_t r4 = 0, uint32_t r5 = 0) {
   g_dbg_obj = obj;
@@ -408,6 +442,8 @@ bool g_extra_update = false;  // (see below: an extra update of this frame)
 // A pin's count is on: the pin judge's hook (sub_822446E0) sets it each update - the pinner's +516 is 2 and the
 // referee is in his count motion (190).
 std::atomic<bool> g_pin_counting{false};
+std::atomic<bool> g_pin_cpu{false};  // (the man pinned is a CPU: one update a frame while counted - see the judge's hook)
+std::atomic<uint32_t> g_pin_cpu_frame{0};  // (the match frame the judge last saw it: a judge gone quiet after a 3 ends the rule)
 
 // The characters' job's hand-offs, the last 512 (all threads), dumped with a
 // stuck world update - for the "stuck in pass 20" freeze (Android, 4+ people
@@ -544,6 +580,44 @@ void TestMatchTime(uint8_t* base) {
 
 void svr2011::HwWatchOn(uint8_t* base, uint32_t guest) { HwWatchAt(base, guest); }
 
+REX_EXTERN(__imp__sub_8239A6B0);
+REX_HOOK_RAW(sub_8239A6B0) {
+  const uint32_t obj = ctx.r3.u32;
+  if (!G32(base, obj + 1316)) {  // (no fast-forward: one step, the game's own)
+    __imp__sub_8239A6B0(ctx, base);
+    return;
+  }
+  const uint32_t time = G32(base, obj + 272), key = MotionKey(base, obj), cap = FfCap();
+  g_ff_key = key, g_ff_steps = 0, g_ff_obj = obj;
+  const auto t0 = Clock::now();
+  uint32_t steps = 0;
+  bool capped = false;
+  for (;;) {
+    MotionStep(ctx, base, obj, 0);
+    g_ff_steps = ++steps;
+    if (ctx.r3.u32) break;
+    if (cap && steps >= cap) {
+      capped = true;
+      break;
+    }
+  }
+  g_ff_obj = 0;
+  P32(base, obj + 272, time);
+  P32(base, obj + 1316, 0);
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
+  static const bool log = std::getenv("SVR2011_TEST_FF_LOG") != nullptr;
+  static uint32_t calls = 0, most = 0;  // (the test line: each new most steps, with the fast-forwards so far)
+  ++calls;
+  if (capped)
+    REXLOG_WARN("[svr2011] motion fast-forward: object {:08X} motion {} (now {}) not at its end after {} steps ({} ms)"
+                " - the rest of it skipped", obj, MotionText(key), MotionText(MotionKey(base, obj)), steps, ms);
+  else if (log && steps > most)
+    REXLOG_INFO("[svr2011] motion fast-forward: object {:08X} motion {} (now {}): {} steps ({} ms) - the most so far,"
+                " fast-forward {}", obj, MotionText(key), MotionText(MotionKey(base, obj)), steps, ms, calls);
+  if (steps > most) most = steps;
+  MotionStep(ctx, base, obj, 1);
+}
+
 // The world update, once a frame of the game's loop: how many 60 Hz ticks
 // this frame runs (at least one).
 REX_EXTERN(__imp__sub_8269D768);
@@ -602,6 +676,19 @@ REX_HOOK_RAW(sub_8269D768) {
   // world down below 60 fps. The count's lost step is put right at its cause now: sub_822EB8D8, below.)
   if (static const bool one = std::getenv("SVR2011_TEST_PIN_ONE_UPDATE") != nullptr; one && g_pin_counting.load())
     g_world_ticks = 1, g_world_acc = 0;
+  // A CPU pinned: one update a frame while the count runs (report bead2e; see the judge's hook). The count is then
+  // slower in real time below 60 fps - only while a CPU is pinned; a human pinned keeps full speed.
+  if (static const bool off = std::getenv("SVR2011_TEST_PIN_CPU_RULE_OFF") != nullptr;
+      !off && g_pin_counting.load() && g_pin_cpu.load() && g_world_ticks > 1 &&
+      G32(base, kMatchFrames) <= g_pin_cpu_frame.load() + 2) {
+    static uint32_t told_frame = 0, told = 0;
+    if (const uint32_t f = G32(base, kMatchFrames); f > told_frame + 300 && (++told <= 20 || told % 100 == 0)) {
+      told_frame = f;
+      REXLOG_INFO("pin count: a CPU is pinned - one update a frame until the count ends (was {}; {} times)",
+                  g_world_ticks, told);
+    }
+    g_world_ticks = 1, g_world_acc = 0;
+  }
 #if SVR2011_DEBUG_SUITE
   if (const int n = svr2011::dbg::SpeedTicks(); n && !g_lockstep) g_world_ticks = n, g_world_acc = 0;  // (dbg_speed)
 #endif
@@ -773,6 +860,10 @@ REX_HOOK_RAW(sub_8269C728) {
                       "function {:08X}; jobs{}",
                       std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - since).count(),
                       g_dbg_pass.load(), g_dbg_obj.load(), g_dbg_fn.load(), jobs);
+          if (const uint32_t ff = g_ff_obj.load())
+            REXLOG_WARN("frame rate: in a motion fast-forward - object {:08X} motion {} (now {}), {} steps so far", ff,
+                        MotionText(g_ff_key.load()), g_base ? MotionText(MotionKey(g_base, ff)) : std::string("?"),
+                        g_ff_steps.load());
           static int64_t dumped_for = -1;  // (once per stuck update)
           if (dumped_for != g_dbg_since.load() && g_base) {
             dumped_for = g_dbg_since.load();
@@ -1582,6 +1673,31 @@ REX_HOOK_RAW(sub_822446E0) {
   const bool pin_on = pinner && Rd32(base + pinner + 516) == 2;
   const bool counting = ref && (Rd32(base + ref + 212) & 0x7FFF) == 190;
   g_pin_counting = pin_on && counting;
+  // Who is pinned: the pinner's target (+96) if it is one of the match's people, else the nearest other wrestler. A
+  // CPU (its player +1152 has no local controller) can only kick out at one update a frame: its AI's timed tap needs
+  // every step, and the characters' job runs once a frame (report bead2e, Android 30 fps: 60 fps 4 of 4 kick-outs,
+  // 30 fps none, 30 fps at one update a frame 5 of 5).
+  if (g_pin_counting.load()) {
+    uint32_t pinned = 0;
+    const uint32_t target = Rd32(base + pinner + 96);
+    float best = 1e9f;
+    for (uint32_t i = 0; i < 6; ++i) {
+      const uint32_t ch = Rd32(base + kChars + i * 4);
+      if (!ch || ch == pinner || ch < 0x40000000u || (ch & 3)) continue;
+      if (ch == target) {
+        pinned = ch;
+        break;
+      }
+      const auto f32 = [&](uint32_t a) { const uint32_t v = Rd32(base + a); float x; std::memcpy(&x, &v, 4); return x; };
+      const float dx = f32(ch + 288) - f32(pinner + 288), dz = f32(ch + 296) - f32(pinner + 296), d = dx * dx + dz * dz;
+      if (d < best) best = d, pinned = ch;
+    }
+    const uint32_t port = pinned ? Rd32(base + pinned + 1152) : 0;
+    g_pin_cpu = pinned && (port >= svr2011::kMaxPlayers || svr2011::PlayerPadType(port) == svr2011::PadType::kNone);
+    g_pin_cpu_frame = frame;
+  } else {
+    g_pin_cpu = false;
+  }
   // (a new match - its frame count starts again, the judge object is the same: nothing from the last one's pins)
   static uint32_t last_frame = 0;
   if (frame < last_frame) g_pin = PinGuard{}, g_drop = DropWatch{}, g_pin_log = PinLog{};
@@ -1746,4 +1862,21 @@ REX_HOOK_RAW(sub_82242C98) {
                 Rd32(base + ctx.r3.u32 + 32) + 1, uint32_t(ctx.lr), Rd32(base + kMatchFrames),
                 g_extra_update ? " (extra update)" : "");
   __imp__sub_82242C98(ctx, base);
+}
+
+// The component lookup sub_8269DFB0(root, tag): walks root's tree (+20 first child, +16 next, +4 tag). Report 945792
+// (PC 2.2.0, a Championship Scramble of five mods, match start): sub_825F6E08 asked each person's 'CPRO' with a root
+// of 05056F13 - no object's (every root is 4-byte aligned) - and read past it: a crash. A root that isn't aligned is
+// "not found" here, as for no root, which its callers already handle, and a line names the caller.
+REX_EXTERN(__imp__sub_8269DFB0);
+REX_HOOK_RAW(sub_8269DFB0) {
+  if (ctx.r3.u32 & 3) {
+    static std::atomic<int> told{0};
+    if (const int n = ++told; n <= 10 || n % 1000 == 0)
+      REXLOG_WARN("[svr2011] component lookup: root {:08X} isn't an object's (tag {:08X}, caller {:08X}) - not found "
+                  "({} times)", ctx.r3.u32, ctx.r4.u32, uint32_t(ctx.lr), n);
+    ctx.r3.u64 = 0;
+    return;
+  }
+  __imp__sub_8269DFB0(ctx, base);
 }

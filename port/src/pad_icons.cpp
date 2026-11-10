@@ -22,6 +22,7 @@
 
 #include "pad_icons.h"
 #include "mystery_opponent.h"
+#include "menu_touch.h"
 
 #include <algorithm>
 #include <array>
@@ -640,6 +641,11 @@ void PadIconsMouseClick(const char* name) { g_mouse_click = name; }
 void InstallPadIcons(rex::memory::Memory* memory) {
   g_memory = memory;
   g_base = memory->TranslateVirtual<uint8_t*>(0);
+#if defined(__SWITCH__)
+  // PlayStation and keyboard pictures don't apply, and these hooks take locks on every
+  // 2D command and texture bind: left off.
+  return;
+#endif
   // (the native renderer draws them; it is the only renderer)
   if (!Load()) {
     REXLOG_INFO("[svr2011] pad icons: no pad_icons/pad_icons.txt - Xbox icons only");
@@ -1396,6 +1402,7 @@ REX_EXTERN(__imp__sub_82467C18);
 REX_HOOK_RAW(sub_82467C18) {
   using namespace svr2011;
   MysterySelectFrame(base);  // (mystery_opponent.h)
+  MenuTouchPanel(ctx, base, ctx.r3.u32 - 28);  // (menu_touch.h)
   OwnerScope scope(g_enabled ? SlotPort(Rd32(base + ctx.r3.u32 + 256)) : -1);
   __imp__sub_82467C18(ctx, base);
 }

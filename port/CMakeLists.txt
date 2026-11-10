@@ -65,6 +65,7 @@ set(SVR2011_SOURCES
     src/match_box.cpp
     src/match_record.cpp
     src/caw_check.cpp
+    src/caw_face.cpp
     src/caw_limits.cpp
     src/match_hud.cpp
     src/slobber_knocker.cpp
@@ -80,6 +81,7 @@ set(SVR2011_SOURCES
     src/report_page.cpp
     src/title_mods.cpp
     src/title_new.cpp
+    src/title_exhibition.cpp
     src/weapon_mods.cpp
     src/cpu_difficulty.cpp
     src/crowd_fight.cpp
@@ -100,6 +102,7 @@ set(SVR2011_SOURCES
     src/crowd_signs.cpp
     src/media_mods.cpp
     src/vs_styles.cpp
+    src/caw_parts.cpp
     src/move_packs.cpp
     modmaker/svrfmt/pac.cpp
     modmaker/svrfmt/texture.cpp
@@ -112,6 +115,7 @@ set(SVR2011_SOURCES
     src/story_mods.cpp
     src/title_belts.cpp
     src/text_guard.cpp
+    src/menu_touch.cpp
     src/big_roster.cpp
     src/post_effects.cpp
     src/replays.cpp
@@ -332,6 +336,14 @@ if(SVR2011_ANTHOLOGY)
     target_sources(svr2011 PRIVATE ${SVR2011_ANTHOLOGY_REDO})
     target_include_directories(svr2011 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
+# FFmpeg and libmspack (LGPL) are DLLs of their own on Windows, beside the programs (Third-party notices.txt). The
+# runtime with them: the exe doesn't relink when only the inside of the runtime changed, which left a stale copy here.
+if(WIN32 AND TARGET rexffmpeg AND TARGET mspack)
+    add_custom_target(svr2011_stage_lgpl_dlls ALL
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:rexruntime> $<TARGET_FILE:rexffmpeg> $<TARGET_FILE:mspack> $<TARGET_FILE_DIR:svr2011>
+        DEPENDS rexruntime rexffmpeg mspack svr2011
+        VERBATIM)
+endif()
 if(NOT WIN32)
     # MSVC CRT functions the port uses (_dupenv_s ...).
     target_compile_options(svr2011 PRIVATE -include ${CMAKE_CURRENT_SOURCE_DIR}/src/compat.h)
@@ -402,12 +414,12 @@ if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/launcher/svr2011_launcher.c")
         set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${doc_path}")
     endforeach()
     add_executable(svr2011_modmaker WIN32
-        modmaker/app.cpp launcher/report_send.c launcher/update_log.c launcher/report_receipts.c modmaker/arena_page.cpp modmaker/star_page.cpp modmaker/threads_page.cpp modmaker/simple_star.cpp modmaker/simple_steps.cpp modmaker/simple_arena.cpp modmaker/simple_port.cpp modmaker/disc_list.cpp modmaker/mod_check.cpp modmaker/signs_page.cpp modmaker/forfun_page.cpp modmaker/title_page.cpp modmaker/backgrounds_page.cpp
+        modmaker/app.cpp launcher/report_send.c launcher/update_log.c launcher/report_receipts.c modmaker/arena_page.cpp modmaker/star_page.cpp modmaker/threads_page.cpp modmaker/simple_star.cpp modmaker/simple_steps.cpp modmaker/simple_arena.cpp modmaker/simple_port.cpp modmaker/disc_list.cpp modmaker/mod_check.cpp modmaker/signs_page.cpp modmaker/forfun_page.cpp modmaker/title_page.cpp modmaker/caw_part_page.cpp modmaker/backgrounds_page.cpp
         modmaker/media_page.cpp modmaker/full_preview.cpp modmaker/audio_out.cpp modmaker/video_mf.cpp modmaker/hair_sim.cpp modmaker/model_materials.cpp modmaker/material_panel.cpp modmaker/moves_page.cpp modmaker/move_check.cpp modmaker/anims_page.cpp modmaker/assets_page.cpp
         modmaker/icons_page.cpp modmaker/caw_page.cpp modmaker/help_page.cpp modmaker/other_page.cpp modmaker/match_page.cpp
         modmaker/tool_run.cpp modmaker/session_log.cpp launcher/movie_maker.c launcher/bink_encode.c launcher/caw_import.c launcher/stfs.c launcher/move_warning.c
         launcher/setup_tab.c launcher/updater.c launcher/verify.c
-        modmaker/svrfmt/wwe13.cpp ${REXSDK_DIR}/thirdparty/libmspack/libmspack/mspack/lzxd.c modmaker/editor.cpp modmaker/char_preview.cpp modmaker/svrfmt/ring_kit.cpp modmaker/svrfmt/arena_build.cpp
+        modmaker/svrfmt/wwe13.cpp modmaker/editor.cpp modmaker/char_preview.cpp modmaker/svrfmt/ring_kit.cpp modmaker/svrfmt/arena_build.cpp
         modmaker/svrfmt/pac.cpp modmaker/svrfmt/archive.cpp modmaker/svrfmt/texture.cpp modmaker/svrfmt/jboy.cpp modmaker/svrfmt/mod_travel.cpp modmaker/svrfmt/disc.cpp modmaker/pac_editor.cpp modmaker/loudness.cpp modmaker/port_page.cpp modmaker/attire_page.cpp
         modmaker/pac_attires.cpp modmaker/installed_page.cpp modmaker/svrfmt/char_fbx.cpp modmaker/rig_map.cpp launcher/unzip.c
         modmaker/svrfmt/fbx_write.cpp modmaker/svrfmt/png.cpp modmaker/svrfmt/arena.cpp modmaker/svrfmt/arena_full.cpp
@@ -425,11 +437,12 @@ if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/launcher/svr2011_launcher.c")
     file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION.txt" SVR2011_MM_VERSION LIMIT_COUNT 1)
     target_compile_definitions(svr2011_modmaker PRIVATE "PORT_VERSION=\"${SVR2011_MM_VERSION}\"")
     target_link_libraries(svr2011_modmaker PRIVATE version d3d11 dxgi d3dcompiler ole32 shell32 windowscodecs comdlg32
-        mfplat mfreadwrite mfuuid propsys delayimp xaudio2 bcrypt winhttp rstrtmgr dbghelp)
+        mfplat mfreadwrite mfuuid propsys delayimp xaudio2 bcrypt winhttp rstrtmgr dbghelp
+        mspack)  # (rexmspack.dll: LGPL, beside the program)
     # (Media Foundation only when used: Windows "N" without the Media Feature Pack)
     target_link_options(svr2011_modmaker PRIVATE -Wl,/DELAYLOAD:mfplat.dll -Wl,/DELAYLOAD:mfreadwrite.dll)
     set_target_properties(svr2011_modmaker PROPERTIES OUTPUT_NAME "SvR2011 Mod Maker")
-    add_executable(svr2011_launcher WIN32 launcher/svr2011_launcher.c launcher/move_warning.c launcher/apk_package.c launcher/report.c launcher/report_send.c launcher/update_log.c launcher/report_receipts.c launcher/reports_tab.c launcher/suggestions_tab.c launcher/report_match.c launcher/report_flow.c launcher/stfs.c launcher/caw_import.c launcher/save_cleaner.c launcher/verify.c launcher/movie_maker.c launcher/bink_encode.c launcher/bink_decode.c launcher/updater.c launcher/release_check.c launcher/unzip.c launcher/mods_tab.c launcher/backgrounds.c launcher/music_tab.c launcher/roster_tab.c launcher/texpacks_tab.c launcher/ui_theme.c launcher/setup_tab.c launcher/discover_tab.c launcher/music_level.c launcher/nat_check.c launcher/launcher.rc src/utf8.manifest)
+    add_executable(svr2011_launcher WIN32 launcher/svr2011_launcher.c launcher/move_warning.c launcher/apk_package.c launcher/switch_package.c launcher/report.c launcher/report_send.c launcher/update_log.c launcher/report_receipts.c launcher/reports_tab.c launcher/suggestions_tab.c launcher/entrance_clash.c launcher/report_match.c launcher/report_flow.c launcher/stfs.c launcher/caw_import.c launcher/save_cleaner.c launcher/verify.c launcher/movie_maker.c launcher/bink_encode.c launcher/bink_decode.c launcher/updater.c launcher/release_check.c launcher/unzip.c launcher/mods_tab.c launcher/backgrounds.c launcher/music_tab.c launcher/roster_tab.c launcher/texpacks_tab.c launcher/ui_theme.c launcher/setup_tab.c launcher/discover_tab.c launcher/music_level.c launcher/nat_check.c launcher/launcher.rc src/utf8.manifest)
     set_target_properties(svr2011_launcher PROPERTIES OUTPUT_NAME "SvR2011 Launcher")
     # The SvR Anthology launcher (branch anthology): SVR Anthology by Yumboy11 - his installer, then the game
     # with --game_data_root; no mods, no online (launcher/anthology_launcher.c).

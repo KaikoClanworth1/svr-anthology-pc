@@ -163,6 +163,7 @@ rex::memory::Memory* g_online_memory = nullptr;
 // guest: the game's "no game sessions" / join failure message with why hosts
 // were left out (p2p.h P2PHiddenReason: another version or other mods)
 uint32_t g_hidden_text = 0;
+constexpr uint32_t kHiddenTextSize = 512;  // (its details and the DLC fix: report 16947c)
 // guest: the CPU slots' help bar labels (online_cpu.cpp)
 constexpr uint32_t kAddCpuId = 0xEF10, kRemoveCpuId = 0xEF11, kWaitingId = 0xEF12;  // (16-bit: the bar holds u16 ids; blank in the game's table)
 constexpr uint32_t kPlayerInfoId = 0xB0A7;  // PLAYER INFO: the lobby's own Y label - its slot's icon is Y's glyph
@@ -178,10 +179,10 @@ constexpr uint32_t kNoSessionsId = 0xC6D4;  // "No game sessions were found. Sea
 constexpr uint32_t kJoinFailedId = 0xC67F;  // "Failed to find a session. Please try again." (an invite)
 
 // Text into a guest buffer (kOffTextSize).
-uint32_t GuestText(uint32_t buffer, const std::string& text) {
+uint32_t GuestText(uint32_t buffer, const std::string& text, uint32_t size = kOffTextSize) {
   if (!buffer || !g_online_memory) return 0;
   char* out = g_online_memory->TranslateVirtual<char*>(buffer);
-  const size_t n = std::min<size_t>(text.size(), kOffTextSize - 1);
+  const size_t n = std::min<size_t>(text.size(), size - 1);
   std::memcpy(out, text.data(), n);
   out[n] = 0;
   return buffer;
@@ -394,8 +395,8 @@ uint32_t OnlineString(uint32_t id) {
                                   : "Unable to join the session due to a difference in game versions.";
     if (id == kNoSessionsId)
       return GuestText(g_hidden_text, std::string(sessions == 1 ? "A game session was found. " : "Game sessions were found. ") +
-                                          head + "\n" + why + "\nSearch again?");
-    return GuestText(g_hidden_text, head + "\n" + why);
+                                          head + "\n" + why + "\nSearch again?", kHiddenTextSize);
+    return GuestText(g_hidden_text, head + "\n" + why, kHiddenTextSize);
   }
   return 0;
 }
@@ -428,7 +429,7 @@ void InstallOnline(rex::memory::Memory* memory, const std::filesystem::path& sav
   if (g_empty_string) std::memset(memory->TranslateVirtual<char*>(g_empty_string), 0, 4);
   g_online_memory = memory;
   g_online_off_text = memory->SystemHeapAlloc(kOffTextSize);
-  g_hidden_text = memory->SystemHeapAlloc(kOffTextSize);
+  g_hidden_text = memory->SystemHeapAlloc(kHiddenTextSize);
   g_mods_text = memory->SystemHeapAlloc(kOffTextSize);
   g_scratch = memory->SystemHeapAlloc(4096);
   {
@@ -472,10 +473,34 @@ REX_HOOK_RAW(sub_828D1648) {
 // with the reason, so the next report says which.
 REX_EXTERN(__imp__sub_8257BCD0);
 REX_EXTERN(__imp__sub_8257ABB8);
+REX_EXTERN(__imp__sub_8257BAC0);
+// The roster entry's +32 bit 4: saving a moveset (sub_8237E9E0) sets it when a move's WAZE record has +140 bit 0x800 -
+// 4775, 9205, 9236, 9237, 9513 and 9773 (Bret Hart's and Chris Masters' taunts, one Backbreaker Drop): on the disc, and
+// a match plays them without the unlocks. The game's message for it was "contains
+// downloadable content" (string 50999, lifted: sub_8257AB78 below), but sub_8257BAC0 and this list's check refuse on it
+// too, which said "created by a different player" for a player's own move-set (report 88abc3). Not a reason to refuse.
+constexpr uint8_t kUploadMark = 4;
+REX_HOOK_RAW(sub_8257BAC0) {  // (r3: the roster entry)
+  uint8_t& mark = base[ctx.r3.u32 + 32];
+  const uint8_t was = mark;
+  if (was & kUploadMark) {
+    static std::set<uint32_t> said;
+    if (said.insert(ctx.r3.u32).second)
+      REXLOG_INFO("online: roster entry {} has the upload mark: not refused for it", int32_t(ctx.r3.u32 - 0x82EBE9FCu) / 36);
+  }
+  mark = uint8_t(was & ~kUploadMark);
+  __imp__sub_8257BAC0(ctx, base);
+  mark = was;
+}
 REX_HOOK_RAW(sub_8257BCD0) {
   const uint32_t profile = ctx.r3.u32;
   const auto saved = ctx;
+  const int16_t entry = profile ? int16_t(uint16_t(base[profile + 32]) << 8 | base[profile + 33]) : int16_t(-1);
+  uint8_t* mark = entry >= 0 && entry < 322 ? base + 0x82EBE9FCu + uint32_t(entry) * 36 + 32 : nullptr;
+  const uint8_t was = mark ? *mark : uint8_t(0);
+  if (mark) *mark = uint8_t(was & ~kUploadMark);
   __imp__sub_8257BCD0(ctx, base);
+  if (mark) *mark = was;
   if (ctx.r3.u32 || !profile) return;
   static std::set<uint32_t> said;
   const uint8_t* p = base + profile;
@@ -491,7 +516,7 @@ REX_HOOK_RAW(sub_8257BCD0) {
   if (id >= 0 && id < 322) {
     const uint8_t* rec = base + 0x82EBE9FCu + uint32_t(id) * 36;
     if (rec[17]) add("downloaded (+17 = " + std::to_string(rec[17]) + ")");
-    if (rec[32]) add("roster +32 = " + std::to_string(rec[32]));
+    if (rec[32] & ~kUploadMark) add("roster +32 = " + std::to_string(rec[32]));
     auto c = saved;
     c.r3.u64 = 0x82EBE9FCu + uint32_t(id) * 36, c.r4.u64 = uint64_t(id);  // (sub_8257ABB8(rec, id): a DLC part)
     __imp__sub_8257ABB8(c, base);

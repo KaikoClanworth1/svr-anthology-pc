@@ -26,13 +26,17 @@ import java.util.List;
 
 final class SuggestionsList {
     static final int kMaxPictures = 3;
+    // (on the page, above the form, and again before Send - as the PC launcher's Suggestions tab)
+    static final String kAbout = "Suggestions are for the game and its tools (the launcher, the Mod Maker, the porters)"
+        + " - not requests for mods. Ask mod makers for mods on Discord.";
 
     static void show(LauncherActivity a) {
         LinearLayout v = new LinearLayout(a);
         v.setOrientation(LinearLayout.VERTICAL);
         v.setPadding(a.dp(20), a.dp(8), a.dp(20), a.dp(4));
-        v.addView(a.text("An idea for the game, the launcher or the Mod Maker? Send it here - we read every one and "
-            + "answer it here: Sure, No (not planned), or Done in an update.", 13, LauncherActivity.kDim));
+        v.addView(a.text(kAbout, 14, LauncherActivity.kText));
+        v.addView(a.text("We read every one and answer it here: Sure, No (not planned), or Done in an update.", 13,
+            LauncherActivity.kDim));
         Button send = a.button("Send an idea…", LauncherActivity.kRed);
         v.addView(send, a.fullWidth(8));
         TextView status = a.text("", 13, LauncherActivity.kDim);
@@ -108,6 +112,7 @@ final class SuggestionsList {
         LinearLayout v = new LinearLayout(a);
         v.setOrientation(LinearLayout.VERTICAL);
         v.setPadding(a.dp(20), a.dp(8), a.dp(20), a.dp(4));
+        v.addView(a.text(kAbout, 13, LauncherActivity.kDim));
         EditText title = new EditText(a);
         title.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
         title.setTextColor(LauncherActivity.kText);
@@ -123,6 +128,15 @@ final class SuggestionsList {
         text.setHint("Your idea - what it would do, and where");
         text.setFilters(new android.text.InputFilter[] {new android.text.InputFilter.LengthFilter(3000)});
         v.addView(text);
+        EditText discord = new EditText(a);   // (2.2.1: needed - the contact, only we see it)
+        discord.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        discord.setTextColor(LauncherActivity.kText);
+        discord.setHint("Your Discord name (needed - only we see it)");
+        discord.setText(ReportSend.discordLoad(InstallActivity.gameFolder()));
+        v.addView(discord);
+        if (a.settings().getString("online_token", "").isEmpty())
+            v.addView(a.text("Not signed in: sign in (or create an account) on the Online page first - ideas come "
+                + "from an online account.", 14, LauncherActivity.kRed));
         TextView picsLine = a.text("", 13, LauncherActivity.kDim);
         v.addView(picsLine);
         Button addPics = a.button("Add a picture…", LauncherActivity.kBackground);
@@ -189,8 +203,38 @@ final class SuggestionsList {
                 error.setVisibility(View.VISIBLE);
                 return;
             }
+            String[] name = new String[1];
+            String bad = ReportSend.discordWhy(discord.getText().toString(), name);
+            if (bad != null) {
+                error.setText(bad);
+                error.setVisibility(View.VISIBLE);
+                discord.requestFocus();
+                return;
+            }
+            ReportSend.authToken = a.settings().getString("online_token", "");
+            if (ReportSend.authToken.isEmpty()) {
+                d.dismiss();
+                a.goOnline();
+                a.status("Sign in (or create an account), then send your idea.");
+                return;
+            }
+            Runnable go = () -> sendIdea(a, d, b, error, rows, listStatus, pics, t, w, name[0]);
+            new AlertDialog.Builder(a, AlertDialog.THEME_DEVICE_DEFAULT_DARK)   // (the reminder again before it goes)
+                .setTitle("Before you send it")
+                .setMessage(kAbout + "\n\nSend this idea?")
+                .setPositiveButton("Send", (x2, y2) -> go.run())
+                .setNegativeButton("Cancel", null)
+                .show();
+        }));
+        d.show();
+    }
+
+    static void sendIdea(LauncherActivity a, AlertDialog d, View b, TextView error, LinearLayout rows,
+                         TextView listStatus, List<File> pics, String t, String w, String contact) {
+        {
             ReportSend.Answers ans = new ReportSend.Answers();
             ans.kind = "suggestion";
+            ans.contact = contact;
             ans.version = a.versionName();
             ans.os = android.os.Build.VERSION.RELEASE + " (API " + android.os.Build.VERSION.SDK_INT + "), "
                 + android.os.Build.MANUFACTURER + " " + android.os.Build.MODEL;
@@ -208,6 +252,7 @@ final class SuggestionsList {
                 got[0] = ReportSend.send(server, u);
                 if (got[0].ok && !got[0].secret.isEmpty())
                     Receipts.add(Receipts.kSuggestions, game, ans.app, got[0].id, got[0].secret, t, w, false);
+                if (got[0].ok) ReportSend.discordSave(game, ans.contact);
             }, () -> {
                 if (got[0].ok) {
                     d.dismiss();
@@ -218,7 +263,6 @@ final class SuggestionsList {
                     error.setVisibility(View.VISIBLE);
                 }
             });
-        }));
-        d.show();
+        }
     }
 }

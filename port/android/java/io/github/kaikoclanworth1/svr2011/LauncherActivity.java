@@ -371,6 +371,9 @@ public class LauncherActivity extends Activity {
         pages_.add(scroll);
     }
 
+    // The Online page (a report / idea form's Sign in: 2.2.1 sends come from an online account).
+    void goOnline() { select(Math.max(0, names_.indexOf("Online"))); }
+
     void select(int index) {
         for (int i = 0; i < tabs_.size(); i++) {
             boolean on = i == index;
@@ -802,7 +805,10 @@ public class LauncherActivity extends Activity {
         // (src/pad_types.cpp: player 1's rumble on the device's own motor when the controller has none -
         // handhelds' built-in pads; a Bluetooth pad without rumble too)
         LinearLayout controls = card(c, "Controls");
-        toggle(controls, "Vibrate the device when the controller can't",
+        // (the game's OPTIONS -> CONTROLS -> VIBRATION: off, nothing rumbles - the device fallback below neither)
+        toggle(controls, "Controller vibration", "Rumble in matches; off: no controller or device vibrates",
+            "vibration", true);
+        toggle(controls,"Vibrate the device when the controller can't",
             "Built-in controllers of handhelds (AYN, Retroid ...) and pads without rumble: the device vibrates instead",
             "device_vibration", true);
 
@@ -881,6 +887,7 @@ public class LauncherActivity extends Activity {
             settings_.setBool("native_prepare_pipelines", true);
             settings_.setBool("native_dump_textures", false);
             settings_.setBool("audio_mute", false);
+            settings_.setBool("vibration", true);
             settings_.setBool("device_vibration", true);
             settings_.setBool("unlock_everything", true);
             settings_.setBool("skip_intros", false);

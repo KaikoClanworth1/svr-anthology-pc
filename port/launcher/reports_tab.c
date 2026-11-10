@@ -340,7 +340,7 @@ void reports_build(HWND wnd, mods_add_fn add, int tab, int id_base, reports_serv
     C(R_SEND, L"Button", L"Send answer", BS_DEFPUSHBUTTON | WS_TABSTOP, 468, 486, 120, 32);
     C(R_REFRESH, L"Button", L"Refresh", BS_PUSHBUTTON | WS_TABSTOP, 28, 532, 90, 28);
     C(R_EDIT, L"Button", L"Edit / add pictures\x2026", BS_PUSHBUTTON | WS_TABSTOP, 126, 532, 160, 28);
-    C(R_STATUS, L"Static", L"", SS_LEFT | SS_NOPREFIX, 296, 532, 292, 40);
+    C(R_STATUS, L"Static", L"", SS_LEFT | SS_NOPREFIX, 296, 532, 154, 40);   /* (Report a problem sits right of it) */
 #undef C
     detail();
 }

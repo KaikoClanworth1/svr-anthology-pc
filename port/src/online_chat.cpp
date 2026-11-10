@@ -18,6 +18,7 @@
 
 #include "generated/default/svr2011_init.h"
 #include "online.h"
+#include "online_overlay.h"
 #include "online_rules.h"
 #include "p2p.h"
 
@@ -26,6 +27,8 @@ namespace svr2011 {
 namespace {
 
 constexpr uint32_t kTag = 0x43485431;   // "CHT1"
+constexpr uint32_t kSetupTag = 0x4D535431;  // "MST1": a match's setup (OnlineMatchSetup)
+constexpr uint32_t kStepTag = 0x4D534831;   // "MSH1": a match's state at a clock (OnlineMatchStep)
 constexpr uint32_t kChatPtr = 0x82EDE92C;  // -> the lobby's chat box (sub_828A7B38(chat, line))
 constexpr size_t kLineChars = 40;          // a chat box line, wrapped (characters)
 constexpr size_t kMaxBytes = kChatMax * 4;  // (UTF-8)
@@ -122,7 +125,114 @@ void SetCursor(PPCContext& ctx, uint8_t* base, uint32_t field, uint32_t cursor) 
   sub_8272E568(c, base);
 }
 
+// -- the match-start setup check (OnlineMatchSetup) --
+struct Setup {
+  uint64_t session = 0;
+  std::string text;
+  Clock::time_point at{};
+};
+std::mutex g_setup_mutex;
+Setup g_my_setup;
+std::map<uint64_t, Setup> g_their_setup;  // by online id
+std::map<uint64_t, std::string> g_setup_told;  // (each pair once: theirs at the last comparison)
+
+// Mine against theirs, when both are this session's and from one match (90 s apart at most). Under the lock.
+void CompareSetups(uint64_t from) {
+  const auto it = g_their_setup.find(from);
+  if (it == g_their_setup.end() || g_my_setup.text.empty() || it->second.session != g_my_setup.session) return;
+  const auto gap = it->second.at > g_my_setup.at ? it->second.at - g_my_setup.at : g_my_setup.at - it->second.at;
+  if (gap > std::chrono::seconds(90)) return;
+  const std::string key = g_my_setup.text + "|" + it->second.text;
+  if (g_setup_told[from] == key) return;
+  g_setup_told[from] = key;
+  if (it->second.text == g_my_setup.text) {
+    REXLOG_INFO("online: match setup the same as player {:016X}'s", from);
+    return;
+  }
+  REXLOG_WARN("online: match setup differs from player {:016X}'s - this game: {}; theirs: {}", from, g_my_setup.text,
+              it->second.text);
+  OnlineOverlayNotice("THE TWO GAMES HAVE DIFFERENT MATCH SETUPS",
+                      "THIS MATCH MAY NOT PLAY THE SAME ON BOTH - SEND A REPORT AFTER IT", 20);
+}
+
+void OnSetup(const uint8_t* p, size_t n) {
+  if (n < 22) return;
+  const uint64_t from = uint64_t(Be32(p + 4)) << 32 | Be32(p + 8);
+  const uint64_t session = uint64_t(Be32(p + 12)) << 32 | Be32(p + 16);
+  const size_t len = size_t(p[20]) << 8 | p[21];
+  if (22 + len > n || len > 600 || !from || from == MyXuid()) return;
+  const P2PLobby lobby = P2PMatchLobby();
+  if (!lobby.in || session != lobby.session ||
+      std::find(lobby.members.begin(), lobby.members.end(), from) == lobby.members.end())
+    return;
+  std::lock_guard lock(g_setup_mutex);
+  g_their_setup[from] = {session, std::string(reinterpret_cast<const char*>(p + 22), len), Clock::now()};
+  CompareSetups(from);
+}
+
+// -- the match's step check (OnlineMatchStep) --
+struct Step {
+  uint64_t hash = 0;
+  std::string summary;
+};
+std::mutex g_step_mutex;
+uint64_t g_step_session = 0;
+std::map<uint32_t, Step> g_my_steps;                        // clock -> this game's (the last 40)
+std::map<uint64_t, std::map<uint32_t, Step>> g_their_steps;  // online id -> clock -> theirs (the last 40)
+std::map<uint64_t, uint32_t> g_step_same, g_step_differ;    // checks per player this match
+std::map<uint64_t, bool> g_step_told;                        // the first difference logged
+
+void TrimSteps(std::map<uint32_t, Step>& m) {
+  while (m.size() > 40) m.erase(m.begin());
+}
+
+// Mine against theirs at a clock both have. Under the lock.
+void CompareStep(uint64_t from, uint32_t clock) {
+  const auto mine = g_my_steps.find(clock);
+  const auto& theirs_all = g_their_steps[from];
+  const auto theirs = theirs_all.find(clock);
+  if (mine == g_my_steps.end() || theirs == theirs_all.end()) return;
+  if (mine->second.hash == theirs->second.hash) {
+    if (++g_step_same[from] == 1)
+      REXLOG_INFO("online: match state the same as player {:016X}'s at clock {} (the step check works)", from, clock);
+    return;
+  }
+  const uint32_t n = ++g_step_differ[from];
+  if (!g_step_told[from]) {
+    g_step_told[from] = true;
+    REXLOG_WARN("online: match out of step with player {:016X} from clock {} ({} checks the same before) - this "
+                "game: {}; theirs: {}", from, clock, g_step_same[from], mine->second.summary, theirs->second.summary);
+    OnlineOverlayNotice("THE TWO GAMES ARE OUT OF STEP",
+                        "EACH SEES ITS OWN MATCH NOW - SEND A REPORT AFTER IT", 20);
+  } else if (n % 10 == 0) {
+    REXLOG_INFO("online: still out of step with player {:016X}: {} checks differ, {} the same", from, n,
+                g_step_same[from]);
+  }
+}
+
+void OnStep(const uint8_t* p, size_t n) {
+  if (n < 34) return;
+  const uint64_t from = uint64_t(Be32(p + 4)) << 32 | Be32(p + 8);
+  const uint64_t session = uint64_t(Be32(p + 12)) << 32 | Be32(p + 16);
+  const uint32_t clock = Be32(p + 20);
+  const uint64_t hash = uint64_t(Be32(p + 24)) << 32 | Be32(p + 28);
+  const size_t len = size_t(p[32]) << 8 | p[33];
+  if (34 + len > n || len > 400 || !from || from == MyXuid()) return;
+  const P2PLobby lobby = P2PMatchLobby();
+  if (!lobby.in || session != lobby.session ||
+      std::find(lobby.members.begin(), lobby.members.end(), from) == lobby.members.end())
+    return;
+  std::lock_guard lock(g_step_mutex);
+  if (session != g_step_session) return;  // (this game's match isn't on yet / another one)
+  auto& theirs = g_their_steps[from];
+  theirs[clock] = {hash, std::string(reinterpret_cast<const char*>(p + 34), len)};
+  TrimSteps(theirs);
+  CompareStep(from, clock);
+}
+
 void OnChat(const uint8_t* p, size_t n) {
+  if (n >= 4 && Be32(p) == kSetupTag) return OnSetup(p, n);
+  if (n >= 4 && Be32(p) == kStepTag) return OnStep(p, n);
   if (n < 19 || Be32(p) != kTag) return;
   const uint64_t from = uint64_t(Be32(p + 4)) << 32 | Be32(p + 8);
   const uint32_t id = Be32(p + 12);
@@ -188,6 +298,56 @@ std::optional<std::string> OnlineChatSend(const std::string& whole) {
   P2PSendChat(payload);  // (twice: one lost, the other shows; the same id isn't shown again)
   REXLOG_INFO("online chat: sent {} characters", Chars(text));
   return text.substr(0, Prefix(text, SIZE_MAX, 63));
+}
+
+void OnlineMatchSetup(const std::string& setup) {
+  const P2PLobby lobby = P2PMatchLobby();
+  if (!lobby.in || !rex::cvar::Query<bool>("online_enabled")) return;
+  std::string text = setup.substr(0, 600);
+  // (test aid: SVR2011_TEST_SETUP_SKEW=1 - this game's setup told as another one: the difference's notice)
+  if (const char* v = std::getenv("SVR2011_TEST_SETUP_SKEW"); v && *v == '1') text += " (test)";
+  {
+    std::lock_guard lock(g_setup_mutex);
+    g_my_setup = {lobby.session, text, Clock::now()};
+    for (const auto& [from, theirs] : g_their_setup) CompareSetups(from);
+  }
+  std::vector<uint8_t> b;
+  Put32(b, kSetupTag), Put64(b, MyXuid()), Put64(b, lobby.session);
+  b.push_back(uint8_t(text.size() >> 8)), b.push_back(uint8_t(text.size()));
+  b.insert(b.end(), text.begin(), text.end());
+  REXLOG_INFO("online: match setup sent - {}", text);
+  // (now and twice more: a packet can be lost, and the other game may still be loading)
+  std::thread([b] {
+    for (int i = 0; i < 3; ++i) {
+      P2PSendChat(b);
+      std::this_thread::sleep_for(std::chrono::seconds(4));
+    }
+  }).detach();
+}
+
+void OnlineMatchStep(uint32_t clock, uint64_t hash, const std::string& summary) {
+  const P2PLobby lobby = P2PMatchLobby();
+  if (!lobby.in || !rex::cvar::Query<bool>("online_enabled")) return;
+  // (test aid: SVR2011_TEST_STEP_SKEW=<clock> - from that clock on this game's hash is told as another one)
+  static const uint32_t skew = [] { const char* v = std::getenv("SVR2011_TEST_STEP_SKEW"); return v ? uint32_t(std::atoi(v)) : 0u; }();
+  if (skew && clock >= skew) hash ^= 0x5A5A5A5A5A5A5A5Aull;
+  const std::string text = summary.substr(0, 400);
+  {
+    std::lock_guard lock(g_step_mutex);
+    if (lobby.session != g_step_session || (!g_my_steps.empty() && clock < g_my_steps.rbegin()->first)) {
+      // (a new session, or a new match in it - the clock went back: the counts start again)
+      g_step_session = lobby.session;
+      g_my_steps.clear(), g_their_steps.clear(), g_step_same.clear(), g_step_differ.clear(), g_step_told.clear();
+    }
+    g_my_steps[clock] = {hash, text};
+    TrimSteps(g_my_steps);
+    for (const auto& [from, theirs] : g_their_steps) CompareStep(from, clock);
+  }
+  std::vector<uint8_t> b;
+  Put32(b, kStepTag), Put64(b, MyXuid()), Put64(b, lobby.session), Put32(b, clock), Put64(b, hash);
+  b.push_back(uint8_t(text.size() >> 8)), b.push_back(uint8_t(text.size()));
+  b.insert(b.end(), text.begin(), text.end());
+  P2PSendChat(b);
 }
 
 bool OnlineChatFromPort(uint64_t sender) {

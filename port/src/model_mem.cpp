@@ -10,6 +10,7 @@
 // Every failed allocation is logged once per caller with its size, so a
 // model that doesn't fit shows what it asked for.
 
+#include "caller_nv.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -462,7 +463,7 @@ void LogLoaderCache(const uint8_t* base, uint32_t cache, const CacheAlloc& r, do
 REX_EXTERN(__imp__sub_826A1C70);
 REX_HOOK_RAW(sub_826A1C70) {
   const bool loader = uint32_t(ctx.lr) == 0x826A1F1C;  // (sub_826A1D38's file read: r31 = the request)
-  if (loader) t_request = ctx.r31.u32;
+  if (loader) t_request = SVR_CALLER_NV(ctx, r31);
   // (SVR2011_TEST_EMD_LOG=1: each model read - the request's first 50 bytes and its size: which pac a scene's
   // character model is looked up in - research for the Streak walk's mod, rtwm_streak.cpp)
   if (static const bool emd_log = std::getenv("SVR2011_TEST_EMD_LOG") != nullptr; emd_log && loader) {
@@ -559,6 +560,9 @@ uint32_t LoaderCacheFallback(uint32_t size) {
   // model under a name no pac carries. It never fits nothing, so it spun forever: a small zeroed block instead,
   // the read empty - the load goes on, and the log names the missing file)
   const uint32_t p = FallbackBlock(std::max(size, 2048u));
+  // (no room: the cache's retry loop asks again at once, over a million times a second - SVR2011_TEST_FALLBACK_NO_ROOM;
+  // report bd538a, a phone with no 22 MB left: the frame rate down for good. A short wait between its asks)
+  if (!p && r.given) std::this_thread::sleep_for(std::chrono::milliseconds(1));
   if (!size && !r.given)
     REXLOG_ERROR("[svr2011] file cache: {} is in no pac (0 bytes) - read as an empty file so the load goes on",
                  r.name);
@@ -663,7 +667,12 @@ REX_HOOK_RAW(sub_826A2D78) {
 // being freed is left in use, the list made again from the blocks by address (the free ones have a next: alloc and
 // free walk it too; if the address links are bad too, the list ends at the bad link and what's after it is lost), and
 // the log says all it can see.
-// Test aids: SVR2011_TEST_FREE_LIST=<heap>,<n>[,loop|double|junk] - the <n>th free on that heap (99: on any) meets that damage;
+// A block outside the heap its header names (its byte at -1, which both the lock and the table come from) is refused
+// too: the game's walk then compares it with that heap's list as if it were inside - past the list's end it never
+// stops (report fc182b, 2.2.1: heap 1, a block freed by sub_826E5328 from its +188 - the net let it through, as it
+// passed any block it couldn't place to the game).
+// Test aids: SVR2011_TEST_FREE_LIST=<heap>,<n>[,loop|double|junk|byte] - the <n>th free on that heap (99: on any) meets that
+// damage (byte: its heap byte names another heap);
 // SVR2011_TEST_FREE_GUARD_OFF=1 - the game's walk alone.
 namespace {
 constexpr uint32_t kHeapLocks = 0x82EC55B0, kHeapTable = 0x82EC5F48, kHeapEntrySize = 36, kHeapLockSize = 28;
@@ -756,11 +765,48 @@ REX_HOOK_RAW(sub_8269AAD8) {
     __imp__sub_8269AAD8(ctx, base);
     return;
   }
+  static const struct ByteTest {
+    int heap = -1, at = 0;
+  } byte_test = [] {
+    ByteTest t;
+    char kind[16] = "";
+    if (const char* v = std::getenv("SVR2011_TEST_FREE_LIST"); v && std::sscanf(v, "%d,%d,%15s", &t.heap, &t.at, kind) == 3 &&
+                                                                std::string(kind) == "byte")
+      return t;
+    return ByteTest{};
+  }();
+  if (byte_test.heap >= 0 && (byte_test.heap == int(base[p - 1]) || byte_test.heap == 99)) {
+    static int count = 0;
+    if (++count == byte_test.at) {
+      const uint8_t was = base[p - 1];
+      base[p - 1] = was == 1 ? 2 : 1;  // (a heap that doesn't hold this block)
+      REXLOG_WARN("[svr2011] heap free list: test - the heap byte of {:08X} made {} (was {})", p, base[p - 1], was);
+    }
+  }
   const uint32_t heap = base[p - 1];
   const uint32_t entry = table + heap * kHeapEntrySize;
   const uint32_t start = heap < kHeapCount ? Rd32(base, entry) : 0, end = heap < kHeapCount ? Rd32(base, entry + 4) : 0;
-  if (!start || p - 16 < start || p >= end) {  // (not one of these heaps' blocks: as the game)
-    __imp__sub_8269AAD8(ctx, base);
+  if (!start || p - 16 < start || p >= end) {
+    // (the game would take that heap's lock and table all the same and walk its list with this block: refused)
+    static const bool off = std::getenv("SVR2011_TEST_FREE_GUARD_OFF") != nullptr;
+    if (off) {
+      __imp__sub_8269AAD8(ctx, base);
+      return;
+    }
+    int holder = -1;
+    for (uint32_t h = 0; h < kHeapCount && holder < 0; ++h) {
+      const uint32_t hs = Rd32(base, table + h * kHeapEntrySize), he = Rd32(base, table + h * kHeapEntrySize + 4);
+      if (hs && p - 16 >= hs && p < he) holder = int(h);
+    }
+    static std::atomic<int> told{0};
+    if (const int n = ++told; n <= 8 || n % 100 == 0) {
+      REXLOG_ERROR("[svr2011] heap free list: freeing {:08X}: its header names heap {} ({:08X}-{:08X}) but {} - the block "
+                   "stays in use, the free skipped ({} times; callers {})", p, heap, start, end,
+                   holder >= 0 ? fmt::format("it is in heap {}", holder) : std::string("no heap holds it"), n,
+                   HeapCallers(base, ctx));
+      REXLOG_ERROR("[svr2011] heap free list:   the 16 words before it:{}", HeapWords(base, p - 64, 16, p - 64, p));
+      if (n == 1) svr2011::MatchBoxLog("a free of a block outside its heap");
+    }
     return;
   }
   const PPCContext saved = ctx;
@@ -781,7 +827,7 @@ REX_HOOK_RAW(sub_8269AAD8) {
     return t;
   }();
   bool test_double = false;
-  if (test.heap == int(heap) || test.heap == 99) {  // (99: any heap)
+  if ((test.heap == int(heap) || test.heap == 99) && test.kind != "byte") {  // (99: any heap)
     static int count = 0;
     if (++count == test.at) {
       const uint32_t first = Rd32(base, start + 8);

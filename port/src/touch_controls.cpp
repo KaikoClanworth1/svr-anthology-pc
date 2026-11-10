@@ -5,6 +5,8 @@
 #include "pad_types.h"
 #include "online_overlay.h"
 #include "keyboard_typing.h"
+#include "menu_touch.h"
+#include "frame_rate.h"
 
 #include <algorithm>
 #include <atomic>
@@ -40,6 +42,11 @@ REXCVAR_DEFINE_BOOL(touch_controls, true, "UI", "On-screen touch controller");
 #else
 REXCVAR_DEFINE_BOOL(touch_controls, false, "UI", "On-screen touch controller");
 #endif
+REXCVAR_DEFINE_BOOL(menu_touch, true, "UI", "Tap the game's menus directly");
+REXCVAR_DEFINE_BOOL(menu_touch_mouse, true, "UI",
+                    "The mouse on the game's menus: a left click acts as a tap (lists, OPTIONS, the select grid, the VS "
+                    "screen); the cursor shows while the mouse moves");
+
 REXCVAR_DEFINE_BOOL(touch_auto_layout, true, "UI",
                     "Touch controller: MATCH layout in matches, MENU layout in menus");
 
@@ -212,14 +219,21 @@ Control Special(const char* id, Kind kind, uint32_t action, float anchor, float 
   return c;
 }
 
+// START and BACK: either side of the centre; the menus' row at the bottom, a match's at the top (the row of
+// MATCH and EDIT).
+constexpr float kStartBackDx = 0.12f, kOldStartBackY = 0.94f, kMatchStartBackY = 0.06f;
+
 std::vector<Control> DefaultLayout(int layout) {
   constexpr float L = 0, R = 1, C = 0.5f;
   std::vector<Control> v;
-  // Both: the layout switch, the editor, START and BACK.
+  // Both: the layout switch, the editor, START and BACK - at the bottom in the menus, at the top in a match
+  // (kMatchStartBackY): the game draws its momentum bar and the submission meter at the bottom centre, under
+  // them (report 73b7e5: "the make-them-give-up meter doesn't appear").
   v.push_back(Special("layout", Kind::kLayout, 0, L, 0.10f, 0.06f, 0.09f));
   v.push_back(Special("edit", Kind::kEdit, 0, R, -0.06f, 0.06f, 0.09f));
-  v.push_back(Button("back", X_INPUT_GAMEPAD_BACK, C, -0.12f, 0.94f, 0.08f, true));
-  v.push_back(Button("start", X_INPUT_GAMEPAD_START, C, 0.12f, 0.94f, 0.08f, true));
+  const float sb = layout == kMatch ? kMatchStartBackY : kOldStartBackY;
+  v.push_back(Button("back", X_INPUT_GAMEPAD_BACK, C, -kStartBackDx, sb, 0.08f, true));
+  v.push_back(Button("start", X_INPUT_GAMEPAD_START, C, kStartBackDx, sb, 0.08f, true));
   if (layout == kMenu) {
     v.push_back(Special("dpad", Kind::kDpad, 0, L, 0.24f, 0.64f, 0.36f));
     v.push_back(Button("a", X_INPUT_GAMEPAD_A, R, -0.21f, 0.80f, 0.16f));
@@ -341,6 +355,11 @@ void Load() {
         c.size = std::clamp(size, 0.04f, 0.6f);
         c.visible = vis != 0;
         if (c.kind == Kind::kButton) c.action = uint32_t(std::strtoul(action.c_str(), nullptr, 16));
+        // (a match's START / BACK saved where they used to be by default - every layout file the editor wrote
+        // has them - go to the new place; moved by the player, they stay)
+        if (l == kMatch && (id == "back" || id == "start") && std::abs(c.anchor - 0.5f) < 0.001f &&
+            std::abs(std::abs(c.dx) - kStartBackDx) < 0.001f && std::abs(c.y - kOldStartBackY) < 0.001f)
+          c.y = kMatchStartBackY;
       }
     } else if (key == "icon") {
       // icon <layout> <control id> <file name in UserData/touch_icons>
@@ -618,6 +637,42 @@ void EditorMove(uint32_t pointer, float x, float y) {
 // ---------------------------------------------------------------------------
 // fingers (UI thread)
 
+// A tap on the game's own menus (menu_touch.h): a finger that came down off the controls and lifted about where it
+// was. The events go on to the others meanwhile, as they did.
+constexpr uint32_t kMousePointer = 0xFFFFFFF0u;
+constexpr uint32_t kNoTap = UINT32_MAX;
+uint32_t g_tap_pointer = kNoTap;
+float g_tap_x = 0, g_tap_y = 0;
+Clock::time_point g_tap_at;
+
+void TapDown(uint32_t pointer, float x, float y) {
+  if (!REXCVAR_GET(menu_touch) || (pointer == kMousePointer && !REXCVAR_GET(menu_touch_mouse))) return;
+  // (a match with mnk_mode on: the mouse is the player's camera and moves there, not a finger)
+  if (pointer == kMousePointer && svr2011::InMatch() && rex::cvar::Query<bool>("mnk_mode")) return;
+  g_tap_pointer = pointer, g_tap_x = x, g_tap_y = y, g_tap_at = Clock::now();
+}
+
+void TapMove(uint32_t pointer, float x, float y) {
+  if (pointer != g_tap_pointer) return;
+  if (std::fabs(x - g_tap_x) > g_w * 0.03f || std::fabs(y - g_tap_y) > g_h * 0.05f) g_tap_pointer = kNoTap;
+}
+
+void TapPress(uint16_t buttons) {
+  std::lock_guard lock(g_mutex);
+  const auto until = std::chrono::steady_clock::now() + kMinPress;
+  for (int b = 0; b < 16; ++b)
+    if (buttons >> b & 1) g_hold_until[b] = until;
+}
+
+void TapUp(uint32_t pointer) {
+  if (pointer != g_tap_pointer) return;
+  g_tap_pointer = kNoTap;
+  if (Clock::now() - g_tap_at > std::chrono::milliseconds(700) || g_w <= 0 || g_h <= 0) return;
+  // Menus are 16:9 with bars on other shapes of screen.
+  const float pw = std::min(g_w, g_h * 16 / 9), ph = pw * 9 / 16;
+  MenuTouchTap((g_tap_x - (g_w - pw) / 2) / pw, (g_tap_y - (g_h - ph) / 2) / ph, TapPress);
+}
+
 bool Down(uint32_t pointer, float x, float y) {
   g_last_touch = Clock::now();
   static int logged = 0;
@@ -634,9 +689,11 @@ bool Down(uint32_t pointer, float x, float y) {
     g_help = false;
     return true;
   }
-  if (!Visible()) return false;
-  const int i = Find(x, y);
-  if (i < 0) return false;
+  const int i = Visible() ? Find(x, y) : -1;
+  if (i < 0) {
+    TapDown(pointer, x, y);
+    return false;
+  }
   Control& c = Current()[i];
   switch (c.kind) {
     case Kind::kLayout:
@@ -673,6 +730,7 @@ bool Move(uint32_t pointer, float x, float y) {
     EditorMove(pointer, x, y);
     return true;
   }
+  TapMove(pointer, x, y);
   auto it = g_pointers.find(pointer);
   if (it == g_pointers.end()) return false;
   auto& layout = Current();
@@ -700,6 +758,7 @@ bool Up(uint32_t pointer) {
     if (pointer == g_drag_pointer) g_drag_pointer = UINT32_MAX;
     return true;
   }
+  TapUp(pointer);
   auto it = g_pointers.find(pointer);
   if (it == g_pointers.end()) return false;
   const int i = it->second.control;
@@ -715,8 +774,6 @@ bool Up(uint32_t pointer) {
   UpdatePad();
   return true;
 }
-
-constexpr uint32_t kMousePointer = 0xFFFFFFF0u;
 
 // Window events are in physical pixels; the overlay (ImGui) works in its
 // display units - fewer on high-density screens (a phone: 2.6 pixels each).
@@ -1161,6 +1218,10 @@ void InstallTouchControls(rex::ui::ImGuiDrawer* drawer, rex::ui::Window* window,
     window->app_context().CallInUIThread([window] {
       window->AddInputListener(&g_listener, 900);
       window->AddListener(&g_focus_listener);
+      // (the menus by mouse: its cursor shows while it moves and hides again - mnk_mode's capture hides it and puts
+      // this back after; menu_touch_mouse off: as before, always shown)
+      if (REXCVAR_GET(menu_touch) && REXCVAR_GET(menu_touch_mouse))
+        window->SetCursorVisibility(rex::ui::Window::CursorVisibility::kAutoHidden);
     });
   }
   REXLOG_INFO("touch controls: {} ({})", REXCVAR_GET(touch_controls) ? "on" : "off", g_file.string());

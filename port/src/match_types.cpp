@@ -22,6 +22,7 @@
 #include "pad_types.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
@@ -47,6 +48,7 @@
 
 #include "arena_mods.h"
 #include "match_hud.h"
+#include "online_chat.h"
 #include "online_rules.h"
 #include "p2p.h"
 #include "script_input.h"
@@ -150,6 +152,9 @@ std::vector<uint32_t> g_own_row_text;  // guest strings
 constexpr uint32_t kWeaponsLabel = 0x0FA0B100, kWeaponsText = 0x0FA0B101;  // (label, description)
 // MY WWE -> OPTIONS: its WEAPONS row (game_files.cpp) and REPORT A PROBLEM after it (menu_hooks.cpp gives its text).
 constexpr uint32_t kOptionsGroup = 0x11, kOptionsWeaponsLabel = 0x0FA0B201, kReportLabel = 0x0FA0B202;
+#if defined(__SWITCH__)
+constexpr uint32_t kExitLabel = 0xAFC1, kMainGroup = 0x01;  // (the main menu's EXIT: game_files.cpp)
+#endif
 constexpr uint32_t kExtremeFirst = 0x4D, kExtremeLast = 0x50;
 constexpr uint32_t kFullGroup = 0x06;  // ONE ON ONE: 14 rows, the most a list shows
 struct WeaponsRow {
@@ -452,6 +457,15 @@ std::vector<uint8_t> WithRows(const uint8_t* table, uint32_t size) {
   };
   for (uint32_t i = 0; i < total; ++i) {
     const uint8_t* rec = table + kFirst + i * kRec;
+#if defined(__SWITCH__)
+    // No EXIT on the main menu: a Switch game is closed from the HOME menu. (SHOP before it becomes the group's last.)
+    if (Rd32(rec) == kExitLabel && Rd32(rec + 0x18) == kMainGroup) {
+      uint8_t* prev = out.data() + out.size() - kRec;
+      Wr32(prev + 0x3C, Rd32(prev + 0x3C) | (Rd32(rec + 0x3C) & 2u));
+      --added;
+      continue;
+    }
+#endif
     out.insert(out.end(), rec, rec + kRec);
     // MY WWE -> OPTIONS -> REPORT A PROBLEM (report_page.h) after WEAPONS, the group's last: a copy of it (its node
     // id too, as menu.pac's port rows - game_files.cpp; menu.pac has no room left for one more record).
@@ -1942,7 +1956,7 @@ REX_HOOK_RAW(sub_8224EF28) {
 void LogMatch(PPCContext& ctx, uint8_t* base, uint32_t rule) {
   constexpr uint32_t kLive = 0x82E3DE00, kChars = 0x82E3CC50, kRoster = 0x82EDEA88;
   const auto saved = ctx;
-  std::string people;
+  std::string people, setup;  // (setup: person : superstar id - online_chat.h OnlineMatchSetup)
   svr2011::ClearMatchPeople();  // (a frozen match's report: match_diag.h)
   for (uint32_t i = 0; i < 10; ++i) {
     const uint32_t ch = Rd32(base + kChars + i * 4);
@@ -1970,6 +1984,7 @@ void LogMatch(PPCContext& ctx, uint8_t* base, uint32_t rule) {
     sub_82573EC8(ctx, base);
     const uint32_t info = ctx.r3.u32;
     svr2011::NoteMatchPerson(i, superstar, name.empty() ? "?" : name);
+    setup += fmt::format(" {}:{}", id, superstar);
     people += fmt::format("{}{} (person {}, team {})", people.empty() ? "" : ", ", name.empty() ? "?" : name, id,
                           info ? base[info + 13] : 255);
   }
@@ -1980,6 +1995,7 @@ void LogMatch(PPCContext& ctx, uint8_t* base, uint32_t rule) {
   if (line == last) return;
   last = line;
   REXLOG_INFO("[svr2011] match: {}", line);
+  svr2011::OnlineMatchSetup(fmt::format("rule {:02X}, arena {},{}", rule, Rd32(base + kLive + 64), setup));
 }
 
 REX_EXTERN(__imp__sub_822AD738);
@@ -2335,6 +2351,28 @@ REX_HOOK_RAW(sub_82216C58) {
           PutFighter(base, tgt, place[4], place.size() > 6 ? place[6] : -12.0f, place[5], place.size() > 7 ? uint8_t(place[7]) : 0);
       }
       const auto saved = ctx;
+      // SVR2011_TEST_FORCE_PARTNER=<person>[,<place>[,<setup>]] - a tag team move: that person (the attacker's partner)
+      // plays the move's third track (y 2), as the game's own double teams do after the paired start (sub_822E35E8:
+      // the corner and standing ones both end sub_82396E80(partner, move, 0, 2)). <place>: 0 the attacker's base and
+      // facing (default), 1 the target's, 2 where he is. <setup>: the game's own calls before its paired start - 1 the
+      // corner double team's sub_821F0F90(attacker, partner), 2 the standing one's sub_82191420(target) +
+      // sub_821EFA98(target, attacker), 0 none (the pair froze in the move, with or without the partner, 9 Nov).
+      static const std::array<int, 3> partner = [] {
+        std::array<int, 3> v{-1, 0, 0};
+        if (const char* e = std::getenv("SVR2011_TEST_FORCE_PARTNER")) std::sscanf(e, "%d,%d,%d", &v[0], &v[1], &v[2]);
+        return v;
+      }();
+      const uint32_t par = partner[0] >= 0 && partner[0] < 6 ? Rd32(base + kChars + uint32_t(partner[0]) * 4) : 0;
+      const bool with_partner = par && par != att && par != tgt;
+      if (with_partner && partner[2] == 1) {
+        ctx.r3.u64 = att, ctx.r4.u64 = par;
+        sub_821F0F90(ctx, base);
+      } else if (with_partner && partner[2] == 2) {
+        ctx.r3.u64 = tgt;
+        sub_82191420(ctx, base);
+        ctx.r3.u64 = tgt, ctx.r4.u64 = att;
+        sub_821EFA98(ctx, base);
+      }
       ctx.r3.u64 = att;
       ctx.r4.u64 = tgt;
       ctx.r5.u64 = motion;
@@ -2351,6 +2389,16 @@ REX_HOOK_RAW(sub_82216C58) {
       }
       REXLOG_INFO("match types: test - person {} starts motion {} on person {} ({} -> state {})", force[0], motion,
                   force[1], frames, Rd32(base + att + 212));
+      if (with_partner) {
+        const uint32_t from = partner[1] == 1 ? tgt : partner[1] == 0 ? att : 0;
+        if (from)
+          WrF(base + par + 288, RdF(base + from + 288)), WrF(base + par + 292, RdF(base + from + 292)),
+              WrF(base + par + 296, RdF(base + from + 296)), WrF(base + par + 276, RdF(base + from + 276));
+        ctx.r3.u64 = par, ctx.r4.u64 = motion, ctx.r5.u64 = 0, ctx.r6.u64 = 2;
+        sub_82396E80(ctx, base);
+        REXLOG_INFO("match types: test - person {} plays motion {} as the partner (place {}, set-up {}, state {})",
+                    partner[0], motion, partner[1], partner[2], Rd32(base + par + 212));
+      }
       ctx = saved;
     }
   }
@@ -3927,11 +3975,23 @@ REX_HOOK_RAW(sub_828C48E8) {
     l[3] = 0, l[10] = 0, l[27] = 0;  // (+27 DISQUALIFICATION: 0 off - the game has masked the lock bit 0x80 off by now)
     const bool ring = StructureOf(rule) && (rule < kCellFirst || rule > kCellLast);  // (cage, inferno)
     if (rule != kSixManRule && rule != kGauntlet && !ring) l[56] = 1;  // (6-MAN / the six-person gauntlet / cage / inferno: not - see kPlacedSix, kPlacedRing)
-    if (rule == kGauntlet || ring) l[4] = 1;                            // (RING OUT: no exiting)
+    // (RING OUT: no exiting - cage / inferno only. It was set for the gauntlet too, as "no DQ" when +4 was taken
+    // for DQ: G. ELIMINATOR: EXTREME RULES let nobody leave the ring - 2.2.1 reports 574ce8 / 5d89c9. Out of the
+    // ring is fine there, as in Extreme Rules; no count-outs instead: a count-out ends a match outside the falls
+    // judge, which the gauntlet's eliminations go through - Three Stages of Hell's finding)
+    if (ring) l[4] = 1;
+    if (rule == kGauntlet) l[5] = 0;
     if (rule == kSixManRule) l[5] = 0;                                   // (6-MAN: no count-outs; out of the ring is fine, as in Extreme Rules)
     REXLOG_INFO("match types: WEAPONS EVERYWHERE - rule {:02X} with the Extreme Rules options", rule);
   }
   svr2011::MysteryOpponentLive(base, live);  // (entrances on: mystery_opponent.h)
+  // Test aid: SVR2011_TEST_LIVE_DUMP=1 - the live rules' first 64 bytes as built (+4 ring out: no exiting, +5
+  // count-out, +27 DQ - docs/MATCH_TYPES_RESEARCH.md "Live rule bytes")
+  if (static const bool dump = std::getenv("SVR2011_TEST_LIVE_DUMP") != nullptr; dump && live) {
+    std::string s;
+    for (uint32_t k = 0; k < 64; ++k) s += fmt::format("{}{:02X}", k % 8 ? " " : k ? " | " : "", base[live + k]);
+    REXLOG_INFO("match types: test - live rules for rule {:02X}: {}", rule, s);
+  }
   // Test aid (match replays, docs/MATCH_RECORDINGS.md): SVR2011_TEST_ENTRANCES=0|1 - the live rules' ENTRANCES
   // (+38) for this match: off, the people start in their in-ring places at the bell.
   if (const char* v = std::getenv("SVR2011_TEST_ENTRANCES"); v && live) {

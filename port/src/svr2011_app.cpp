@@ -61,6 +61,7 @@
 #include "hd_movies.h"
 #include "media_mods.h"
 #include "vs_styles.h"
+#include "caw_parts.h"
 #include "frame_rate.h"
 #include "guest_faults.h"
 #include "perf_hooks.h"
@@ -834,7 +835,7 @@ void Svr2011App::OnPostLoadXexImage() {
                      "frame_rate full_speed unlock_30fps "
                      "process_priority"},
         {"effects", "depth_of_field motion_blur soft_filter"},
-        {"gameplay", "replays managers_tile mixed_gender_matches caw_logos_anywhere unlock_everything user_language per_mod_saves"},
+        {"gameplay", "replays managers_tile mixed_gender_matches caw_logos_anywhere caw_face_per_attire unlock_everything user_language per_mod_saves"},
         {"input", "input_backend mnk_mode touch_controls touch_auto_layout vibration device_vibration pad_map_p1 pad_map_p2 pad_map_p3 pad_map_p4"},
         {"audio", "audio_backend audio_mute"},
         {"online", "online_enabled online_server"},
@@ -1052,6 +1053,7 @@ void Svr2011App::OnPostLoadXexImage() {
   // Superstar mods: new characters in the free DLC slots (superstar_mods.h).
   svr2011::InstallMediaMods(runtime()->memory());  // (arenas branch: before the superstar mods mount its pac)
   svr2011::InstallVsStyles(runtime()->memory());   // (the same: its overlay pac)
+  svr2011::InstallCawParts(runtime()->memory());   // (the same: CAW parts from mods, caw_parts.h)
   svr2011::KeepWindowAlive();
 #ifndef SVR2011_D3D_TRACE
   svr2011::InstallModelMem(runtime()->memory());  // (model_mem.cpp)

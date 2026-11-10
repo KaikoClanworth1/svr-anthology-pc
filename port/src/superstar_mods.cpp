@@ -24,6 +24,7 @@
 //   mods are.
 // The select screen shows them in the EXTRA list (managers.cpp, the M tile).
 #include "anthology.h"
+#include "caller_nv.h"
 #include "big_roster.h"
 #include "cae_mod_motions.h"
 #include "no_mods.h"
@@ -78,6 +79,7 @@
 #include "jukebox.h"
 #include "media_mods.h"
 #include "vs_styles.h"
+#include "caw_parts.h"
 #include "music.h"
 #include "hd_movies.h"
 #include "user_movies.h"
@@ -188,6 +190,8 @@ struct Mod {
   int entrance = -1;            // entrance number (manifest entrance=; profile +0x1C0 +0x14..+0x18)
   int attire_entrance[4] = {-1, -1, -1, -1};  // per attire (manifest attire<N>_entrance=; EntranceForAttire)
   int victory = -1;  // its victory scene when it wins a singles match (manifest victory=; VictoryOfWinner)
+  fs::path victory_song;  // its music when it wins (manifest victory_song= / victory_gain=: media_mods.h SetVictoryTrack)
+  float victory_gain = 0.0f;
   // a created entrance (manifest cae=<file>: a whole 284-byte entrance block as the game holds it, big-endian -
   // its five scene parts are copied in: motion, pyro and the rest per scene, as CREATE AN ENTRANCE's ADVANCED
   // CREATION makes them); its parts' hash (.applied cae=) so a player's own later edit stays
@@ -992,6 +996,9 @@ void LoadMods() {
         if (l.rfind("pose=", 0) == 0) m.pose = uint32_t(std::clamp(std::atoi(l.c_str() + 5), 0, 65535));
         if (l.rfind("entrance=", 0) == 0) m.entrance = std::clamp(std::atoi(l.c_str() + 9), 0, 65535);
         if (l.rfind("victory=", 0) == 0) m.victory = std::clamp(std::atoi(l.c_str() + 8), 0, 65535);
+        if (l.rfind("victory_song=", 0) == 0 && l.size() > 13 && fs::exists(f / fs::u8path(l.substr(13)), ec))
+          m.victory_song = f / fs::u8path(l.substr(13));
+        if (l.rfind("victory_gain=", 0) == 0) m.victory_gain = std::clamp(float(std::atof(l.c_str() + 13)), -20.0f, 6.0f);
         if (l.rfind("cae=", 0) == 0) {  // (a created entrance's block: CaeParts)
           std::ifstream in(f / fs::u8path(l.substr(4)), std::ios::binary);
           std::vector<uint8_t> b((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
@@ -1154,6 +1161,7 @@ void LoadMods() {
     REXLOG_INFO("[svr2011] superstar mods: {} as id {} (from {}, key {}){}", m.name, m.slot, m.base, m.key,
                 temp ? " - fetched from the session's host, this run only" : "");
     m.fingerprint = Fingerprint(m);
+    if (!m.victory_song.empty()) svr2011::SetVictoryTrack(m.slot, m.victory_song, m.victory_gain);
     g_mods.push_back(std::move(m));
   }
   {  // the mods left out at this start, one folder a line (none: no file)
@@ -1588,6 +1596,27 @@ void SetSigns(uint8_t* sr, const uint8_t* br, const Mod& m) {
 // lengths times it, and grapples / IK follow. Always from the base's value
 // (never compounding over a kept or saved record); clamped to what the
 // game's moves still fit.
+// Universe's brand (record +16 + mode; Universe +17: 0 RAW, 1 SmackDown, 4 the legends, 6 the unused ids). A mod
+// built on an unused id (base 115 ...) carried that 6, and the rankings of every brand's title skip anyone not on the
+// title's brand (sub_825AF0F0 -> sub_828B8038(id, 1)): only the Unified Tag ranking, which takes teams, showed mods
+// (2.2.0 report e7e305). A 6 becomes RAW or SmackDown, by the slot (both brands get mods); a brand the player set stays.
+// But FREE AGENT in Universe is that same 6 (2.2.1 report fe6cee: AJ Styles set to free agent went back to a brand
+// at the next match / Universe start - every record write made it RAW or SmackDown again). So only a record whose
+// other brand byte (+16) is 6 too - the base's "no brand", carried - is given one, once: +16 takes the same brand,
+// which marks the record done. A 6 at +17 with a brand at +16 is the player's free agent and stays.
+constexpr uint32_t kBrand = 16, kUniverseBrand = 17;
+void UniverseBrand(uint8_t* sr, const Mod& m) {
+  if (sr[kBrand] != 6) return;  // (done, or a branded base: +17 is the player's - a 6 there is FREE AGENT)
+  if (sr[kUniverseBrand] == 6) {
+    sr[kUniverseBrand] = uint8_t(m.slot & 1);
+    static std::set<uint32_t> told;
+    if (told.insert(m.slot).second)
+      REXLOG_INFO("[svr2011] superstar mods: id {} in Universe on {} (its base's record had no brand)", m.slot,
+                  m.slot & 1 ? "SmackDown" : "RAW");
+  }
+  sr[kBrand] = sr[kUniverseBrand];  // (a 2.2.1 save's mod already moved off 6: marked too, as it is)
+}
+
 void SetHeight(uint8_t* sr, const uint8_t* br, const Mod& m) {
   if (m.height <= 0) return;
   const long v = std::clamp(std::lround(Rd16(br + kScale) * m.height), 3300L, 4900L);
@@ -1900,6 +1929,7 @@ void ApplyRecords(uint8_t* base) {
         REXLOG_INFO("[svr2011] superstar mods: id {} kept as loaded (ratings {} {} {} ...)", m.slot, sr[0], sr[1],
                     sr[2]);
       }
+      UniverseBrand(sr, m);
       continue;  // (already: as set up, or from a save)
     }
     const std::string was(reinterpret_cast<char*>(sr + kFullName), 0,
@@ -1934,6 +1964,7 @@ void ApplyRecords(uint8_t* base) {
         for (uint32_t off : {kOwnId, kOwnId2, kSamePerson}) sr[off] = uint8_t(m.slot >> 8), sr[off + 1] = uint8_t(m.slot);
         OwnSelectTile(sr, br);
         SetHeight(sr, br, m);
+        UniverseBrand(sr, m);
         continue;
       }
     }
@@ -1951,6 +1982,7 @@ void ApplyRecords(uint8_t* base) {
     if (!m.abilities.empty())
       for (uint32_t k = 0; k < 8; ++k) sr[kAbilities + k] = k < m.abilities.size() ? m.abilities[k] : 0;
     SetHeight(sr, br, m);
+    UniverseBrand(sr, m);
 
     // test aid: SVR2011_TEST_STAR_EDIT=<id> - that mod's ratings set to 20 (as
     // an edit made in the game would), to see them kept through a save
@@ -2304,7 +2336,7 @@ REX_HOOK_RAW(sub_828B6CD0) {
     __imp__sub_828B6CD0(ctx, base);
     return;
   }
-  const uint32_t cursor = ctx.r31.u32;
+  const uint32_t cursor = SVR_CALLER_NV(ctx, r31);
   const bool mod = ModOf(ctx.r3.u32) != nullptr;
   __imp__sub_828B6CD0(ctx, base);
   const int shows = !ctx.r3.u32 ? 0 : mod ? 1 : 2;
@@ -2374,8 +2406,19 @@ uint32_t KeyAlias(uint8_t* base, const char* n) {
     } else if (p == asked) {
       std::snprintf(out, sizeof out, "%.*s%s", int(n[0] == '/'), n, asked);
     } else {
-      if (!m || m->key == v) return 0;
-      std::snprintf(out, sizeof out, "%.*sEMD/%06u%02u", int(p - n), n, m->key, kind);
+      if (!m) return 0;
+      // An attire the mod no longer has (removed in the Mod Maker, suggestion 04d611 - a save or a setup can still
+      // pick it): the model is missing and the loader crashed in sub_826BB8A0, so attire 1's model stands in.
+      unsigned k = kind;
+      if (k % 10 == 2 && k / 10 >= m->attires) {
+        k = 2;
+        static std::atomic<int> said{0};
+        if (said++ < 8)
+          REXLOG_WARN("[svr2011] superstar mods: {} has no attire {} ({} attires): attire 1's model stands in", m->name,
+                      kind / 10 + 1, m->attires);
+      }
+      if (m->key == v && k == kind) return 0;
+      std::snprintf(out, sizeof out, "%.*sEMD/%06u%02u", int(p - n), n, m->key, k);
     }
   } else if (g_mods.empty()) {
     return 0;
@@ -2404,6 +2447,8 @@ REX_HOOK_RAW(sub_826B87B0) {
   if (const uint32_t alias = svr2011::ThreadsAlias(reinterpret_cast<const char*>(base + ctx.r4.u32))) ctx.r4.u64 = alias;
   // the chosen VS screen style's theme (vs_styles.h): asked for by another name, as below
   if (const uint32_t alias = svr2011::VsStyleAlias(reinterpret_cast<const char*>(base + ctx.r4.u32))) ctx.r4.u64 = alias;
+  // CAW parts from mods (caw_parts.h): the part lists and thumbnails with their records, by the overlay's names
+  if (const uint32_t alias = svr2011::CawPartsAlias(reinterpret_cast<const char*>(base + ctx.r4.u32))) ctx.r4.u64 = alias;
   // a media mod's replacement (renders: media_mods.h) - the first match in
   // the archive list wins, so the game's own would: asked for by another name
   if (const uint32_t alias = svr2011::MediaAlias(reinterpret_cast<const char*>(base + ctx.r4.u32))) {
@@ -2438,6 +2483,12 @@ REX_HOOK_RAW(sub_826B87B0) {
                          strnlen(reinterpret_cast<const char*>(base + ctx.r4.u32), 64));
     if (nm.find(trace) != std::string::npos) {
       const uint32_t out = ctx.r5.u32, caller = uint32_t(ctx.lr);
+      std::string chain;  // (the callers above: the guest stack's back chain, the saved LR at frame - 8)
+      for (uint32_t fr = ctx.r1.u32, k = 0; k < 6 && fr > 0x70000000u && fr < 0x80000000u; ++k) {
+        fr = Rd32(base + fr);
+        if (fr <= 0x70000000u || fr >= 0x80000000u) break;
+        chain += fmt::format(" {:08X}", Rd32(base + fr - 8));
+      }
       __imp__sub_826B87B0(ctx, base);
       std::string o;
       for (int i = 0; out && i < 16; ++i) o += fmt::format("{:02X}", base[out + i]);
@@ -2447,13 +2498,23 @@ REX_HOOK_RAW(sub_826B87B0) {
       std::lock_guard lock(tm);
       if (std::find(told.begin(), told.end(), k) == told.end()) {
         told.push_back(k);
-        REXLOG_INFO("[svr2011] vfs trace: {} -> {:08X} out {} (from {:08X})", nm, ctx.r3.u32, o, caller);
+        REXLOG_INFO("[svr2011] vfs trace: {} -> {:08X} out {} (from {:08X}{})", nm, ctx.r3.u32, o, caller, chain);
       }
       return;
     }
   }
   if (!log) {
+    const auto asked = ctx;
     __imp__sub_826B87B0(ctx, base);
+    // (a part a saved CAW names that no pac has - its mod gone, or another machine's: that category's first)
+    if (!ctx.r3.u32 && uint32_t(asked.lr) != 0x826A17FC)
+      if (const uint32_t alias = svr2011::CawPartsMissing(reinterpret_cast<const char*>(base + asked.r4.u32))) {
+        const auto lr = ctx.lr;
+        ctx = asked;
+        ctx.lr = lr;
+        ctx.r4.u64 = alias;
+        __imp__sub_826B87B0(ctx, base);
+      }
     return;
   }
   const std::string name(reinterpret_cast<const char*>(base + ctx.r4.u32), 0,
@@ -2857,6 +2918,43 @@ int EntranceForAttire(PPCContext& ctx, uint8_t* base, uint32_t mgr, uint32_t idx
     REXLOG_INFO("[svr2011] superstar mods: {} attire {}: entrance {}", m ? m->name : std::to_string(key / 100), attire + 1, n);
   return n;
 }
+
+// A mod whose profile keeps entrance 0 (a save's entrance block all zero - kept as the mod's own profile, the save's
+// late write after SetEntranceMedia): CREATE AN ENTRANCE made its entrance stage, part 0 played 0 and the stage ended
+// at once - the editor backed out to its menu (Android reports a81bee / 9d32ce: Kane '06, Shawn Michaels, Owen Hart;
+// reproduced on PC with a zeroed block). Entrance 0 for a mod's slot (not a created entrance's): its own entrance= when
+// that has a script, else its base's default.
+uint32_t ModZeroEntrance(uint8_t* base, uint32_t mgr, uint32_t idx, uint32_t n) {
+  if (n || idx >= 16 || base[mgr + 36 + idx * 280 + 195]) return n;  // (a created entrance: its parts are its own)
+  const uint32_t table = Rd32(base + kSlotTable);
+  if (!table) return n;
+  const uint32_t key = Rd32(base + table + kSlotsAt + idx * kSlotSize + kSlotKey);
+  const Mod* m = ModOf(key / 100);
+  if (!m) return n;
+  uint32_t use = m->entrance > 0 && svr2011::EntranceScriptExists(m->entrance) ? uint32_t(m->entrance) : 0;
+  if (!use) {
+    const uint32_t bi = svr2011::RosterIndex(base, m->base);
+    if (bi < 512) {
+      const uint8_t* e = base + svr2011::RosterEntry(kProfiles, kProfileSize, bi) + kEntrance;
+      use = Rd16(e + 0x08) ? Rd16(e + 0x08) : Rd16(e + 0x14);  // (the base's default copy, else its current one)
+    }
+  }
+  if (!use) return n;
+  // (and the zeros healed where the editor and the next save read them: the entrance manager's copy - +16 entrance,
+  // +18 champion, +20 multi-title - and the profile's +0x14 / +0x16 / +0x18; else the editor's rows showed the
+  // first entrance of each list)
+  auto heal = [&](uint32_t at) {
+    if (!base[at] && !base[at + 1]) base[at] = uint8_t(use >> 8), base[at + 1] = uint8_t(use);
+  };
+  for (const uint32_t k : {16u, 18u, 20u}) heal(mgr + 36 + idx * 280 + k);
+  if (const uint32_t si = svr2011::RosterIndex(base, m->slot); si < 512)
+    for (const uint32_t k : {0x14u, 0x16u, 0x18u}) heal(svr2011::RosterEntry(kProfiles, kProfileSize, si) + kEntrance + k);
+  static std::set<uint32_t> told;
+  if (told.insert(m->slot).second)
+    REXLOG_WARN("[svr2011] superstar mods: {} (id {}) - its saved entrance is 0 (an empty entrance block): entrance {} "
+                "instead", m->name, m->slot, use);
+  return use;
+}
 }  // namespace
 // Test aid SVR2011_TEST_CAE_LOG: the entrance block CREATE AN ENTRANCE's page loads
 // (sub_82753570(mgr, out): out = a copy of mgr+36, 280 bytes) - music +12, movie +14,
@@ -2881,14 +2979,25 @@ REX_HOOK_RAW(sub_82756538) {
     if (const int n = EntranceForAttire(ctx, base, mgr, idx, true); n > 0) ctx.r3.u64 = uint32_t(n);
     else ctx.r3 = r;
   }
-  // (a number whose mod is gone: cae_mod_motions.cpp)
+  // (a number whose mod is gone: cae_mod_motions.cpp; a mod's empty saved entrance: ModZeroEntrance)
   ctx.r3.u64 = svr2011::EntranceFallback(base, mgr, idx, int(part), ctx.r3.u32);
+  if (part == 0) ctx.r3.u64 = ModZeroEntrance(base, mgr, idx, ctx.r3.u32);
   // (test aid SVR2011_TEST_CAE_LOG: the number each slot's scene part plays - a created entrance's are 10000+)
   static const bool on = std::getenv("SVR2011_TEST_CAE_LOG") != nullptr;
   static std::set<uint64_t> told;
   if (on && idx < 16 && told.insert(uint64_t(mgr) << 32 | uint64_t(idx) << 28 | uint64_t(part & 0xFF) << 20 | (ctx.r3.u32 & 0xFFFFF)).second)
     REXLOG_INFO("[svr2011] cae: slot {} part {} plays {} (created {})", idx, part, ctx.r3.u32,
                 base[mgr + 36 + idx * 280 + 195]);
+}
+// (test aid SVR2011_TEST_CAE_LOG: a team's entrance as the match asks it - sub_823373A8(mgr, idx) reads the team
+// record's tag or trio entrance (TEAM MANAGER's ENTRANCE SETTING); its slots ask no singles number then)
+REX_EXTERN(__imp__sub_823373A8);
+REX_HOOK_RAW(sub_823373A8) {
+  const uint32_t idx = ctx.r4.u32;
+  __imp__sub_823373A8(ctx, base);
+  static const bool on = std::getenv("SVR2011_TEST_CAE_LOG") != nullptr;
+  static int told = 0;
+  if (on && told++ < 24) REXLOG_INFO("[svr2011] cae: slot {} team entrance {}", idx, ctx.r3.u32 & 0xFFFF);
 }
 REX_EXTERN(__imp__sub_82756718);
 REX_HOOK_RAW(sub_82756718) {
@@ -2898,6 +3007,7 @@ REX_HOOK_RAW(sub_82756718) {
   if (const int n = EntranceForAttire(ctx, base, mgr, idx, false); n > 0) ctx.r3.u64 = uint32_t(n);
   else ctx.r3 = r;
   ctx.r3.u64 = svr2011::EntranceFallback(base, mgr, idx, -1, ctx.r3.u32);
+  ctx.r3.u64 = ModZeroEntrance(base, mgr, idx, ctx.r3.u32);
 }
 REX_EXTERN(__imp__sub_82756768);
 REX_HOOK_RAW(sub_82756768) {
@@ -2907,6 +3017,7 @@ REX_HOOK_RAW(sub_82756768) {
   if (const int n = EntranceForAttire(ctx, base, mgr, idx, false); n > 0) ctx.r3.u64 = uint32_t(n);
   else ctx.r3 = r;
   ctx.r3.u64 = svr2011::EntranceFallback(base, mgr, idx, -1, ctx.r3.u32);
+  ctx.r3.u64 = ModZeroEntrance(base, mgr, idx, ctx.r3.u32);
 }
 
 // Victory scenes (docs/VICTORY_SCENES.md): after the match the winner's scene is a script EVP? n from
@@ -2985,6 +3096,13 @@ REX_HOOK_RAW(sub_82BEC030) {
         return;
       }
     }
+    // Test aid SVR2011_TEST_MUSIC_LOG=1 (tests are muted): each music / entrance sound event by name, with the
+    // match frame - a mod's theme at a Royal Rumble entry (2.2.1 report 6dcc92: a mid-match entrant posts Play_MUS_<its
+    // entrance music, 4 digits>; a USER PLAYLIST one (254) calls XMPPlayUserPlaylist instead - "user music: playing")
+    if (static const bool music_log = std::getenv("SVR2011_TEST_MUSIC_LOG") != nullptr;
+        music_log && (std::strstr(e, "MUS") || std::strstr(e, "Mus") || std::strstr(e, "Theme") || std::strstr(e, "Entr") ||
+                      std::strstr(e, "Pause")))
+      REXLOG_INFO("[svr2011] music event: {:.60} (object {:08X}, frame {})", e, ctx.r4.u32, Rd32(base + 0x82E3CD0C));
     uint32_t id = 0;
     if (svr2011::JukeboxEvent(base, e, ctx.r4.u32)) {  // (jukebox.h: every menu song off)
       ctx.r3.u64 = 0x7E000001u;  // (a playing id: not 0)
@@ -3989,10 +4107,26 @@ REX_HOOK_RAW(sub_825B7660) {  // (id) -> Universe place, -1: none
   __imp__sub_825B7660(ctx, base);
 }
 REX_EXTERN(__imp__sub_825B7B40);
-REX_HOOK_RAW(sub_825B7B40) {  // (id, id) -> both in Universe
+// (id, id) -> 1: the two may team up - both in Universe, not in one team already, and not both in teams. Its
+// callers: after a match the partners' join step (sub_825C3498: one joins the other's team, sub_828C0F50 adds with
+// no check of its own) and a new team (sub_825ACFF8).
+REX_HOOK_RAW(sub_825B7B40) {
   const uint32_t a = ctx.r3.u32, b = ctx.r4.u32;
   if (ModOf(a) || ModOf(b)) {  // (its own code looks ids up in the disc list: a mod's answered here)
-    ctx.r3.u64 = UniversePlace(ctx, base, a) != -1 && UniversePlace(ctx, base, b) != -1 ? 1 : 0;
+    bool ok = UniversePlace(ctx, base, a) != -1 && UniversePlace(ctx, base, b) != -1;
+    if (ok) {  // (its team rules, as its own code has them: this answer once skipped them, and after each match
+      // a stock partner of a mod joined their team again - report a6aa1e: Matt Hardy 3 times in THE HARDYS)
+      const auto saved = ctx;
+      const auto team = [&](uint32_t x, uint32_t y) {  // sub_828C0650(x, y, nobody): the team that has both, -1
+        ctx = saved;
+        ctx.r3.u64 = x, ctx.r4.u64 = y, ctx.r5.u64 = 0x200;
+        sub_828C0650(ctx, base);
+        return int32_t(ctx.r3.u32);
+      };
+      ok = team(a, b) == -1 && (team(a, 0x200) == -1 || team(b, 0x200) == -1);
+      ctx = saved;
+    }
+    ctx.r3.u64 = ok ? 1 : 0;
     return;
   }
   __imp__sub_825B7B40(ctx, base);
@@ -4006,13 +4140,13 @@ uint32_t PairTable(const PPCContext& ctx, uint8_t* base) {
   const uint32_t save = Rd32(base + 0x82E407B4);
   const uint32_t own = save ? save + 0x364B4 + 3616 : 0;  // (Universe's own: P+3616)
   auto at = [&](uint32_t obj, uint32_t off) { return obj ? Rd32(base + obj + off) : 0u; };
-  if (lr >= 0x825AF908) return at(ctx.r31.u32, 4);   // sub_825AF908: obj r31, *(obj+4)
+  if (lr >= 0x825AF908) return at(SVR_CALLER_NV(ctx, r31), 4);   // sub_825AF908: obj r31, *(obj+4)
   if (lr >= 0x825AF800) return own;                  // sub_825AF800: sub_8257A490 + 3616
-  if (lr >= 0x825AECE8) return at(ctx.r27.u32, 12);  // sub_825AECE8: obj r27, *(obj+12)
+  if (lr >= 0x825AECE8) return at(SVR_CALLER_NV(ctx, r27), 12);  // sub_825AECE8: obj r27, *(obj+12)
   if (lr >= 0x825ADA48) return own;                  // sub_825ADA48: only tests -1
-  if (lr >= 0x825AD9C8) return at(ctx.r31.u32, 4);   // sub_825AD9C8: obj r31
-  if (lr >= 0x825AD950) return at(ctx.r31.u32, 4);   // sub_825AD950: obj r31
-  if (lr >= 0x825AD8E0) return at(ctx.r30.u32, 4);   // sub_825AD8E0: obj r30
+  if (lr >= 0x825AD9C8) return at(SVR_CALLER_NV(ctx, r31), 4);   // sub_825AD9C8: obj r31
+  if (lr >= 0x825AD950) return at(SVR_CALLER_NV(ctx, r31), 4);   // sub_825AD950: obj r31
+  if (lr >= 0x825AD8E0) return at(SVR_CALLER_NV(ctx, r30), 4);   // sub_825AD8E0: obj r30
   return 0;
 }
 }  // namespace

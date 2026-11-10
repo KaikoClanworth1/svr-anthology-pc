@@ -37,6 +37,11 @@ struct StarProject {
   std::wstring attires[4];        // [1..3]: attires 2-4 from other model pacs (their first attire)
   char attire_names[4][32] = {};  // [1..3]: their names on CHANGE ATTIRE ("" = ATTIRE N)
   int attire_entrance[4] = {-1, -1, -1, -1};  // [1..3]: attire<N>_entrance= (-1: the superstar's entrance)
+  // attires removed (suggestion 04d611): the slots (2-4) in the order they were removed - the later ones move down
+  // one each time (the game counts attires in order). Those in the model pac are cut from it at Save (PacRemoveAttire).
+  // attire_cuts_model: the model they were made on (another model picked: they don't apply)
+  std::vector<int> attire_cuts;
+  std::wstring attire_cuts_model;
   // where a ported superstar came from (superstar_port.py: source=<game> <their id>, source_entrance=, entrance_note=)
   std::string source_game, entrance_note;
   int source_id = -1, source_entrance = -1;
@@ -57,6 +62,8 @@ struct StarProject {
   int music = 0;                  // music= : a theme of the game's own (its music id 1-253) instead of a song file; 0 = none
   int entrance = -1;              // entrance= number (-1: the style's); a superstar's id, or 535 (Jeff Hardy's, unused)
   int victory = -1;               // victory= scene (-1: the game's; Victories())
+  std::wstring victory_song;      // victory_song= his music when he wins (none: his theme)
+  float victory_gain = 0.0f;      // victory_gain=<dB> (-20..+6; 0: left out)
   char announcer[32] = "";        // announcer=<NAME>: the ring announcer's own clips of that name
   char hometown_city[32] = "";    // hometown=<CITY>[,<STATE>]: the announcer's own hometown clips
   char hometown_state[32] = "";
@@ -119,6 +126,9 @@ bool FbxMaterials(bool simple, bool intro = true);  // the FBX's materials (its 
 void FbxMakeButton(const char* label, float width);
 void GearRows(bool simple);  // entrance gear per attire: has it, show it, leave it out, give it another attire's
 std::vector<int> AttireCount();  // the attires the mod has, 1..4 (star_page.cpp)
+std::vector<int> OwnAttires();   // the model pac's own attires after the removals (1..n)
+int PacAttireOf(int slot);       // a slot's attire number in the model pac as picked (before the removals)
+void RemoveAttire(int slot);     // attire 2-4 out: the later ones move down one (star_page.cpp)
 void ThreadsOpen(int attire);    // the Threads parts tab on that attire (threads_page.cpp)
 // the move-set: the picker (g_pick_slot >= 0 opens it), slot names, the preview of a pose
 extern int g_pick_slot;

@@ -654,7 +654,7 @@ bool InstallModFiles(const fs::path& dir, const std::vector<ZipEntry>& files, st
     for (const auto& f : files)
       if (f.name == "manifest.txt") {
         const std::string t(f.data.begin(), f.data.end());
-        for (const char* k : {"type", "name", "base", "song", "music", "movie", "theme_gain", "call_gain", "entrance", "victory", "cae", "moves", "pack"})
+        for (const char* k : {"type", "name", "base", "song", "victory_song", "victory_gain", "music", "movie", "theme_gain", "call_gain", "entrance", "victory", "cae", "moves", "pack"})
           if (const std::string v = Value(t, k); !v.empty()) keys += std::string(" ") + k + "=" + v;
       }
     Log("install: " + PathStr(dir.parent_path().filename()) + "/" + PathStr(dir.filename()) + " (" + std::to_string(files.size()) +
@@ -1250,7 +1250,9 @@ void LoadMoveset() {
     for (int b = 0; b < 128 && n; ++b)
       if (count[b] * 10 >= n * 9 && b != 121 && b != 124 && b != 127) rule.bits[b / 8] |= uint8_t(1 << (b % 8));
     for (const auto& [sit, c] : sits)
-      if ((sit == 13 || sit == 14) && c * 10 >= n * 9) rule.situation = sit;  // (opponent seated on the top turnbuckle)
+      // (13 / 14: opponent seated on the top turnbuckle; 18: a corner double team or a team finisher - the tag team
+      // slots 0x196-0x19C - where a standing double team, situation 0, would start in the wrong place)
+      if ((sit == 13 || sit == 14 || sit == 18) && c * 10 >= n * 9) rule.situation = sit;
   }
   for (const auto& [id, m] : g_move_infos)
     for (int s = 0; s < kMoveSlots; ++s)
@@ -2011,6 +2013,8 @@ int ArenaPacNumber(const std::string& name) {  // (the last "bg" followed by exa
   return found;
 }
 
+bool SpecialStage(const std::string& name) { return ArenaPacNumber(name) >= 60 && Lower(name).find("_dlc") == std::string::npos; }
+
 void ViewFooter() {
   ImGui::PushID("viewfooter");
   // (on the same line while a checkbox labelled `label` still fits there, else on the next)
@@ -2359,6 +2363,7 @@ const PageDesc kPages[] = {
     {PageId::kSigns, "Crowd signs", "", &signs_page::hooks, nullptr},
     {PageId::kBackgrounds, "Menu backgrounds", "", &backgrounds_page::hooks, nullptr},
     {PageId::kTitle, "Championship titles", "", &title_page::hooks, nullptr},
+    {PageId::kCawPart, "CAW glasses", "", &caw_part_page::hooks, nullptr},
     {PageId::kMedia, "Media", "", &media_page::hooks, nullptr},
     {PageId::kMatch, "Match types", "", &match_page::hooks, nullptr},
     {PageId::kPort, "Port from a disc", "", nullptr, port_page::Draw},
@@ -2424,7 +2429,7 @@ const Group kGroups[] = {
                                {"Move pack", PageId::kMoves}, {"From another game", PageId::kMovesPort}}},
     {"Media", "", {{"Crowd signs", PageId::kSigns}, {"Menu backgrounds", PageId::kBackgrounds},
                    {"Titantron videos", PageId::kMedia, 0}, {"Menus & renders", PageId::kMedia, 1}, {"Audio", PageId::kMedia, 2},
-                   {"Belts & weapons", PageId::kBelts}, {"Titles", PageId::kTitle}}},
+                   {"Belts & weapons", PageId::kBelts}, {"Titles", PageId::kTitle}, {"CAW glasses", PageId::kCawPart}}},
     {"Match types", "", {{"Match types", PageId::kMatch}}},
     {"My game discs", "Porting", {{"My game discs", PageId::kDiscs}}},
     {"CAW pictures", "Saves", {{"CAW pictures", PageId::kCaw}}},
@@ -2571,7 +2576,7 @@ bool PageByName(const std::wstring& name, PageId& page) {
       {L"port-taunts", PageId::kPortTaunts, -1}, {L"taunts", PageId::kPortTaunts, -1},
       {L"superstar-port", PageId::kStarPort, -1}, {L"arena-port", PageId::kArenaPort, -1},
       {L"moves-port", PageId::kMovesPort, -1}, {L"belts", PageId::kBelts, -1}, {L"threads", PageId::kThreads, -1},
-      {L"titles", PageId::kTitle, -1}, {L"forfun", PageId::kForFun, -1}};
+      {L"titles", PageId::kTitle, -1}, {L"forfun", PageId::kForFun, -1}, {L"caw-glasses", PageId::kCawPart, -1}};
   for (const auto& n : kNames)
     if (name == n.name) {
       page = n.page;
@@ -3299,8 +3304,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   std::string star_moveset, star_import_moveset;
   int star_entrance = 0;
   int star_victory = 0;
-  std::wstring title_spec, title_save;
+  std::wstring title_spec, title_save, caw_part_spec, caw_part_save;
   std::wstring forfun_arena, forfun_star;
+  std::wstring star_victory_song, media_victory;
   std::wstring star_model, star_song, star_movie, star_picture, star_voice, star_save, sign_save, media_save, media_video;
   std::string star_name;
   std::vector<std::wstring> sign_files, media_pictures, background_files;
@@ -3535,7 +3541,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
       };
       put("(set)", CheckInstalledSet());
       std::error_code ec;
-      for (const char* kind : {"Superstars", "Attires", "Arenas", "Moves", "Backstage", "Signs", "Media", "Backgrounds", "MatchTypes"})
+      for (const char* kind : {"Superstars", "Attires", "Arenas", "Moves", "Backstage", "Signs", "Media", "Backgrounds", "MatchTypes", "CawParts"})
         for (const auto& e : fs::directory_iterator(fs::path(g_game) / L"Mods" / kind, ec))
           if (e.is_directory(ec) && e.path().filename().wstring()[0] != L'.') put(std::string(kind) + "/" + Utf8(e.path().filename().wstring()), CheckModFolder(kind, e.path()));
       WriteFile(Utf8(out), Bytes(text.begin(), text.end()));
@@ -3685,6 +3691,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     else if (!wcscmp(argv[i], L"--star-cae") && more) star_page::TestCae(Utf8(argv[++i]));  // a created entrance (Mods\.cae id)
     else if (!wcscmp(argv[i], L"--star-import-moveset") && more) star_import_moveset = Utf8(argv[++i]);  // star:<id> | mod:<folder>
     else if (!wcscmp(argv[i], L"--star-entrance") && more) star_entrance = _wtoi(argv[++i]);
+    else if (!wcscmp(argv[i], L"--star-victory-song") && more) star_victory_song = argv[++i];  // (victory_song=, -3 dB)
+    else if (!wcscmp(argv[i], L"--media-victory") && more) media_victory = argv[++i];  // <id>,<song>
     else if (!wcscmp(argv[i], L"--star-victory") && more) star_victory = _wtoi(argv[++i]);  // (victory=, the section open)
     else if (!wcscmp(argv[i], L"--star-victory-port") && more) star_page::TestVictoryPort(Utf8(argv[++i]));  // (<game>,<n>: converted)
     else if (!wcscmp(argv[i], L"--run-fix") && more) g_test_fix = Utf8(argv[++i]);
@@ -3759,6 +3767,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     else if (!wcscmp(argv[i], L"--forfun-arena") && more) forfun_arena = argv[++i];
     else if (!wcscmp(argv[i], L"--forfun-star") && more) forfun_star = argv[++i];
     else if (!wcscmp(argv[i], L"--title-test") && more) title_spec = argv[++i];
+    else if (!wcscmp(argv[i], L"--caw-part-test") && more) caw_part_spec = argv[++i];
+    else if (!wcscmp(argv[i], L"--test-caw-part-save") && more) caw_part_save = argv[++i];
     else if (!wcscmp(argv[i], L"--test-title-save") && more) title_save = argv[++i];
     else if (!wcscmp(argv[i], L"--background") && more) background_files.push_back(argv[++i]);
     else if (!wcscmp(argv[i], L"--test-background-save") && more) background_save = argv[++i];
@@ -3850,10 +3860,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   if (!star_import_moveset.empty()) star_page::TestImportMoveset(star_import_moveset);
   if (star_entrance) star_page::TestEntrance(star_entrance);
   if (star_victory) star_page::TestVictory(star_victory);
+  if (!star_victory_song.empty()) star_page::TestVictorySong(star_victory_song, -3.0f);
   signs_page::TestStart(sign_files, sign_save);
   backgrounds_page::TestStart(background_files, background_save);
   forfun_page::TestStart(forfun_arena, forfun_star);
   title_page::TestStart(title_spec, title_save);
+  caw_part_page::TestStart(caw_part_spec, caw_part_save);
+  if (const size_t c = media_victory.find(L','); c != std::wstring::npos) media_page::TestVictory(_wtoi(media_victory.c_str()), media_victory.substr(c + 1));
   media_page::TestStart(media_arena, media_video, media_pictures, media_save);
   arena_page::SetTestSave(test_save, test_lib);
   if (!test_obj_add.empty() || !test_obj_export.empty() || test_obj_remove >= 0)
