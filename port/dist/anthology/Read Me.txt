@@ -1,6 +1,6 @@
 SVR ANTHOLOGY by Yumboy11 - on the WWE SmackDown vs. Raw 2011 PC recomp
 ==========================================================================
-SVR Anthology PC 1.0.3 (on the SvR 2011 PC recomp 2.2.0 + the 2.2.1 fixes by KaikoClanworth)
+SVR Anthology PC 1.0.4 (on the SvR 2011 PC recomp 2.2.2 by KaikoClanworth)
 
 Updates: from 1.0.3 on, the launcher looks for a new version each time it starts (it asks
 GitHub, nothing else) and shows an Update button at the bottom of its sidebar. The update
@@ -74,6 +74,14 @@ the phone's games/SVR Anthology folder. Run it again after changes on the PC:
 only what changed is copied, and the phone's saves stay. The app sits beside
 SvR 2011 if you have that too. A phone with Vulkan is needed (recent
 Snapdragon phones work best).
+
+No USB debugging? Install the app (Android\SvR Anthology.apk), open it once,
+then connect the phone, choose File transfer and copy into the phone's
+games/SVR Anthology folder: the "WWE SmackDown vs Raw Anthology" folder, the
+"Original" folder from this folder (made the first time you press PLAY), and
+(optional) the "WWE SmackDown vs Raw Anthology Saves and DLC" folder. The
+app's Setup tab checks each step, finds folders copied to Download too, and
+tells you if a copy stopped part way.
 
 This version has no mods, no Mod Maker and no online play: it runs the
 Anthology as Yumboy11 made it. The game's settings, saves and DLC are kept in

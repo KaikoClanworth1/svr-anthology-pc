@@ -106,7 +106,7 @@ enum {
     ID_SHOWFPS, ID_MSAA, ID_RENDERER, ID_PREPARE, ID_TEXTURES, ID_INPUT, ID_AUDIO, ID_MUTE, ID_PRIORITY, ID_LANGUAGE,
     ID_UNLOCK_ALL, ID_MATCH_CAMERA, ID_DEFAULTS, ID_SAVE, ID_SETTINGS_STATUS,
     /* Phone */
-    ID_PHONE_INSTALL, ID_PHONE_CANCEL, ID_PHONE_PROGRESS, ID_PHONE_STATUS,
+    ID_PHONE_INSTALL, ID_PHONE_CANCEL, ID_PHONE_PROGRESS, ID_PHONE_STATUS, ID_PHONE_FOLDERS,
     ID_UPDATE
 };
 #define WM_INSTALLER_DONE (WM_APP + 1)
@@ -1213,12 +1213,20 @@ static void build_window(void)
     SendMessageW(h, PBM_SETBARCOLOR, 0, C_ACCENT);
     SendMessageW(h, PBM_SETBKCOLOR, 0, C_CARD);
     add(PAGE_PHONE, L"Static", L"", SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS, 0, 248, 724, 22, ID_PHONE_STATUS);
-    card(PAGE_PHONE, 0, 286, 724, 110, L"On the phone");
+    card(PAGE_PHONE, 0, 286, 724, 160, L"No USB debugging? Copy by cable instead");
+    add(PAGE_PHONE, L"Static",
+        L"Install the app (Android\SvR Anthology.apk in this folder) and open it once. Connect the phone, choose "
+        L"File transfer, and copy these into the phone's games  3A SVR Anthology folder: the \"" ANTHOLOGY_GAME
+        L"\" folder, the \"Original\" folder from this launcher's folder (made when you press Play here), and "
+        L"(optional) the \"" ANTHOLOGY_SAVES L"\" folder. The app's Setup tab checks them.",
+        SS_LEFT | SS_NOPREFIX, 18, 320, 690, 72, 0);
+    add(PAGE_PHONE, L"Button", L"Open the folders to copy", BS_PUSHBUTTON | WS_TABSTOP, 16, 398, 260, 36, ID_PHONE_FOLDERS);
+    card(PAGE_PHONE, 0, 462, 724, 110, L"On the phone");
     add(PAGE_PHONE, L"Static",
         L"The app is \"SVR Anthology\" (it sits beside SvR 2011 if you have that). It needs a phone with Vulkan; "
         L"settings, the version and touch controls are in the app. The Anthology stays Yumboy11's: the phone gets "
         L"a copy of your install, nothing else.",
-        SS_LEFT | SS_NOPREFIX, 18, 320, 690, 66, 0);
+        SS_LEFT | SS_NOPREFIX, 18, 496, 690, 66, 0);
 }
 
 /* The reports' server: svr2011.toml's online_server (test folders set theirs), else ours. Online play stays off. */
@@ -1500,6 +1508,13 @@ static LRESULT CALLBACK wnd_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
         case ID_GO_SETUP: show_page(PAGE_SETUP); break;
         case ID_PHONE_INSTALL: phone_start(); break;
         case ID_PHONE_CANCEL: InterlockedExchange(&s_phone_cancel, 1); break;
+        case ID_PHONE_FOLDERS: {   /* (Explorer at his install's folder and at this launcher's, for copying by cable) */
+            WCHAR p[MAX_PATH];
+            parent_of(p, s_game);
+            if (s_game[0] && dir_exists(p)) open_path(p);
+            open_path(s_dir);
+            break;
+        }
         case ID_SAVE:
             settings_save();
             set_text(ID_SETTINGS_STATUS, L"Saved - the game uses them at its next start.");

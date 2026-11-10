@@ -103,7 +103,8 @@ public class LauncherActivity extends Activity {
         status_.setPadding(dp(16), dp(6), dp(16), dp(10));
         root.addView(status_);
 
-        addPage(tabRow, content, "Play", playPage());
+        if (Flavor.ANTHOLOGY) addPage(tabRow, content, "Play", playPage(), this::anthologyPlayRefresh);
+        else addPage(tabRow, content, "Play", playPage());
         addPage(tabRow, content, "Settings", settingsPage());
         if (Flavor.ANTHOLOGY) {
             // (SVR Anthology: as the PC Anthology launcher - no online, mods, Paint Tool, movies, installs or
@@ -171,6 +172,8 @@ public class LauncherActivity extends Activity {
         // (the game's GRAPHICS page may have changed settings meanwhile)
         settings_.load();
         refresh();
+        // (SVR Anthology: back from copying files over USB or from a picker - the Setup checklist again)
+        if (Flavor.ANTHOLOGY && current_ < onShow_.size() && onShow_.get(current_) != null) onShow_.get(current_).run();
         if (drivers_ != null) {
             drivers_.checkCrash();
             drivers_.offerBuiltIn();  // (Adreno 710/720/722: once)
@@ -374,7 +377,10 @@ public class LauncherActivity extends Activity {
     // The Online page (a report / idea form's Sign in: 2.2.1 sends come from an online account).
     void goOnline() { select(Math.max(0, names_.indexOf("Online"))); }
 
+    private int current_;
+
     void select(int index) {
+        current_ = index;
         for (int i = 0; i < tabs_.size(); i++) {
             boolean on = i == index;
             tabs_.get(i).setTextColor(on ? Color.WHITE : kDim);
@@ -477,8 +483,34 @@ public class LauncherActivity extends Activity {
     }
 
     // SVR Anthology's Play tab: his version to play, Play, the credit (as the PC Anthology launcher's).
+    // (SVR Anthology: Play at the top - the cover screen of a fold shows only the top - or, before the Setup tab's
+    // steps are done, a button to them)
+    private Button anthPlay_;
+    private TextView anthReady_;
+
+    void anthologyPlayRefresh() {
+        if (anthPlay_ == null) return;
+        boolean ready = InstallActivity.installed();
+        anthPlay_.setText(ready ? "Play" : "Set up SVR Anthology first");
+        anthPlay_.setTextSize(ready ? 22 : 18);
+        anthReady_.setText(ready ? "Ready: games/" + InstallActivity.kFolderName
+            : "The Setup tab shows what is missing and how to copy it from your PC, step by step.");
+    }
+
     View anthologyPlayPage() {
         LinearLayout c = column();
+        anthPlay_ = button("Play", kRed);
+        anthPlay_.setTypeface(Typeface.DEFAULT_BOLD);
+        anthPlay_.setMinHeight(dp(72));
+        anthPlay_.setOnClickListener(v -> {
+            if (InstallActivity.installed()) play();
+            else select(names_.indexOf("Setup"));
+        });
+        c.addView(anthPlay_, fullWidth(4));
+        anthReady_ = text("", 13, kDim);
+        anthReady_.setPadding(dp(4), dp(8), dp(4), 0);
+        c.addView(anthReady_);
+        anthologyPlayRefresh();
         LinearLayout about = card(c, "SVR Anthology");
         TextView desc = text("Yumboy11's SVR Anthology on KaikoClanworth's SvR 2011 PC recomp - on your phone.",
             15, kText);
@@ -489,16 +521,6 @@ public class LauncherActivity extends Activity {
         TextView folder = text("Game folder: games/" + InstallActivity.kFolderName, 13, kDim);
         folder.setPadding(0, dp(6), 0, dp(10));
         about.addView(folder);
-
-        Button play = button("Play", kRed);
-        play.setTextSize(22);
-        play.setTypeface(Typeface.DEFAULT_BOLD);
-        play.setMinHeight(dp(72));
-        play.setOnClickListener(v -> play());
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT);
-        lp.topMargin = dp(18);
-        c.addView(play, lp);
 
         // Report a problem and My reports, as the port's: they go to the online dashboard's SvR Anthology page.
         Button report = button("Report a problem…", kBackground);

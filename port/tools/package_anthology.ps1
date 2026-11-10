@@ -19,7 +19,8 @@ Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $stage | Out-Null
 # the programs: the Anthology build's game and launcher, the SDK's DLLs it was built with
 foreach ($f in @((Join-Path $build "svr2011.exe"), (Join-Path $build "SvR Anthology Launcher.exe"), (Join-Path $build "SvR Anthology Updater.exe"),
-                 (Join-Path $sdk "rexruntime.dll"), (Join-Path $sdk "rexgpu-xenos.dll"))) {
+                 (Join-Path $sdk "rexruntime.dll"), (Join-Path $sdk "rexgpu-xenos.dll"),
+                 (Join-Path $sdk "rexffmpeg.dll"), (Join-Path $sdk "rexmspack.dll"))) {   # (LGPL: DLLs of their own, 2.2.2)
     if (-not (Test-Path $f)) { throw "$f is missing - build first" }
     Copy-Item $f $stage
 }
