@@ -1,0 +1,104 @@
+# More moves in SVR Anthology PC: what blocks them and a plan
+
+From Piloun1, 2026-11-07, for KaikoClanworth1 (svr-anthology-pc). Companion of `REQUEST_KAIKO_ANTHOLOGY_SLOTS.md`
+(R5) and `BIG_ROSTER_ANTHOLOGY_PLAN.md`. Addresses are from a **static, read-only analysis of the SvR 2011 disc
+program** (`Original\default.xex`, the base your Anthology build recompiles). Sizes were measured on my Anthology
+(game + 14 DLC). Nothing of yours was run.
+
+---
+
+## 0. Short version
+
+- Move ids are not the problem (3 283 used out of 32 767). **The Royal Rumble category banks are**: every added move
+  must also go into `MOT\RR00` (strikes), `RR01` (grapples) or `RR02` (others), and in Anthology the last DLC's copies
+  are already **17.3 MB (RR00) and 18.9 MB (RR01)**.
+- The game does **not** have a fixed number of RR banks: it tries `MOT/RR00`, `RR01`, `RR02`, `RR03`… until one is
+  missing, and gathers each wrestler's motions from **all** of them, one bank at a time. So new moves could go into
+  **new banks (RR04, RR05…)** instead of growing RR00 / RR01: content only, no code change, to be confirmed in game.
+- The "16 MiB per bank" rule is empirical (a Xenia test of mine, see 2.4). Anthology's 17-19 MB banks run without any
+  memory change from Yumboy11 except pool 1 (32 -> 64 KB); the largest pool is 20 MiB. In your build, measuring the real
+  headroom and raising a pool is cheap.
+- Your Move Packs extend the stock banks (sorted insert), so they meet the same size wall, and their overlay mount
+  (`sub_825953B0`, pacs' own tables) cannot read 13 of Anthology's pacs (see the slots request, R2 gotcha).
+
+---
+
+## 1. Where a move lives (2011 / Anthology files)
+
+| Part | Where | Anthology state |
+|---|---|---|
+| Record (160 B, id at +0x90) | `misc.pac` `MOVS/WAZE` (game + every DLC copy) | — |
+| Match data EXH / sound events / MBD | `misc.pac` `WAZA/DATA` 0-2, `BATS/INIT` and `BATH/INIT` 10-12 (the last DLC's misc.pac is read) | — |
+| Match animations | `m.pac` `MOT/BM00-03` (PACH of sub-banks) ; DLC `m_dlc02.pac` `MOT/BMD0` | BMD0 6.3 MB (~10 MB free under 16 MiB) |
+| **Royal Rumble category banks** | `m.pac` `MOT/RR00-03` ; DLC `m_dlc02.pac` `MOT/RR00-02` (override the game's) | DLC: **RR00 17.3 MB, RR01 18.9 MB**, RR02 14.5 MB ; game: RR00 16.38, RR01 16.37, RR02 12.1, RR03 0.9 MB |
+| Per-wrestler precomputed banks | `mRR.pac` `MRR/<id>` (~3 MB each, 2011 roster) | stock (Yumboy11 never puts added moves there; when I tried, matches froze) |
+| Create-a-Moveset previews | `m.pac` `MVMT/SPE1, STN1, STN2, STAT, CORN, ROPE, TEAM, RUMB…` ; DLC `MVMT/MDL1`, `BDL1` | DLC MDL1 6.2 MB (~10 MB free) ; growing the game's SPE1 by 1 MB crashed on Xenia |
+| Compact match copies | `mpsp.pac` `MOTP/GAME` ; DLC `mpsp_dlc02.pac` | — |
+| Preview script | `menu\mvMot.pac` (by move id), game + DLC | — |
+
+All RR banks are stored raw (not compressed) in their pacs.
+
+## 2. How the game loads the RR banks (disc program)
+
+### 2.1 The bank list — `sub_8224C4C8`
+`sprintf("MOT/RR%02d", n)` for n = 0, 1, 2… while the entry exists (`sub_826A17D0`), then the same with `"MOT/RB%02d"`;
+names go in a list of 16-byte slots (1 024 bytes cleared: **64 names** at most), count at +52. Any mounted pac can
+provide a bank (the DLC overrides RR00-02, RR03 comes from `m.pac`). So `RR04` would simply be the next one found.
+
+### 2.2 Building each wrestler's motion set — `sub_8224E180` -> `sub_8224CFD0`
+`sub_8224E180` builds the list (2.1), then for each wrestler of the match allocates a 1 416-byte motion-set object
+(`sub_8269A8D8(1416)`, or `sub_8269BA30(89)`) and constructs it with `sub_8224CFD0` (vtable 0x8200584C). The
+constructor starts with the wrestler's own bank `"/MRR/%04d"` when `sub_8224CE20(this)` says so (that test reads match
+settings, not whether the bank exists), else with `"MOT/RR00"`, and requests the load (`sub_826A2FA8`).
+
+### 2.3 Gathering the motions — `sub_8224D8C8` (vtable +4, 0x82005850)
+A state machine that walks the banks **one at a time** (counters at +100 for RR, +104 for RB): `sprintf`, exists,
+load, then copies out of that bank the motions the wrestler needs (sorted list of at most **267** entries of 16 bytes,
+`memcpy` = `sub_8269BC38`) into the wrestler's set. A motion is therefore taken from whichever listed bank holds it.
+
+### 2.4 Sizes and memory
+- Memory pools, table at 0x82DAC2F8 (`{id, size in KB}`), identical in 2011 and Anthology except pool 1: 0:4352,
+  1:32 (Anthology 64), 2:12800, 3:5888, 4:12288, 5:8192, 6:2048, 14:5120, 7:2660, 8:1104, 9:1088, 10:6112, 11:4096,
+  12:4608, 13:86, 15:350, **16:20480 (the largest, 20 MiB)**, 17-22:1024, 23-25:416, 26-28:1024, 29-34:600, 35-37:192,
+  38:1280, 39:3072 (107.7 MB in all). Pool 0 (4.25 MiB) is the match load memory you raised to 16 MB in 2.1.9.
+- The official 2011 DLC keeps RR00 / RR01 at 63 999 / 63 994 blocks of 256 bytes, just under 64 000 (16 384 000).
+- My Xenia test on SvR 2011 (2026-10-31): added moves grew RR00 / RR01 from 16.37 MB to 17.7-18.4 MB -> AJ Styles
+  crashed in match and moves that had worked became fallback finishers. Since then my tool keeps every bank under
+  16 MiB - 64 KiB (16 711 680 bytes).
+- Yet Anthology ships RR00 / RR01 at 17.3 / 18.9 MB and runs. So the limit is probably a pool (pool 16?) shared by the
+  bank being read and what is gathered at the same time, not a per-bank constant (no 0xFA0000 / 16 MiB size constant
+  found near this code).
+
+## 3. Plan
+
+### Step 1 — measure in your build (small)
+Log, for each RR / RB bank load: name, size, the heap / pool it goes to and the free space left; and the size of each
+wrestler's gathered set. Run a stock 30-man Royal Rumble in Anthology (DLC RR01 = 18.9 MB). This gives the real
+headroom and tells which pool to raise.
+
+### Step 2 — remove the wall (pick one or both)
+- **2a. Raise the pool** (like A2, at start-up): the one found in step 1 (e.g. pool 16: 20 -> 64 MiB) and pool 0 to
+  16 MB as in 2.1.9 (if the Anthology build does not have it yet). On PC this is cheap, and RR00 / RR01 can grow again.
+- **2b. Extra RR banks**: confirm that `MOT/RR04` (in the last DLC's `m_dlc02.pac`) is listed and used: Piloun1's
+  tool can write one added move that way (all its other parts as today: BMD0, MDL1, MOTP, WAZE, misc data, script).
+  If it works, no bank ever has to exceed its size, and the 64-name list allows dozens of banks.
+
+### Step 3 — wrestlers with their own bank (`mRR.pac`)
+When `sub_8224CE20` sends a wrestler to `/MRR/<id>`, a move added to his moveset but missing from that bank is not
+found (fallback finisher). Options: make `sub_8224CE20` return 0 for wrestlers whose moveset holds ids absent from
+their MRR bank (or for every edited wrestler), or let the gathering continue into the RR banks after the MRR bank.
+
+### Step 4 — Move Packs for Anthology (optional, bigger)
+Today they grow the stock banks and rely on the own-table mount. For Anthology: build the overlays from the
+`plist360.arc` sections (13 pacs have TOC headers that disagree with the .arc, listed in the slots request), and put
+new moves into new RRnn banks instead of growing RR00 / RR01.
+
+### Step 5 — tests (Piloun1 can run them, Xenia and your build)
+1 added move, then 20, then 100: a normal match, a 30-man Royal Rumble (with an Anthology-added wrestler **and** a
+2011 wrestler who has an MRR bank), the Create-a-Moveset preview (menu memory: the game's SPE1 +1 MB crashed), and
+memory logs from step 1.
+
+## 4. Numbers to keep
+- Move ids <= 32 767: they are read as signed; 2K ids 34 007-60 355 crashed Create-a-Moveset on Xenia (2026-10-30).
+- Ids used by the official DLC (your `dlc_move_ids.json`, 303 ids) must not be reused.
+- Per wrestler: at most 267 gathered motion entries (`sub_8224D8C8`).
