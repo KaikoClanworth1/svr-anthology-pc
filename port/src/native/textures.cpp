@@ -25,6 +25,12 @@
 #include "native/texture_packs.h"
 #include "pad_icons.h"
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 REXCVAR_DEFINE_BOOL(native_mat_fix, true, "GPU",
                     "Native renderer: the stock ring mats without their light bands (rows of light patches in "
                     "the game's mat art; false: the original). Applies from the next arena.");
@@ -1712,6 +1718,15 @@ void EvictUnused(const Context& ctx) {
     if (v && *v) return *v == '1';
 #if defined(__ANDROID__)
     return true;
+#elif defined(_WIN32)
+    // (Anthology reports feeb07 / e7e6e6: a 6 GB laptop, about 600 MB free; after the first match Windows took the
+    // game's pages and the entrances fell to 40-50 fps.) A PC with 8 GB or less lets go of unused textures too.
+    MEMORYSTATUSEX m{};
+    m.dwLength = sizeof m;
+    const bool low = GlobalMemoryStatusEx(&m) && m.ullTotalPhys <= (8ull << 30);
+    REXLOG_INFO("native renderer: {:.1f} GB RAM - textures unused for a minute are {}", m.ullTotalPhys / 1073741824.0,
+                low ? "let go (8 GB or less)" : "kept");
+    return low;
 #else
     return false;
 #endif
