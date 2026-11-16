@@ -31,6 +31,8 @@
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/vfs.h>
 #include <rex/logging.h>
+#include <rex/runtime.h>
+#include <rex/system/kernel_state.h>
 
 #include <rex/input/device_assignment.h>
 #include <rex/input/input_system.h>
@@ -104,6 +106,9 @@
 #include "online_cas.h"
 #include "match_hud.h"
 #include "online_files.h"
+#include <map>
+#include <mutex>
+#include <spdlog/sinks/base_sink.h>
 #include "online_overlay.h"
 #include "startup_pump.h"
 #include "leaderboards.h"
@@ -127,6 +132,9 @@ void InstallModelMem(rex::memory::Memory* memory);  // (model_mem.cpp: failed bu
 REXCVAR_DEFINE_STRING(saves_folder, "", "Storage",
                       "Where the saves live: empty for the game folder's Saves, or a folder (absolute, or "
                       "relative to the game folder) - e.g. to keep two installs' saves apart or shared")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(process_affinity, "", "CPU",
+                      "Windows: the CPU cores the game may use, as a hex mask (FF00 = cores 8-15); empty = all")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(audio_backend, "xaudio2", "Audio",
                       "Audio output: xaudio2 (default) or sdl")
@@ -360,6 +368,71 @@ void CheckGameFilesThere() {
 
 }  // namespace
 
+// A DLC package's missing file (2.2.4 report 179b65, Android: an incomplete Vol03 pack without pac\misc.pac - the
+// runtime logs "[NtCreateFile] FAILED: path='DLC3:\PAC\MISC.PAC'" just before the game's disc read error, and the
+// notice told the player to reinstall the game). A log sink keeps the last failed open on a dlcN: device and each
+// device's package ("content <id> (n) opened as dlcN:"), so the notice names the DLC pack.
+namespace {
+std::mutex g_dlc_mutex;
+std::string g_dlc_failed;                     // (the path, as logged)
+std::map<std::string, std::string> g_dlc_of;  // device ("dlc3") -> package id
+class DlcOpenSink final : public spdlog::sinks::base_sink<std::mutex> {
+ protected:
+  void sink_it_(const spdlog::details::log_msg& msg) override {
+    const std::string_view text(msg.payload.data(), msg.payload.size());
+    if (const size_t at = text.find("FAILED: path='"); at != std::string_view::npos) {
+      const std::string_view path = text.substr(at + 14, text.find('\'', at + 14) - (at + 14));
+      // (a pac on a DLC device: dlc0: to dlc9: - not info\catalog_hd.arc, which every start fails to open)
+      std::string low(path);
+      std::transform(low.begin(), low.end(), low.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+      if (low.size() > 9 && low.compare(0, 3, "dlc") == 0 && low[3] >= '0' && low[3] <= '9' && low[4] == ':' &&
+          low.find("\\pac\\") != std::string::npos) {
+        std::lock_guard lock(g_dlc_mutex);
+        g_dlc_failed = std::string(path);
+      }
+    } else if (const size_t op = text.find(") opened as dlc"); op != std::string_view::npos && text.find("content ") != std::string_view::npos) {
+      const size_t id_at = text.find("content ") + 8, id_end = text.find(' ', id_at), colon = text.find(':', op);
+      if (id_end != std::string_view::npos && colon != std::string_view::npos && id_end < op) {
+        std::lock_guard lock(g_dlc_mutex);
+        g_dlc_of[std::string(text.substr(op + 12, colon - (op + 12)))] = std::string(text.substr(id_at, id_end - id_at));
+      }
+    }
+  }
+  void flush_() override {}
+};
+// (the failed open's DLC pack: its name from the package header - UTF-16BE at 8, as the launcher's report reads it -
+// or its id; "" when the last failed open wasn't on a DLC device)
+std::string MissingDlcText() {
+  std::string path, id;
+  {
+    std::lock_guard lock(g_dlc_mutex);
+    path = g_dlc_failed;
+    if (path.empty()) return "";
+    std::string dev = path.substr(0, path.find(':'));
+    std::transform(dev.begin(), dev.end(), dev.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    if (const auto it = g_dlc_of.find(dev); it != g_dlc_of.end()) id = it->second;
+  }
+  std::string name;
+  if (!id.empty()) {
+    std::ifstream in(svr2011::UserDataFolder() / "0000000000000000" / "5451085D" / "Headers" / "00000002" / (id + ".header"),
+                     std::ios::binary);
+    std::string h((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    for (size_t i = 8; i + 1 < h.size() && i < 8 + 256; i += 2) {
+      const unsigned c = unsigned(uint8_t(h[i])) << 8 | uint8_t(h[i + 1]);
+      if (!c) break;
+      name += c >= 0x20 && c < 0x7F ? char(c) : c == 0x2013 || c == 0x2014 ? '-' : '?';
+    }
+  }
+  std::string file = path.substr(path.find(':') + 1);
+  std::replace(file.begin(), file.end(), '\\', '/');
+  while (!file.empty() && file[0] == '/') file.erase(0, 1);
+  std::transform(file.begin(), file.end(), file.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+  const std::string pack = !name.empty() ? "'" + name + "'" : !id.empty() ? id : path.substr(0, path.find(':'));
+  return "The DLC pack " + pack + " is missing a file (" + file + "). Remove that DLC pack in the launcher, or add it "
+         "again complete. The game will close.";
+}
+}  // namespace
+
 // The game's disc read error (sub_82904DB8 -> XamShowDirtyDiscErrorUI): a file it needs couldn't be opened. The
 // runtime's box blamed "bad or unimplemented file IO calls" and then called exit(1) - static objects destroyed under
 // the still running render and audio threads: a SIGSEGV in native::OnLoadShaderConstants or a SIGABRT in the audio
@@ -384,12 +457,15 @@ void CheckGameFilesThere() {
         names += (listed++ ? ", " : "") + p;
       }
   if (more) names += " and " + std::to_string(more) + " more";
+  const std::string dlc = names.empty() ? MissingDlcText() : std::string();
   const std::string text =
-      names.empty() ? "A game file couldn't be read. Install the game again from your Xbox 360 disc image (launcher "
+      !dlc.empty() ? dlc
+      : names.empty() ? "A game file couldn't be read. Install the game again from your Xbox 360 disc image (launcher "
                       "Install). The game will close."
                     : "Game files missing: " + names + ". Install the game again from your Xbox 360 disc image "
                       "(launcher Install). The game will close.";
-  REXLOG_ERROR("[svr2011] disc read error: {} - ending the game", names.empty() ? "a file couldn't be read" : names);
+  REXLOG_ERROR("[svr2011] disc read error: {} - ending the game",
+               !dlc.empty() ? dlc : names.empty() ? "a file couldn't be read" : names);
   svr2011::ShowNotice(text, 15.0f);
   rex::FlushLogging();
   std::this_thread::sleep_for(std::chrono::seconds(15));
@@ -665,6 +741,23 @@ void Svr2011App::OnConfigurePaths(rex::PathConfig& paths) {
 }
 
 void Svr2011App::OnPreSetup(rex::RuntimeConfig& config) {
+#if defined(_WIN32)
+  // Which CPU cores the game may run on: SVR2011_AFFINITY (the test scripts set FF00 - cores 8-15, so a game the
+  // player runs on 0-7 keeps them), else the process_affinity setting; hex mask, empty = all.
+  {
+    std::string mask = Env("SVR2011_AFFINITY");
+    if (mask.empty()) mask = rex::cvar::Query<std::string>("process_affinity");
+    if (!mask.empty()) {
+      DWORD_PTR want = DWORD_PTR(std::strtoull(mask.c_str(), nullptr, 16)), proc = 0, sys = 0;
+      if (GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys)) want &= sys;
+      if (want && SetProcessAffinityMask(GetCurrentProcess(), want))
+        REXLOG_INFO("cpu: the game runs on cores mask {:X} ({})", uint64_t(want),
+                    Env("SVR2011_AFFINITY").empty() ? "process_affinity" : "SVR2011_AFFINITY");
+      else
+        REXLOG_WARN("cpu: affinity mask {} not used (cores mask {:X} on this PC)", mask, uint64_t(sys));
+    }
+  }
+#endif
   // Test games (tools/dev/svrtest.ps1 and the other test scripts): SVR2011_AUDIO_MUTE=1 mutes every sound path
   // (they all read audio_mute) even when the command line was dropped - a flag given twice is a parse error that
   // loses every --option, --audio_mute=true with them (27 Oct: a test game was heard).
@@ -722,6 +815,7 @@ void Svr2011App::OnPreSetup(rex::RuntimeConfig& config) {
   }
 #endif
 #endif
+  rex::AddSink(std::make_shared<DlcOpenSink>());  // (a DLC pack's missing file: EndForMissingFiles names it - now, before any game thread)
   // Automated tests: the only controller is one driven by a command file.
   if (std::string file = Env("SVR2011_INPUT_FILE"); !file.empty()) {
     svr2011::InstallScriptLogSink();  // (now: logging is up, no game thread yet)
@@ -1164,4 +1258,20 @@ bool Svr2011App::OnWindowCloseRequested() {
   svr2011::StopPortMapping();
   svr2011::OnlineOverlaySayGoodbye();  // (shown offline at once)
   return true;
+}
+
+// The window closed: the SDK's way (ReXApp::OnClosing - the title stopped, the log flushed, std::_Exit), but on
+// Windows the process ends with TerminateProcess. std::_Exit there still unloads the DLLs: rexruntime's static
+// objects are destroyed under the threads still running, which ended every quit with an abort() and a crash report
+// (reports 20261111-220112-cd089d and others: "Title terminated; hard-exiting process." then "crash: abort()").
+void Svr2011App::OnClosing(rex::ui::UIEvent& e) {
+  (void)e;
+  REXLOG_INFO("Window closing, shutting down...");
+  if (runtime() && runtime()->kernel_state()) runtime()->kernel_state()->TerminateTitle();
+  REXLOG_INFO("Title terminated; ending the process.");
+  rex::FlushLogging();
+#if defined(_WIN32)
+  TerminateProcess(GetCurrentProcess(), 0);
+#endif
+  std::_Exit(0);
 }

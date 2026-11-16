@@ -203,7 +203,12 @@ uint32_t FallbackBlock(uint32_t size, bool cpu, uint32_t align) {
     const char* v = std::getenv("SVR2011_TEST_FALLBACK_NO_ROOM");
     return v ? uint32_t(std::strtoul(v, nullptr, 0)) : 0u;
   }();
-  const uint32_t ptr = test_no_room && size >= test_no_room
+  // (SVR2011_TEST_PHYS_NO_ROOM=<bytes>: the same for the physical pool only - report 79be36's 26 MB motion file)
+  static const uint32_t test_phys_no_room = [] {
+    const char* v = std::getenv("SVR2011_TEST_PHYS_NO_ROOM");
+    return v ? uint32_t(std::strtoul(v, nullptr, 0)) : 0u;
+  }();
+  const uint32_t ptr = (test_no_room && size >= test_no_room) || (!cpu && test_phys_no_room && size >= test_phys_no_room)
                            ? 0
                            : g_memory->SystemHeapAlloc(size, want, cpu ? rex::memory::kSystemHeapVirtual
                                                                        : rex::memory::kSystemHeapPhysical);
@@ -253,6 +258,14 @@ uint32_t ModelPageLimit() {
 uint32_t FallbackBytesInUse() {
   std::lock_guard lock(g_fallback_mutex);
   return g_fallback_bytes;
+}
+
+bool InFallbackBlock(uint32_t address) {
+  if (!address || !g_fallback_blocks.load(std::memory_order_relaxed)) return false;
+  std::lock_guard lock(g_fallback_mutex);
+  for (const auto& [ptr, size] : g_fallback)
+    if (address >= ptr && address - ptr < size) return true;
+  return false;
 }
 
 bool CawHeapFree(uint32_t ptr) {

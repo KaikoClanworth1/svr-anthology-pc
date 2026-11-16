@@ -26,4 +26,7 @@ class Svr2011App : public rex::ReXApp {
   void OnLoadXexImage(std::string& xex_image) override;  // (the Anthology build: anthology.h)
   void OnPostLoadXexImage() override;
   bool OnWindowCloseRequested() override;  // (the router's port mapping removed: port_map.h)
+
+ private:
+  void OnClosing(rex::ui::UIEvent& e) override;  // (ReXApp's, ending the process without unloading the DLLs)
 };

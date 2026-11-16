@@ -168,6 +168,7 @@ struct Recording {
   std::array<std::vector<uint64_t>, 4> table_steps;
   std::array<uint8_t, 4> last_table{};
   uint32_t trail_second = ~0u;
+  uint32_t last_clock = 0;  // (the match clock's last value: a story's next match starts it again)
   std::string start;
   std::chrono::steady_clock::time_point started;
   uint32_t rule = 0, arena = 0;
@@ -176,6 +177,9 @@ struct Recording {
   std::vector<svr2011::MatchPerson> people;
   std::map<uint32_t, std::pair<bool, int>> cpu_attire;  // (character index: a CPU, the attire 1-4 - wrestlers only)
   std::map<uint32_t, uint32_t> ports;                   // (character index: the player's controller 0-3 playing him)
+  std::map<uint32_t, uint32_t> chars, raw_ports;        // (character index: its address, its +1152 at the bell)
+  std::set<uint32_t> no_ai;                             // (character index: a "CPU" no AI update ran for in 10 s)
+  bool ai_checked = false;
   int last_passes = 1;                                  // (the last frame's world updates written to inputs.bin)
   FILE* inputs = nullptr;
   FILE* trail = nullptr;
@@ -258,13 +262,19 @@ void WriteJson(bool complete) {  // (under g_rec)
     if (!people.empty()) people += ",\n    ";
     const auto ca = g.cpu_attire.find(p.index);
     const bool known = ca != g.cpu_attire.end();
+    // (no AI ran for him 10 s in, yet no pad plays him: a hidden test's cpu=all person 0)
+    const bool no_ai = g.no_ai.count(p.index) != 0;
+    if (no_ai && !g.ports.count(p.index) && g.raw_ports.count(p.index) && g.raw_ports.at(p.index) < svr2011::kMaxPlayers)
+      g.ports[p.index] = g.raw_ports.at(p.index);
     people += fmt::format(
         "{{\"index\": {}, \"person\": {}, \"name\": {}, \"superstar\": {}, \"cpu\": {}, \"attire\": {}, \"port\": {}, "
-        "\"mod\": {}, \"caw\": null}}",
-        p.index, p.person, Json(p.name), p.superstar, known ? (ca->second.first ? "true" : "false") : "null",
+        "\"mod\": {}, \"caw\": null{}}}",
+        p.index, p.person, Json(p.name), p.superstar,
+        known ? (ca->second.first && !no_ai ? "true" : "false") : "null",
         known && ca->second.second ? std::to_string(ca->second.second) : std::string("null"),
         g.ports.count(p.index) ? std::to_string(g.ports.at(p.index)) : std::string("null"),
-        p.mod.empty() ? std::string("null") : ModJson("Superstars", p.mod));
+        p.mod.empty() ? std::string("null") : ModJson("Superstars", p.mod),
+        no_ai ? ", \"no_ai\": true" : "");
   }
   const std::string arena_id = Key(g.arena_manifest, "id");
   const std::string s = fmt::format(
@@ -553,6 +563,10 @@ void RestoreBell(uint8_t* base) {  // (under g_rec)
   REXLOG_INFO("[svr2011] replay: bell.bin written back -{}", told);
 }
 
+// Each character's CPU AI updates (slobber_knocker.cpp's sub_8280CFD0 hook: MatchRecordAiUpdate) since the bell.
+std::mutex g_ai_mutex;
+std::map<uint32_t, uint32_t> g_ai_updates;
+
 void Start(PPCContext& ctx, uint8_t* base, uint32_t clock) {  // (under g_rec)
   const int keep = REXCVAR_GET(match_recordings);
   if (keep <= 0) return;
@@ -576,6 +590,13 @@ void Start(PPCContext& ctx, uint8_t* base, uint32_t clock) {  // (under g_rec)
       g.cpu_attire[p.index] = {!pad, attire};
       if (pad) g.ports[p.index] = port;
     }
+  for (const auto& p : g.people)  // (each wrestler's character and +1152: the AI check 10 s in)
+    if (const uint32_t c = Rd32(base + kChars + p.index * 4); p.person < 6 && c >= 0x40000000u && !(c & 3))
+      g.chars[p.index] = c, g.raw_ports[p.index] = Rd32(base + c + 1152);
+  {
+    std::lock_guard lock(g_ai_mutex);
+    g_ai_updates.clear();
+  }
   std::string names;
   for (const auto& p : g.people)
     if (p.person < 6) names += (names.empty() ? "" : "_vs_") + Safe(p.name);
@@ -657,6 +678,22 @@ void Start(PPCContext& ctx, uint8_t* base, uint32_t clock) {  // (under g_rec)
   REXLOG_INFO("[svr2011] record: this match in {}", g.dir.string());
 }
 
+// A story's segment the game went on from without ending it (Road to WrestleMania: a backstage brawl, then the match
+// - no new load, no match end): its folder closed as it is (result "segment", done.txt - nothing more comes), so the
+// next match gets a folder of its own. Report 3fd493: the match was written into the segment's folder, under the
+// segment's people and rule.
+void EndSegment() {  // (under g_rec)
+  if (g.inputs) std::fclose(g.inputs);
+  if (g.trail) std::fclose(g.trail);
+  g.inputs = g.trail = nullptr;
+  g.result = "segment";
+  WriteJson(false);
+  if (FILE* f = std::fopen((g.dir / "done.txt").string().c_str(), "wb")) std::fclose(f);
+  REXLOG_INFO("[svr2011] record: the segment's folder closed - the next match starts without a new load ({})",
+              g.dir.filename().string());
+  g.on = false;
+}
+
 }  // namespace
 
 // The random table is seeded (a match's load, and other places): logged with SVR2011_TEST_SEED_LOG (replay research).
@@ -698,6 +735,11 @@ REX_HOOK_RAW(sub_828F2430) {
 }
 
 namespace svr2011 {
+void MatchRecordAiUpdate(uint32_t character) {
+  if (static const bool on = TestMatchAllCpu(); !on) return;  // (svrtest's cpu=all test match only)
+  std::lock_guard lock(g_ai_mutex);
+  ++g_ai_updates[character];
+}
 
 void MatchRecordMatchLoads() {
   if (!t_logic) {
@@ -752,8 +794,24 @@ void MatchRecordUpdate(PPCContext& ctx, uint8_t* base) {
   {
     std::lock_guard lock(g_rec);
     const bool match = clock && c0 >= 0x40000000u && !(c0 & 3);
+    // A story's next match without a new load (EndSegment): the clock starts again under another rule or arena, with
+    // other wrestlers (a gauntlet's next opponent keeps the rule and arena, Three Stages of Hell its people: one
+    // folder, as before).
+    if (g.on && match && clock <= 2 && g.last_clock > clock + 60 && !g_replay.on &&
+        (base[kLive] != g.rule || Rd32(base + kLive + 64) != g.arena)) {
+      std::set<std::pair<uint32_t, uint32_t>> was, now;   // (person, superstar) of the wrestlers
+      for (const auto& p : g.people) if (p.person < 6) was.insert({p.person, p.superstar});
+      for (const auto& p : svr2011::MatchPeople(base)) if (p.person < 6) now.insert({p.person, p.superstar});
+      if (!now.empty() && now != was) {
+        EndSegment();
+        g_loaded = true;  // (this bell starts the next one's, below)
+      }
+    }
+    if (g.on && match) g.last_clock = clock;
     if (match && !g.on && clock <= 2) {  // (the bell: with a referee, after a match's load - not an attract match)
-      bool referee = false;
+      // (Royal Rumbles and battle royals have no referee: their rule instead)
+      const uint8_t rule = base[kLive];
+      bool referee = (rule >= 0x14 && rule <= 0x18) || (rule >= 0x22 && rule <= 0x25) || rule == 0x56;
       for (uint32_t i = 0; i < 10; ++i)
         if (const uint32_t c = Rd32(base + kChars + i * 4); c >= 0x40000000u && !(c & 3) && Rd32(base + c + 1156) == 6)
           referee = true;
@@ -786,6 +844,25 @@ void MatchRecordUpdate(PPCContext& ctx, uint8_t* base) {
         std::fputs((line + "\n").c_str(), g.trail);
         std::fflush(g.trail);
         if (g.inputs) std::fflush(g.inputs);  // (a hung game that is killed keeps its pads up to the last second)
+      }
+      // 10 s after the bell, the "CPUs" the game's AI update (sub_8280CFD0) never ran for: svrtest's cpu=all gives
+      // person 0 a CPU's port (+1152 6), yet no AI runs for him and no pad plays him - match.json gives him cpu false,
+      // "no_ai", so nobody reads his idle as the AI's
+      // (svrtest's cpu=all test match only: in a player's match a real CPU can have none yet - a tag partner on the
+      // apron, a Rumble entrant waiting - and match.json stays as it was)
+      if (static const bool test = svr2011::TestMatchAllCpu(); test && !g.ai_checked && g.trail_second != ~0u &&
+                                                                g.trail_second >= 10) {
+        g.ai_checked = true;
+        std::lock_guard lock(g_ai_mutex);
+        for (const auto& p : g.people) {
+          const auto ca = g.cpu_attire.find(p.index);
+          if (p.person >= 6 || ca == g.cpu_attire.end() || !ca->second.first || !g.chars.count(p.index)) continue;
+          if (g_ai_updates.count(g.chars.at(p.index))) continue;
+          g.no_ai.insert(p.index);
+          REXLOG_WARN("[svr2011] record: person {} ({}) - no CPU AI ran for him in 10 s (port +1152 {}, no pad)",
+                      p.person, p.name, g.raw_ports.count(p.index) ? int(g.raw_ports.at(p.index)) : -1);
+        }
+        if (!g.no_ai.empty()) WriteJson(false);
       }
     }
   }

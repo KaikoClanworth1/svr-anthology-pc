@@ -665,6 +665,7 @@ def hand_library(game_pac):
     """the 2011 hand-pose library for the HCTP-path converters' finger tracks (hand_tracks.py)"""
     import hand_tracks
     EH.DEFAULT_HAND_LIB = hand_tracks.library(game_pac) if game_pac else {}
+    EH.DEFAULT_GAME_PAC = game_pac   # (and their face tracks: face_tracks.py, report a1b6b1)
     return EH.DEFAULT_HAND_LIB
 
 
@@ -908,8 +909,18 @@ DLC_PROP_FALLBACK = 2006   # (a prop every 2011 install has: only if the pack ca
 def dlc_props(src, game, evp11, rep):
     """the props of a DLC entrance that 2011's evtobj lacks, from the game's packages (evtobj_dlc<nn>.pac, 2K16's pac/prop/<id>_dlc<nn>.pac):
     the model converted (svrmod wwe13prop), added by the pack under its own id"""
-    packages = getattr(getattr(src, 'dlc', None), 'packages', None)
-    if not packages:
+    packages = getattr(getattr(src, 'dlc', None), 'packages', None) or []
+    # (and the disc's own evtobj_dlc<nn>.pac: WWE '13's Attitude Era superstars are on the disc, unlocked by a package
+    # of one catalog - suggestion 6135d5)
+    try:
+        disc = ['pac/evt/' + f for f in src.listdir('pac/evt') if re.match(r'(?i)evtobj_dlc\d+\.pac$', f)]
+        # (then the disc's own evtobj.pac, for a prop 2011's lacks - WWE '13's Gangrel fire 2726, report 08b661; only
+        # ids 2011 doesn't have reach here, and the DLC pacs come first)
+        if disc:
+            disc += ['pac/evt/' + f for f in src.listdir('pac/evt') if f.lower() == 'evtobj.pac']
+    except Exception:   # noqa: BLE001
+        disc = []
+    if not packages and not disc:
         return
     missing = collections.defaultdict(list)
     for w in rep['warnings']:
@@ -919,12 +930,14 @@ def dlc_props(src, game, evp11, rep):
     if not missing:
         return
     found = {}
-    for pk in packages:
-        for low in pk.matching(r'^pac/(evt/evtobj_dlc\d+|prop/\d+_dlc\d+)\.pac$'):
+    sources = [('DLC package ' + pk.display, pk.read, pk.matching(r'^pac/(evt/evtobj_dlc\d+|prop/\d+_dlc\d+)\.pac$'))
+               for pk in packages] + ([('the disc', src.read, disc)] if disc else [])
+    for where, read, lows in sources:
+        for low in lows:
             # (a package pac this reader can't read leaves its props out, not the whole entrance: WWE 2K17's Goldberg
             # with its packages failed on a table running past the file's end, report 20261108 09187a)
             try:
-                raw = pk.read(low)
+                raw = read(low)
                 if raw[:4] == b'\x0f\xf5\x12\xed':
                     raw = E13.xdec(raw, E13.find_svrmod(SVRMOD))
                 try:
@@ -934,7 +947,7 @@ def dlc_props(src, game, evp11, rep):
                         raise
                     ents = E13.epac16_entries(raw)   # (2K16 / 2K17's per-entry EPAC layout)
             except Exception as x:
-                rep['notes'].append('%s in DLC package %s: not read (%s) - its props are left out' % (low, pk.display, x))
+                rep['notes'].append('%s in %s: not read (%s) - its props are left out' % (low, where, x))
                 continue
             for (g, n), b in ents.items():
                 if g == 'SOBJ' and n.isdigit():
@@ -971,7 +984,7 @@ def wwe13_convert(src, entrance, number, name, parts, rep, game_pac=None, game='
         rep[k] += r[k]
     evp11 = own_vehicles(src, game, evp11, game_pac, rep)
     dlc_props(src, game, evp11, rep)
-    rep['notes'].append('not converted: theme, face / finger tracks; titantron only with --titantron (Bink 2: a decoder the player installs)')
+    rep['notes'].append('not converted: theme, the source face (a 2011 face stands in: the face note); titantron only with --titantron (Bink 2: a decoder the player installs)')
     return evp11, evt11
 
 
@@ -1396,6 +1409,22 @@ def pyro(src, g, entrance, number, d, rep):
         return
     name = '%04d' % entrance
     pce = ents.get(('PCE6', name))
+    where = 'prtcls.pac'
+    if pce is None and g not in ('wwe2k16', 'wwe2k17'):
+        # (the disc's prtcls_dlc<nn>.pac: WWE '13's Attitude Era superstars' sets - Gangrel's fire, PCE6 0053, report
+        # 08b661; their entrances are on the disc too, unlocked by a package)
+        try:
+            for f in sorted(src.listdir('pac')):
+                if re.match(r'(?i)prtcls_dlc\d+\.pac$', f):
+                    raw = src.read('pac/' + f)
+                    if raw[:4] not in (b'EPAC', b'EPK8'):
+                        raw = E13.xdec(raw, E13.find_svrmod(SVRMOD))
+                    more = E13.epk8_entries(raw)
+                    if ('PCE6', name) in more:
+                        ents, pce, where = more, more[('PCE6', name)], f
+                        break
+        except Exception as x:   # noqa: BLE001
+            rep['notes'].append("pyro: the disc's prtcls_dlc pacs not readable (%s)" % x)
     if pce is None:
         rep['notes'].append('pyro: the source has no particle set for entrance %d' % entrance)
         return
@@ -1408,7 +1437,7 @@ def pyro(src, g, entrance, number, d, rep):
         lines.append('pacentry prtcls.pac %s %04d %s' % (grp, number, fn))
     with open(os.path.join(d, 'pack.txt'), 'a', newline='\r\n') as f:
         f.write('\n'.join(lines) + '\n')
-    rep['notes'].append('pyro: prtcls.pac PCE6/LPE6 %s -> %04d%s' % (name, number, '' if ('LPE6', name) in ents else ' (LPE6 from PCE6)'))
+    rep['notes'].append('pyro: %s PCE6/LPE6 %s -> %04d%s' % (where, name, number, '' if ('LPE6', name) in ents else ' (LPE6 from PCE6)'))
 
 
 TITANTRON_DIRS = ('movies/titantron', 'MOVIES/TITANTRON', 'movies/Titantron')

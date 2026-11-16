@@ -16,6 +16,7 @@
 #include <utility>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -115,7 +116,10 @@ REX_HOOK_RAW(sub_82BA1AC8) {
 }
 
 // CREATE A MOVE-SET's tab lists filled (sub_82378A68): the packs' moves ("MOD: " names) go to the end of
-// each list, in their order - a MOD group under the game's moves (list 25's first row, NONE, stays).
+// each list, in their order - a MOD group under the game's moves (list 25's first row, NONE, stays). A pack move
+// the game can't play (move_packs.cpp MoveUsable 0: a record from 16000 up that never starts, or its motions missing
+// or left out of the banks) leaves the list: its preview froze the editor's wrestlers (report 0d04a0), and a
+// moveset given it keeps the base's move in a match anyway.
 REX_EXTERN(__imp__sub_82378A68);
 REX_HOOK_RAW(sub_82378A68) {
   __imp__sub_82378A68(ctx, base);
@@ -124,6 +128,7 @@ REX_HOOK_RAW(sub_82378A68) {
   const uint32_t records = Rd32(base, table + 60);
   if (!records) return;
   int moved = 0;
+  std::set<uint16_t> dropped;
   for (uint32_t l = 0; l < 26; ++l) {
     const uint32_t list = Rd32(base, table + 840 + l * 4);
     const uint16_t n = Rd16(base, table + 944 + l * 2);
@@ -131,16 +136,29 @@ REX_HOOK_RAW(sub_82378A68) {
     std::vector<uint16_t> keep, mods;
     for (uint16_t i = 0; i < n; ++i) {
       const uint16_t idx = Rd16(base, list + 2 * i);
-      (IsModRecord(base, records, idx) ? mods : keep).push_back(idx);
+      if (!IsModRecord(base, records, idx)) {
+        keep.push_back(idx);
+      } else if (svr2011::MoveUsable(Rd16(base, records + idx * kRecordSize + 0x90)) == 0) {
+        dropped.insert(Rd16(base, records + idx * kRecordSize + 0x90));
+      } else {
+        mods.push_back(idx);
+      }
     }
-    if (mods.empty()) continue;
+    if (mods.size() + keep.size() == n && mods.empty()) continue;
     uint16_t i = 0;
     for (const uint16_t v : keep) Wr16(base, list + 2 * i++, v);
     for (const uint16_t v : mods) Wr16(base, list + 2 * i++, v);
+    if (i != n) Wr16(base, table + 944 + l * 2, i);
     moved += int(mods.size());
   }
   static int logged = 0;
-  if (moved && logged++ < 4) REXLOG_INFO("[svr2011] cam mods: {} MOD rows grouped at the end of the move lists", moved);
+  if ((moved || !dropped.empty()) && logged++ < 4) {
+    std::string ids;
+    for (const uint16_t id : dropped) ids += " " + std::to_string(id);
+    REXLOG_INFO("[svr2011] cam mods: {} MOD rows grouped at the end of the move lists{}", moved,
+                dropped.empty() ? std::string()
+                                : fmt::format("; {} pack move(s) the game can't play left out:{}", dropped.size(), ids));
+  }
 }
 
 // A move by category and id (sub_8237D4C8(table, cat, id) -> its record, NULL when the category list
@@ -174,6 +192,67 @@ const std::pair<int, int>& TestMissing() {
     return std::make_pair(-1, 0);
   }();
   return test;
+}
+
+// Whether the match's motion banks have motion `id` (any x, y): the bank lists *0x82E3CC40 / *0x82E3C108, 68 slots
+// each, a bank's entries at +276 (16 bytes, sorted by id << 16 | x << 8 | y, count at +272) - as sub_82394740 looks
+// one up. No lists (a menu): true, nothing to judge by.
+bool MotionInBanks(uint8_t* base, uint16_t id) {
+  const auto at = [&](uint32_t a) { return base + a + REX_PHYS_HOST_OFFSET(a); };
+  bool any = false;
+  for (const uint32_t list_at : {0x82E3CC40u, 0x82E3C108u}) {
+    const uint32_t list = Rd32(base + list_at);
+    if (!list) continue;
+    any = true;
+    for (uint32_t k = 0; k < 68; ++k) {
+      uint32_t b = Rd32(at(list + 4 * k));
+      if (!b) continue;
+      if (Rd32(at(b)) != 0x734B4D59 && Rd32(at(b)) != 0x73424D59) b -= 16;
+      const uint32_t n = Rd32(at(b + 272));
+      if (!n || n > 65536) continue;
+      uint32_t lo = 0, hi = n;  // (the first entry at or past id << 16)
+      while (lo < hi) {
+        const uint32_t mid = (lo + hi) / 2;
+        if (Rd32(at(b + 276 + mid * 16)) < uint32_t(id) << 16) lo = mid + 1;
+        else hi = mid;
+      }
+      if (lo < n && Rd32(at(b + 276 + lo * 16)) >> 16 == id) return true;
+    }
+  }
+  return !any;
+}
+
+// The fallback for a category in this match: its first candidate the banks have (report 0afa16, 2.2.4: category 3's
+// first game move, 5109, has a record and category bits but no motion in any bank - a pack move's slot fell back to
+// it after a lock-up and both wrestlers froze in motion 5109). Picked once per category while the bank lists stay.
+uint16_t MatchDefault(uint8_t* base, uint32_t cat) {
+  static std::mutex mu;
+  static uint32_t lists = 0;
+  static std::map<uint32_t, uint16_t> picked;
+  const uint32_t now = Rd32(base + 0x82E3CC40) ^ (Rd32(base + 0x82E3C108) << 1);
+  {
+    std::lock_guard lock(mu);
+    if (now != lists) lists = now, picked.clear();
+    if (const auto it = picked.find(cat); it != picked.end()) return it->second;
+  }
+  uint16_t pick = svr2011::CategoryDefaultMove(int(cat));
+  // (the banks are filled while the match loads: judged from 2 s of the match world on - before that the first
+  // candidate, not kept)
+  if (Rd32(base + 0x82E3CD0C) < 120) return pick;
+  if (!MotionInBanks(base, pick)) {
+    const uint16_t skipped = pick;
+    for (const uint16_t id : svr2011::CategoryDefaultMoves(int(cat)))
+      if (id != skipped && !svr2011::NoMotionMove(id) && !svr2011::MoveMissing(id, true) && svr2011::StockPlays(id) &&
+          MotionInBanks(base, id)) {
+        pick = id;
+        break;
+      }
+    REXLOG_WARN("[svr2011] cam mods: category {}'s fallback move {} has no motion in this match's banks - {}", cat,
+                skipped, pick != skipped ? fmt::format("{} instead", pick) : std::string("no other move found, kept"));
+  }
+  std::lock_guard lock(mu);
+  picked[cat] = pick;
+  return pick;
 }
 
 uint32_t MatchMove(uint8_t* base, uint32_t slot, uint32_t got) {
@@ -233,11 +312,15 @@ uint32_t MatchMove(uint8_t* base, uint32_t slot, uint32_t got) {
   // pick the same move. Asked last: it takes p2p's lock. Test aid SVR2011_TEST_ONLINE_MOVES=1: judged as networked)
   static const bool test_online = [] { const char* v = std::getenv("SVR2011_TEST_ONLINE_MOVES"); return v && *v == '1'; }();
   const auto networked = [] { return test_online || svr2011::P2PMatchLobby().in; };
-  if (cat >= 128 || !id || CreatedFinisher(id) ||
+  // (and a pack move the game can't play - a record from 16000 up that never starts, MoveUsable 0: a moveset saved
+  // with one before CREATE A MOVE-SET left them out of its lists (report 0d04a0) - judged from this player's packs,
+  // so not in a networked match)
+  if (cat >= 128 || !id || (CreatedFinisher(id) && !svr2011::PackMove(id)) ||
       !(planted || svr2011::MoveMissing(id, false) || (svr2011::MoveMissing(id, true) && !networked()) ||
-        !svr2011::OnlinePackMoveAllowed(id)))
+        !svr2011::OnlinePackMoveAllowed(id) ||
+        (svr2011::PackMove(id) && svr2011::MoveUsable(id) == 0 && !networked())))
     return got;
-  const uint16_t def = svr2011::CategoryDefaultMove(int(cat));
+  const uint16_t def = MatchDefault(base, cat);
   if (!def) {
     static int nolog = 0;
     if (nolog++ < 8) REXLOG_WARN("[svr2011] cam mods: slot {} move {} has no record and category {} has no move to use", slot, id, cat);
@@ -249,7 +332,8 @@ uint32_t MatchMove(uint8_t* base, uint32_t slot, uint32_t got) {
     std::lock_guard lock(mu);
     if (logged.size() < 64 && !logged[slot << 16 | id]) {
       logged[slot << 16 | id] = true;
-      REXLOG_WARN("[svr2011] cam mods: slot {} move {} has no record (pack removed?) - {} in this match", slot, id, def);
+      REXLOG_WARN("[svr2011] cam mods: slot {} move {} has no record (pack removed?) or can't be played - {} in this match",
+                  slot, id, def);
     }
   }
   return (got & 0x8000) | def;
@@ -314,3 +398,7 @@ REX_HOOK_RAW(sub_822104F8) {
                 "(the game read past its table here: a crash) ({} times)",
                 Rd32(base, ch + 1156), motion, slots[0], slots[1], slots[2], slots[3], n);
 }
+
+namespace svr2011 {
+bool MotionInMatchBanks(uint8_t* base, uint16_t id) { return MotionInBanks(base, id); }
+}  // namespace svr2011

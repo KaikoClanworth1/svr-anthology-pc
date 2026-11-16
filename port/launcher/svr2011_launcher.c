@@ -72,6 +72,7 @@
 #include "report_receipts.h"
 #include "reports_tab.h"
 #include "suggestions_tab.h"
+#include "supporters_tab.h"
 #include "music_tab.h"
 #include "texpacks_tab.h"
 #include "setup_tab.h"
@@ -121,6 +122,7 @@ static void setup_console_progress(int permille, const WCHAR *text);
 #define REPO_URL          L"https://github.com/KaikoClanworth1/wwe-svr2011-pc"
 #define KOFI_URL          L"https://ko-fi.com/kaikoclanworth"
 #define PAYPAL_URL        L"https://www.paypal.com/donate/?hosted_button_id=MS4C2WC38N3W2"
+#define PATREON_URL       L"https://www.patreon.com/c/KaikoClanworth"
 #define CREDIT_LINE       L"Launcher - Version " PORT_VERSION L" - By KaikoClanworth"
 #define CREDIT_LINK       L"Download free at github.com/KaikoClanworth1/wwe-svr2011-pc"
 #define MAIN_TITLE        CREDIT_LINE L" - " CREDIT_LINK
@@ -132,7 +134,7 @@ static void setup_console_progress(int permille, const WCHAR *text);
 
 /* ── state ─────────────────────────────────────────────────────────────── */
 
-enum { TAB_PLAY, TAB_SETTINGS, TAB_ONLINE, TAB_INSTALL, TAB_DLC, TAB_SAVES, TAB_PAINT, TAB_MOVIES, TAB_ANDROID, TAB_MODS, TAB_MUSIC, TAB_ROSTER, TAB_TEXPACKS, TAB_SETUP, TAB_DISCOVER, TAB_TOOLS, TAB_REPORTS, TAB_SUGGESTIONS, TAB_SWITCH, TAB_COUNT };
+enum { TAB_PLAY, TAB_SETTINGS, TAB_ONLINE, TAB_INSTALL, TAB_DLC, TAB_SAVES, TAB_PAINT, TAB_MOVIES, TAB_ANDROID, TAB_MODS, TAB_MUSIC, TAB_ROSTER, TAB_TEXPACKS, TAB_SETUP, TAB_DISCOVER, TAB_TOOLS, TAB_REPORTS, TAB_SUGGESTIONS, TAB_SWITCH, TAB_SUPPORTERS, TAB_COUNT };
 #define ID_MODS_BASE 900  /* the Mods tab's controls (mods_tab.c) */
 #define ID_MUSIC_BASE 950 /* the Music tab's (music_tab.c) */
 #define ID_ROSTER_BASE 1000 /* the Roster tab's (roster_tab.c) */
@@ -141,6 +143,7 @@ enum { TAB_PLAY, TAB_SETTINGS, TAB_ONLINE, TAB_INSTALL, TAB_DLC, TAB_SAVES, TAB_
 #define ID_DISCOVER_BASE 1300 /* Mods -> Discovery's (discover_tab.c) */
 #define ID_REPORTS_BASE 1400 /* the Reports tab's (reports_tab.c) */
 #define ID_SUGGEST_BASE 1450 /* the Suggestions tab's (suggestions_tab.c) */
+#define ID_SUPPORTERS_BASE 1500 /* the Supporters tab's (supporters_tab.c) */
 
 enum {
     ID_TAB = 100,
@@ -242,6 +245,7 @@ static int mod_tab_at(POINT pt);
 static RECT      s_credit_link;            /* the credit's link (top right of every page), for clicks */
 static RECT      s_kofi_link;              /* "Support me: ko-fi" (bottom of the sidebar), for clicks */
 static RECT      s_paypal_link;            /* ... " / PayPal" after it */
+static RECT      s_patreon_link;           /* "Support me: Patreon" on the line above them */
 static int       s_dpi = 96;
 static HICON     s_icon;
 #define TAB_CTL_MAX 64   /* a page's controls (more are created but never shown) */
@@ -980,6 +984,7 @@ static int s_bundled_answered;  /* (the questions of this start asked: the next 
 static int s_play_pending;  /* Play (1) / Start Without Mods (2) clicked while they were installed: started after */
 static int s_up_finishing;  /* (up_finish: the update's folders being fetched - the bundled install follows) */
 static int s_bundled_again;  /* (start_bundled while one ran - up_finish's new folders: once more after it) */
+static WCHAR s_entrance_report[8192];  /* (the once-only entrance check's moves, bundled_thread) */
 
 static void bundled_progress(int n, int total)
 {
@@ -995,6 +1000,9 @@ static DWORD WINAPI bundled_thread(LPVOID arg)
     if (launcher[0] && !same_dir(game, launcher))
         install_bundled(game, launcher);
     mods_set_bundled_progress(NULL);
+    /* (the first start of a version with the entrance check: mods installed before it checked once - report 85741e;
+       said in a box once Play is free again, bundled_message) */
+    if (mods_entrance_check(game, 1, s_entrance_report, 8192) <= 0) s_entrance_report[0] = 0;
     free(dirs);
     PostMessageW(s_bundled_wnd, WM_APP_BUNDLED, (WPARAM)0xFFFFFFFF, 0);
     return 0;
@@ -1085,6 +1093,13 @@ static void bundled_message(WPARAM wp)
         s_play_pending = 0;
         refresh_play();
         if (s_cur_tab == TAB_MODS) mods_show(s_game_dir);
+        if (s_entrance_report[0]) {   /* (moves of the once-only entrance check: said once; also in Mods\.install.log) */
+            static WCHAR t[8400];
+            swprintf_s(t, 8400, L"Some installed mods used one entrance number for different entrances (one played "
+                                L"the other's). The later-installed ones now use free numbers:\r\n\r\n%s", s_entrance_report);
+            s_entrance_report[0] = 0;
+            if (!s_bundled_no_ask) MessageBoxW(s_wnd, t, L"Entrance numbers", MB_OK | MB_ICONINFORMATION);
+        }
         if (pending) play_with(pending == 2);  /* (the click made while they were installed) */
         return;
     }
@@ -3212,6 +3227,7 @@ static const struct { int tab; WCHAR icon; const WCHAR *name; } k_nav[] = {
     { TAB_ONLINE, 0xE774, L"Online" },      { TAB_MUSIC, 0xE8D6, L"Music" },
     { TAB_MOVIES, 0xE714, L"Movies" },      { TAB_PAINT, 0xE790, L"Paint Tool" },
     { TAB_REPORTS, 0xED15, L"Reports" },    { TAB_SUGGESTIONS, 0xEA80, L"Suggestions" },
+    { TAB_SUPPORTERS, 0xEB51, L"Supporters" },
 };
 
 /* Mods, in three tabs: the installed mods (TAB_MODS), Discovery, Texture packs - a tab bar on top of each
@@ -3606,6 +3622,8 @@ static void show_tab(int t)
         reports_show(s_game_dir);
     if (t == TAB_SUGGESTIONS)
         suggestions_show(s_game_dir);
+    if (t == TAB_SUPPORTERS)
+        supporters_show();
     if (t == TAB_SETUP || t == TAB_TOOLS)
         setup_show(s_game_dir, s_launcher_dir);
     if (t == TAB_PLAY && !s_up_busy)
@@ -4503,7 +4521,7 @@ static void build_ui(void)
     HWND h;
     WCHAR v[64];
     int i;
-    static const WCHAR *names[TAB_COUNT] = { L"Play", L"Settings", L"Online", L"Install", L"DLC", L"Saves", L"Paint Tool", L"Movies", L"Android Install", L"Mods", L"Music", L"Roster", L"Texture packs", L"Setup", L"Discovery", L"Tools", L"Reports", L"Suggestions", L"Switch" };
+    static const WCHAR *names[TAB_COUNT] = { L"Play", L"Settings", L"Online", L"Install", L"DLC", L"Saves", L"Paint Tool", L"Movies", L"Android Install", L"Mods", L"Music", L"Roster", L"Texture packs", L"Setup", L"Discovery", L"Tools", L"Reports", L"Suggestions", L"Switch", L"Supporters" };
 
     /* The tabs (never shown: the sidebar picks them; --capture and show_tab
        still use its selection). */
@@ -4924,6 +4942,9 @@ static void build_ui(void)
     suggestions_set_sign_in(go_sign_in);   /* (2.2.1: signed out, its Sign in button opens the Online tab) */
     suggestions_build(s_wnd, add, TAB_SUGGESTIONS, ID_SUGGEST_BASE, discover_server, reports_token, test_run_refuses_url,
                       PORT_VERSION);
+    /* (who supports the project: the server's list, read-only; supporting unlocks nothing) */
+    supporters_build(s_wnd, add, TAB_SUPPORTERS, ID_SUPPORTERS_BASE, discover_server, test_run_refuses_url, PATREON_URL,
+                     KOFI_URL, PAYPAL_URL);
     discover_set_ini(s_launcher_ini);
     discover_set_running(any_game_running);   /* (asked before an update from Discovery replaces a mod) */
     /* Setup: what's needed, found or missing; the Mod Maker's tools (setup_tab.c) */
@@ -7813,7 +7834,7 @@ static void nx_message(WPARAM wp, WCHAR *msg)
     if (wp == APK_OK) {
         set_busy(0);
         SendMessageW(ctl(ID_NX_PROGRESS), PBM_SETPOS, 1000, 0);
-        swprintf_s(t, 800, L"Done. Now install svr2011.nsp with DBI (see \"Install on Switch.txt\" in %s).", s_nx_out);
+        swprintf_s(t, 800, L"Done: the card has the files the game needs. Now install svr2011.nsp with DBI (see \"Install on Switch.txt\" in %s).", s_nx_out);
         set_text(ID_NX_STATUS, t);
     } else if (wp == APK_FAILED) {
         set_busy(0);
@@ -9243,7 +9264,8 @@ static void paint_window(HDC dc)
     static const WCHAR *const titles[TAB_COUNT] = { L"Play", L"Settings", L"Online", L"Setup", L"Setup",
                                                     L"Saves", L"Paint Tool", L"Movies", L"Setup", L"Mods",
                                                     L"Music", L"Roster: sort categories", L"Mods",
-                                                    L"Setup", L"Mods", L"Setup", L"Reports", L"Suggestions", L"Setup" };
+                                                    L"Setup", L"Mods", L"Setup", L"Reports", L"Suggestions", L"Setup",
+                                                    L"Supporters" };
     RECT cl, r;
     HBRUSH sb = CreateSolidBrush(C_SIDEBAR);
     HGDIOBJ old;
@@ -9309,22 +9331,28 @@ static void paint_window(HDC dc)
     }
     r.left = S(36); r.right = S(SB_W - 10); r.top = cl.bottom - S(34); r.bottom = cl.bottom - S(12);
     DrawTextW(dc, v, -1, &r, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
-    /* "Support me: ko-fi" above the version: the link opens the Ko-fi page. */
+    /* "Support me: Patreon", then "ko-fi / PayPal" under it, above the version: each link opens its page (support
+       only - everything stays free). */
     {
         SIZE z;
-        RECT k = { S(20), cl.bottom - S(56), S(SB_W - 10), cl.bottom - S(34) };
+        RECT k = { S(20), cl.bottom - S(78), S(SB_W - 10), cl.bottom - S(56) };
         DrawTextW(dc, L"Support me: ", -1, &k, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
         GetTextExtentPoint32W(dc, L"Support me: ", 12, &z);
         k.left += z.cx;
         SetTextColor(dc, C_ACCENT);
+        DrawTextW(dc, L"Patreon", -1, &k, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+        GetTextExtentPoint32W(dc, L"Patreon", 7, &z);
+        s_patreon_link.left = k.left; s_patreon_link.right = k.left + z.cx;
+        s_patreon_link.top = k.top; s_patreon_link.bottom = k.top + z.cy;
+        k.left = S(20); k.top = cl.bottom - S(56); k.bottom = cl.bottom - S(34);
         DrawTextW(dc, L"ko-fi", -1, &k, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
         GetTextExtentPoint32W(dc, L"ko-fi", 5, &z);
         s_kofi_link.left = k.left; s_kofi_link.right = k.left + z.cx;
         s_kofi_link.top = k.top; s_kofi_link.bottom = k.top + z.cy;
         k.left += z.cx;
         SetTextColor(dc, RGB(150, 152, 162));
-        DrawTextW(dc, L"  B7 ", -1, &k, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
-        GetTextExtentPoint32W(dc, L"  B7 ", 3, &z);
+        DrawTextW(dc, L" \x00B7 ", -1, &k, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
+        GetTextExtentPoint32W(dc, L" \x00B7 ", 3, &z);
         k.left += z.cx;
         SetTextColor(dc, C_ACCENT);
         DrawTextW(dc, L"PayPal", -1, &k, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
@@ -9410,6 +9438,7 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         if (mv_command(LOWORD(wp), HIWORD(wp)) || up_command(LOWORD(wp), HIWORD(wp)) ||
             mods_command(LOWORD(wp), HIWORD(wp)) || music_command(LOWORD(wp), HIWORD(wp)) ||
             reports_command(LOWORD(wp), HIWORD(wp)) || suggestions_command(LOWORD(wp), HIWORD(wp)) ||
+            supporters_command(LOWORD(wp), HIWORD(wp)) ||
             roster_command(LOWORD(wp), HIWORD(wp)) || texpacks_command(LOWORD(wp), HIWORD(wp)) ||
             discover_command(LOWORD(wp), HIWORD(wp)) ||
             setup_command(LOWORD(wp), HIWORD(wp)))
@@ -9861,6 +9890,9 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
     case WM_APP_SUGGESTIONS:
         suggestions_message(m, wp, lp);
         return 0;
+    case WM_APP_SUPPORTERS:
+        supporters_message(m, wp, lp);
+        return 0;
     case WM_LBUTTONDOWN: {
         const POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         const int k = nav_at(pt.x, pt.y);
@@ -9874,6 +9906,10 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         }
         if (PtInRect(&s_kofi_link, pt)) {
             ShellExecuteW(w, L"open", KOFI_URL, NULL, NULL, SW_SHOWNORMAL);
+            return 0;
+        }
+        if (PtInRect(&s_patreon_link, pt)) {
+            ShellExecuteW(w, L"open", PATREON_URL, NULL, NULL, SW_SHOWNORMAL);
             return 0;
         }
         if (k >= 0 && k_nav[k].tab == TAB_SETUP && setup_step(s_cur_tab) < 0)
@@ -9911,7 +9947,7 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp)
             POINT pt;
             GetCursorPos(&pt);
             ScreenToClient(w, &pt);
-            if (nav_at(pt.x, pt.y) >= 0 || PtInRect(&s_credit_link, pt) || PtInRect(&s_kofi_link, pt) || PtInRect(&s_paypal_link, pt) ||
+            if (nav_at(pt.x, pt.y) >= 0 || PtInRect(&s_credit_link, pt) || PtInRect(&s_kofi_link, pt) || PtInRect(&s_paypal_link, pt) || PtInRect(&s_patreon_link, pt) ||
                 play_link_at(pt) >= 0 || step_at(pt) >= 0 || mod_tab_at(pt) >= 0) {
                 SetCursor(LoadCursor(NULL, IDC_HAND));
                 return TRUE;
@@ -10612,8 +10648,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
         LocalFree(argv);
         return 0;
     }
+    /* Tests: --entrance-check <game folder> [--once]: the Mods tab's Check entrance numbers (--once: as a start does,
+       only if Mods\.entrance_check isn't there); prints the moves and their count. */
+    if (argv && argc >= 3 && !wcscmp(argv[1], L"--entrance-check")) {
+        static WCHAR rep[8192];
+        const int n = mods_entrance_check(argv[2], argc >= 4 && !wcscmp(argv[3], L"--once"), rep, 8192);
+        wprintf(L"%s%smoved %d\n", rep, rep[0] ? L"\n" : L"", n);
+        LocalFree(argv);
+        return 0;
+    }
     if (argv && argc >= 4 && !wcscmp(argv[1], L"--capture")) {
-        static const WCHAR *names[TAB_COUNT] = { L"play", L"settings", L"online", L"install", L"dlc", L"saves", L"paint", L"movies", L"android", L"mods", L"music", L"roster", L"texpacks", L"setup", L"discover", L"tools", L"reports", L"suggestions", L"switch" };
+        static const WCHAR *names[TAB_COUNT] = { L"play", L"settings", L"online", L"install", L"dlc", L"saves", L"paint", L"movies", L"android", L"mods", L"music", L"roster", L"texpacks", L"setup", L"discover", L"tools", L"reports", L"suggestions", L"switch", L"supporters" };
         int i;
         const WCHAR *p = argv[2];
         /* A comma list: each tab is shown in turn (after 300 ms), the last captured. */
@@ -10851,7 +10896,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
                    (s_cur_tab == TAB_MODS && getenv("SVR2011_MODS_UPDATE") && GetTickCount64() - t0 < 60000 &&
                     (GetTickCount64() - t0 < 3000 || discover_busy())) ||   /* (an update from Installed Mods) */
                    (s_cur_tab == TAB_REPORTS && reports_test_state(NULL, NULL, 0) && GetTickCount64() - t0 < 10000) ||
-                   (s_cur_tab == TAB_SUGGESTIONS && suggestions_test_state(NULL, NULL, 0) && GetTickCount64() - t0 < 10000))
+                   (s_cur_tab == TAB_SUGGESTIONS && suggestions_test_state(NULL, NULL, 0) && GetTickCount64() - t0 < 10000) ||
+                   (s_cur_tab == TAB_SUPPORTERS && supporters_test_state(NULL, NULL, 0) && GetTickCount64() - t0 < 10000))
                 while (PeekMessageW(&pm, NULL, 0, 0, PM_REMOVE)) {
                     TranslateMessage(&pm);
                     DispatchMessageW(&pm);
@@ -10905,6 +10951,19 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmd, int show)
             if (!_wfopen_s(&f, log, L"w, ccs=UTF-8") && f) {
                 fwprintf(f, L"suggestions: %d\nstatus: %s\n", n, line);
                 suggestions_test_dump(f);
+                fclose(f);
+            }
+        }
+        if (s_cur_tab == TAB_SUPPORTERS) {
+            /* Supporters: the list (or the empty / offline line) and the status line in <file>.supporters.txt */
+            WCHAR log[MAX_PATH], line[400];
+            FILE *f = NULL;
+            int n = 0;
+            supporters_test_state(&n, line, 400);
+            swprintf_s(log, MAX_PATH, L"%s.supporters.txt", capture_file);
+            if (!_wfopen_s(&f, log, L"w, ccs=UTF-8") && f) {
+                fwprintf(f, L"supporters: %d\nstatus: %s\n", n, line);
+                supporters_test_dump(f);
                 fclose(f);
             }
         }

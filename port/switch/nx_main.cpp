@@ -96,6 +96,7 @@ u64 __nx_exception_stack_size = sizeof(__nx_exception_stack);
 
 void NxProfileStart(void);
 void NxAbStart(void);
+void NxPgoStart(void);  // (nx_pgo.cpp, a counting build only)
 
 // Settings 2 to 3: 30 fps became the Switch's default. Only that line changes (the rest are the
 // player's), once; GRAPHICS -> FRAME RATE can set 60 again afterwards.
@@ -164,9 +165,38 @@ static void WriteSettings() {
   fclose(f);
 }
 
+bool NxInstallCheck();  // (nx_install_check.cpp)
+
+// Video recording, so the console's capture (and SysDVR) can take the game's picture: the NSP's control.nacp says
+// VideoCapture Manual, and the game hands the system its recording buffer (96 MB of the game's own memory) here,
+// before the game takes the rest. Off unless "switch_recording = true" is in svr2011.toml: the game keeps the memory
+// (for SysDVR or the console's own recording, turn it on). Returns what happened.
+static const char* StartRecording() {
+  bool on = false;
+  if (FILE* f = fopen(SVR_GAME_DIR "/svr2011.toml", "r")) {
+    char line[256];
+    while (fgets(line, sizeof(line), f))
+      if (!strncmp(line, "switch_recording", 16)) on = strstr(line, "true") != nullptr;
+    fclose(f);
+  }
+  if (!on) return "off (switch_recording = true in svr2011.toml turns it on)";
+  static char why[96];
+  const Result rc = appletInitializeGamePlayRecording();
+  if (R_FAILED(rc)) {
+    snprintf(why, sizeof(why), "not available (0x%X)", rc);
+    return why;
+  }
+  const Result state = appletSetGamePlayRecordingState(true);
+  snprintf(why, sizeof(why), R_SUCCEEDED(state) ? "on (96 MB buffer)" : "buffer given, state refused (0x%X)", state);
+  return why;
+}
+
 void userAppInit(void) {
   socketInitializeDefault();
   romfsMountFromCurrentProcess("romfs");  // (fails harmlessly without one)
+  // Before anything reads the game's files: are they on the card? If not, a message instead of a crash.
+  if (!NxInstallCheck()) exit(0);
+  const char* recording = StartRecording();
   mkdir(SVR_GAME_DIR, 0777);
   mkdir(SVR_GAME_DIR "/logs", 0777);
   setenv("REX_APP_FOLDER", SVR_GAME_DIR, 1);
@@ -181,6 +211,9 @@ void userAppInit(void) {
   WriteSettings();
   NxProfileStart();
   NxAbStart();  // (clock readings in the log)
+#ifdef SVR_NX_PGO_GENERATE
+  NxPgoStart();
+#endif
   // Start-up marks, flushed at once: this works even if logging never starts.
   FILE* f = fopen(SVR_GAME_DIR "/logs/nx_start.txt", "w");
   if (f) {
@@ -189,6 +222,7 @@ void userAppInit(void) {
     svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
     fprintf(f, "started: applet %d, total %llu MB, used %llu MB\n", appletGetAppletType(),
             (unsigned long long)(total >> 20), (unsigned long long)(used >> 20));
+    fprintf(f, "video recording: %s\n", recording);
     fclose(f);
   }
 }

@@ -16,6 +16,8 @@
 #include "match_diag.h"
 #include "match_types.h"
 #include "anthology.h"
+#include "cam_mod_moves.h"
+#include "menu_hooks.h"
 #include "frame_rate.h"
 #include "mystery_opponent.h"
 #include "no_mods.h"
@@ -225,6 +227,7 @@ bool g_ge = false;  // the match set up is a Gauntlet Eliminator
 // (sub_827374A0) sees it, but the match's live rules are built again from
 // the session's rule at its start (sub_828C48E8): there it's swapped too.
 uint32_t g_online_from = ~0u, g_online_to = ~0u;
+uint32_t g_setup_serial = 0;  // (match set-ups so far: the people builder's gauntlet line once per match)
 uint32_t g_ge_text[4] = {};
 
 // ELIMINATION: after NORMAL in TRIPLE THREAT (rule 0x0D) and FATAL-4-WAY
@@ -877,7 +880,7 @@ void RestoreRule(uint8_t* base) {
 // backstage, the backstage camera.
 constexpr uint32_t kStoryContext = 0x82E3C1F4;
 
-void ShapeRule(uint8_t* base, uint32_t rule, uint32_t like, bool select_only) {
+void ShapeRule(uint8_t* base, uint32_t rule, uint32_t like, bool select_only, int keep_own = 0) {
   const uint32_t rules = Rd32(base + kRules);
   if (!rules) return;
   uint8_t* rec = base + rules + rule * kRuleSize;
@@ -923,7 +926,11 @@ void ShapeRule(uint8_t* base, uint32_t rule, uint32_t like, bool select_only) {
       for (int i = 2; i < kSlobberPeople; ++i) rec[2 + i * 3 + 2] = 2;
     }
   } else {
-    for (const Span& span : kShape) std::memcpy(rec + span.at, from + span.at, span.size);
+    for (const Span& span : kShape) {
+      // (keep_own: 1 the rule's own match family +44, 2 and its +52 / +64 too)
+      if ((keep_own >= 1 && span.at == 44) || (keep_own >= 2 && (span.at == 52 || span.at == 64))) continue;
+      std::memcpy(rec + span.at, from + span.at, span.size);
+    }
     for (uint32_t at : {kRule2People, kRule2FreeForAll}) rec2[at] = base[rules + kRule2 + like * kRule2Size + at];
   }
   REXLOG_INFO("match types: rule {:02X} set up like rule {:02X}{}", rule, like, select_only ? " (select screen)" : "");
@@ -1081,7 +1088,9 @@ REX_HOOK_RAW(sub_82292D50) {
   // reports - "the CPU only reverses": a controller nobody holds played him).
   if (c) {
     static uint32_t told_match = 0, told = 0;
-    const uint32_t m = Rd32(base + 0x82EDEB48), person = Rd32(base + c + 1156), port = Rd32(base + c + 1152);
+    // (a match: its block and its first character - the title's demo match and the next one share the block)
+    const uint32_t m = Rd32(base + 0x82EDEB48) ^ Rd32(base + 0x82E3CC50), person = Rd32(base + c + 1156),
+                   port = Rd32(base + c + 1152);
     if (m != told_match) told_match = m, told = 0;
     if (m && person < 6 && !(told >> person & 1)) {
       told |= 1u << person;
@@ -1139,6 +1148,7 @@ REX_EXTERN(__imp__sub_82BAA6E8);
 REX_HOOK_RAW(sub_82BAA6E8) {
   const uint32_t table = ctx.r4.u32, size = ctx.r5.u32;
   if (svr2011::kAnthology && table) svr2011::HideOnlineRows(base + table, size);  // (no online: anthology.h)
+  svr2011::MenusShown();  // (menu_hooks.h: after a Universe match the menus' settings come back here)
   std::vector<uint8_t> rows;
   if (g_memory && table) rows = WithRows(base + table, size);
   svr2011::LoadWatchDone("its menus read");
@@ -1308,6 +1318,7 @@ REX_HOOK_RAW(sub_827374A0) {
     }
   svr2011::SetMatchLoading(true);  // (arena_mods: a custom arena's loading pictures)
   RestoreRule(base);
+  ++g_setup_serial;
   g_lumberjacks_chosen = false;
   // FREE-ROAMING BACKSTAGE is removed (its rows: MatchTypeSwitches): a whole-backstage rule reaching here anyway - a
   // saved match, Universe, a CPU set-up - plays the first named room instead (PARKING LOT: 0x1B, 2 on 2: 0x70).
@@ -1375,7 +1386,11 @@ REX_HOOK_RAW(sub_827374A0) {
   // free-for-all byte); back after the match (RestoreRule).
   constexpr uint32_t kSixTag = 0x08, kSixFreeForAll = 0x23;
   if (g_weapons && rule == kSixTag) {
-    ShapeRule(base, rule, kSixFreeForAll, false);
+    // (test aid SVR2011_TEST_WE_SHAPE=0|1|2: what of the battle royal's record it takes - 0 all, 1 not its match family
+    // +44, 2 nor +52 / +64)
+    static const int keep = [] { const std::string v = svr2011::Env("SVR2011_TEST_WE_SHAPE"); return v.empty() ? 0 : std::atoi(v.c_str()); }();
+    ShapeRule(base, rule, kSixFreeForAll, false, keep);
+    if (keep) REXLOG_INFO("match types: WEAPONS EVERYWHERE shape keeps rule {:02X}'s own {}", rule, keep >= 2 ? "+44 / +52 / +64" : "+44");
     REXLOG_INFO("match types: WEAPONS EVERYWHERE - 6-man as a free-for-all (shaped like rule {:02X})", kSixFreeForAll);
   }
   ctx.r4.u64 = played;
@@ -1549,6 +1564,19 @@ REX_HOOK_RAW(sub_828BBEF0) {
   }
   if (base[0x82E3DE00] == kLumberjack && !Rd32(base + kStoryContext) && ctx.r3.u32) {
     FillLumberjackSlots(base, ctx.r3.u32);
+  }
+  // (report 6d63a6: SLOBBER KNOCKER with nobody waiting - 2 people, the match over at the first fall - with no fill
+  // line logged. Once per match set-up, when a gauntlet row is on or the live rule is the gauntlet: what this
+  // hook's conditions saw and slots 2-5's picks, +8 - 51200 empty)
+  if (static uint32_t told = ~0u; told != g_setup_serial && (g_slobber || g_ge || base[0x82E3DE00] == kGauntlet)) {
+    told = g_setup_serial;
+    std::string picks;
+    for (uint32_t i = 2; ctx.r3.u32 && i < 6; ++i)
+      picks += fmt::format(" {}", Rd32(base + ctx.r3.u32 + kSlots + i * kSlotSize + 8));
+    REXLOG_INFO("match types: people built - slobber {} g. eliminator {} live rule {:02X} online to {:02X} story {:08X} "
+                "match {:08X} chosen {} from {:08X}; slots 2-5:{}",
+                g_slobber, g_ge, base[0x82E3DE00], g_online_to & 0xFF, Rd32(base + kStoryContext), ctx.r3.u32,
+                g_lumberjacks_chosen, uint32_t(ctx.lr), picks);
   }
   if (g_slobber && g_online_to != kGauntlet && base[0x82E3DE00] == kGauntlet && ctx.r3.u32) {  // (the 2 waiting opponents; online: the lobby's)
     if (const uint32_t rules = Rd32(base + kRules))
@@ -2665,6 +2693,61 @@ void MatchTypesUpdate(PPCContext& ctx, uint8_t* base) {
                         (frames + 1 - since[i]) / 60, i, Rd32(base + ch[i] + 212), j, Rd32(base + ch[j] + 212));
           since[i] = since[j] = frames + 1;
         }
+  }
+  // A wrestler in a motion no bank has (report b6f4f0, 2.2.4 online: Triple H's 7551, cut short by a run-in, went on to
+  // 1852 - in none of the game's pacs - and he stood in it for the rest of the match; 7017d6's jump to 23231 the same
+  // way). A second in it: he's started on 446 (down on the mat, the game's own way up from it: 0, 20, standing), as
+  // JumpAct starts a motion. Only one alone in it: two in one missing motion are a pair, and one of a pair started on
+  // its own crashed (the lock-up above) - logged. Match state and the banks only: alike on every machine with the
+  // same files (lockstep). Test aids: SVR2011_TEST_MISSING_JUMP=<person>,<frame> - at that match frame the person
+  // starts motion 1852; SVR2011_TEST_MISSING_GUARD_OFF=1 - no guard.
+  {
+    static const bool off = std::getenv("SVR2011_TEST_MISSING_GUARD_OFF") != nullptr;
+    static const std::pair<int, uint32_t> jump = [] {
+      int p = -1, f = 0;
+      if (const char* v = std::getenv("SVR2011_TEST_MISSING_JUMP")) std::sscanf(v, "%d,%d", &p, &f);
+      return std::make_pair(p, uint32_t(f));
+    }();
+    constexpr uint32_t kDown = 446, kHold = 60;
+    static uint32_t motion_of[6] = {}, missing_for[6] = {};
+    const uint32_t frames = Rd32(base + 0x82E3CD0C);
+    if (jump.first >= 0 && jump.first < 6 && frames == jump.second)
+      if (const uint32_t c = Rd32(base + kChars + uint32_t(jump.first) * 4)) {
+        PPCContext k = ctx;
+        k.r3.u64 = c, k.r4.u64 = 1852, k.r5.u64 = 0, k.r6.u64 = 0;
+        k.f1.f64 = 0.0;
+        sub_82396E80(k, base);
+        REXLOG_INFO("match types: test - person {} starts motion 1852 (state {})", jump.first, Rd32(base + c + 212));
+      }
+    uint32_t ch[6] = {};
+    for (uint32_t i = 0; i < 6; ++i) {
+      ch[i] = Rd32(base + kChars + i * 4);
+      const uint32_t m = ch[i] ? Rd32(base + ch[i] + 212) & 0x7FFF : 0;
+      if (m != motion_of[i] || !m) motion_of[i] = m, missing_for[i] = 0;
+      // (the game's own search missed it - the unsorted banks too: 128 is in one of those - and the sorted lists lack it)
+      else if (frames > 60 && svr2011::MatchBoxMotionMissing(m) && !svr2011::MotionInMatchBanks(base, uint16_t(m)))
+        ++missing_for[i];
+      else missing_for[i] = 0;
+    }
+    for (uint32_t i = 0; i < 6; ++i) {
+      if (missing_for[i] != kHold) continue;
+      bool pair = false;
+      for (uint32_t j = 0; j < 6; ++j) pair |= j != i && ch[j] && motion_of[j] == motion_of[i];
+      static int logged = 0;
+      if (pair || off || !svr2011::MotionInMatchBanks(base, kDown)) {
+        if (logged++ < 40)
+          REXLOG_WARN("match types: person {} in motion {}, which no bank has, for 1 s - {}", i, motion_of[i],
+                      off ? "guard off (test aid)" : pair ? "a pair in it: left as it is" : "no 446 in the banks either");
+        continue;
+      }
+      PPCContext k = ctx;
+      k.r3.u64 = ch[i], k.r4.u64 = kDown, k.r5.u64 = 0, k.r6.u64 = 0;
+      k.f1.f64 = 0.0;
+      sub_82396E80(k, base);
+      if (logged++ < 40)
+        REXLOG_WARN("match types: person {} in motion {}, which no bank has, for 1 s - started on {} (state {})", i,
+                    motion_of[i], kDown, Rd32(base + ch[i] + 212));
+    }
   }
   // Research aid (stuck wrestlers, B11/B12): SVR2011_TEST_STUCK_CHARS=1 - each
   // second, people 0-5 whose place and motion (+212) haven't changed for 10 s

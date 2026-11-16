@@ -60,6 +60,7 @@ public class LauncherActivity extends Activity {
         super.onCreate(savedInstanceState);
         ProblemReport.ctx = getApplicationContext();  // (report.txt's "last exit" lines)
         InstallActivity.init(this);
+        NoMedia.ensure(InstallActivity.gameFolder());  // (the movies out of the Gallery: NoMedia.java)
         getWindow().setStatusBarColor(kBackground);
         getWindow().setNavigationBarColor(kBackground);
         settings_ = new GameSettings(InstallActivity.gameFolder());
@@ -155,6 +156,7 @@ public class LauncherActivity extends Activity {
         if (getPreferences(MODE_PRIVATE).getBoolean("check_updates", true)) checkUpdates(false);
         // The mods that come with the port, once for each app version (BundledMods).
         BundledMods.atStart(this);
+        ModsPage.entranceCheckAtStart(this);   // (once: mods installed before the entrance check - report 85741e)
         // Edge to edge (Android 15+): keep clear of the status and navigation bars
         // and the camera cut-out.
         if (android.os.Build.VERSION.SDK_INT >= 30) root.setOnApplyWindowInsetsListener((v, insets) -> {

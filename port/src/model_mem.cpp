@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <mutex>
 #include <set>
@@ -420,9 +421,9 @@ std::string GuestName(const uint8_t* base, uint32_t a) {
 }
 
 struct CacheAlloc {
-  bool active = false, stuck = false, given = false;
+  bool active = false, stuck = false, given = false, virtual_tried = false;
   uint32_t size = 0, tries = 0;
-  std::chrono::steady_clock::time_point t0;
+  std::chrono::steady_clock::time_point t0, refused_at;  // (refused_at: the first ask that found no block, since the last that did)
   std::string name;  // (the file it is for: noted when it is found stuck)
 };
 thread_local CacheAlloc t_alloc;
@@ -500,10 +501,54 @@ REX_HOOK_RAW(sub_826BAB40) {
   if (loader) t_request = 0;
 }
 
+// A loaded file's sub-archive (sub_821C5CD8(archive, entry id, owner), from the loader's done-callback: it finds the
+// entry, unpacks it into a new buffer - sub_826A1420 - reads that as a PACH and registers it). sub_826A1420 gives 0
+// when the entry unpacks to nothing or no buffer could be had, and sub_821C5CD8 read a PACH at address 0 anyway:
+// the loader thread's crash at lr 826A0FC0 (report 752e29: the mod arenas WCW FallBrawl and ECW On TNN, on phones).
+// (The test harness's HIAC, rule 31, in arena 1 crashes at the same lr by another way: sub_8227DD80 asks for entries
+// arena 1's file doesn't have at all - not a player's path, left as it is.) An empty PACH is given instead (no entries: what the registering code finds
+// when the archive has none - nothing registered), from the fallback memory, which the caller's delete gives back.
+REX_EXTERN(__imp__sub_826A1088);
+REX_EXTERN(__imp__sub_826A1200);
+REX_EXTERN(__imp__sub_826A1420);
+REX_HOOK_RAW(sub_826A1420) {
+  const uint32_t lr = uint32_t(ctx.lr), archive = ctx.r3.u32, index = ctx.r4.u32;
+  __imp__sub_826A1420(ctx, base);
+  // (test aid SVR2011_TEST_UNPACK_FAIL=<n>: the n-th unpack at this call and every one after it gives 0, as a
+  // failed one did on the phones)
+  static const int fail_from = [] { const char* v = std::getenv("SVR2011_TEST_UNPACK_FAIL"); return v ? std::atoi(v) : 0; }();
+  static std::atomic<int> calls{0};
+  if (lr == 0x821C5D78 && fail_from > 0 && ++calls >= fail_from && ctx.r3.u32) {
+    REXLOG_INFO("[svr2011] file loader: test - unpack {} of {:08X} made to fail ({:08X} dropped)", index, archive, ctx.r3.u32);
+    ctx.r3.u64 = 0;  // (the real block leaks: a test only)
+  }
+  if (lr != 0x821C5D78 || ctx.r3.u32) return;
+  PPCContext c = ctx;
+  c.r3.u64 = archive, c.r4.u64 = index;
+  __imp__sub_826A1088(c, base);
+  const uint32_t entry = c.r3.u32;
+  c = ctx;
+  c.r3.u64 = archive, c.r4.u64 = index;
+  __imp__sub_826A1200(c, base);
+  const uint32_t unpacked = c.r3.u32;
+  const uint32_t tag = entry ? Rd32(base, entry) : 0;
+  const uint32_t block = svr2011::FallbackBlock(16, true);
+  static std::atomic<uint32_t> times{0};
+  if (times++ < 20)
+    REXLOG_WARN("[svr2011] file loader: sub-archive entry {} of {:08X} (for {}) unpacked to nothing - entry at "
+                "{:08X}, tag {:08X}, {} bytes unpacked - an empty archive given instead ({:08X})",
+                index, archive, RequestName(base), entry, tag, unpacked, block);
+  if (!block) return;  // (no fallback memory either: the game's own way)
+  uint8_t* p = base + block;
+  const uint8_t empty[16] = {'P', 'A', 'C', 'H', 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  std::memcpy(p, empty, sizeof empty);
+  ctx.r3.u64 = block;
+}
+
 REX_EXTERN(__imp__sub_826BA928);
 REX_HOOK_RAW(sub_826BA928) {
   const bool loader = ctx.r3.u32 == Rd32(base, kLoaderCache);
-  if (loader) t_alloc = CacheAlloc{true, false, false, ctx.r4.u32, 0, std::chrono::steady_clock::now()};
+  if (loader) t_alloc = CacheAlloc{true, false, false, false, ctx.r4.u32, 0, std::chrono::steady_clock::now()};
   const uint32_t size = ctx.r4.u32;
   const std::string name = loader ? RequestName(base) : std::string();
   __imp__sub_826BA928(ctx, base);
@@ -559,7 +604,39 @@ uint32_t LoaderCacheFallback(uint32_t size) {
   // (a request of 0 bytes: a file no mounted pac has - its directory entry not found, size 0 - e.g. a character's
   // model under a name no pac carries. It never fits nothing, so it spun forever: a small zeroed block instead,
   // the read empty - the load goes on, and the log names the missing file)
-  const uint32_t p = FallbackBlock(std::max(size, 2048u));
+  // (a motion file - MOT/.., MOTP/.. - only the CPU reads: the virtual system heap first. The physical pool is the
+  // 512 MB the GPU sees, shared with every model and texture, and after one match it may have no 26 MB in one piece:
+  // report 79be36, a triple threat after a 1v1 with 72 move packs - MOT/RR00 and RR01 (DLC Vol. 2's per-wrestler banks,
+  // grown to 23 and 21 MB) had the physical fallback, RR02 (26 MB) found no room, and the cache's loop asked for it
+  // for good: the match never loaded. The physical pool after it, if the virtual heap has none)
+  const uint32_t want = std::max(size, 2048u);
+  const bool motion = r.name.find("MOT/") != std::string::npos || r.name.find("MOTP/") != std::string::npos;
+  uint32_t p = motion ? FallbackBlock(want, true, 0x1000) : 0;
+  if (!p) p = FallbackBlock(want);
+  const auto now = std::chrono::steady_clock::now();
+  if (p) {
+    r.refused_at = {};
+  } else if (r.refused_at == std::chrono::steady_clock::time_point{}) {
+    r.refused_at = now;
+  } else if (!motion && !r.virtual_tried && now - r.refused_at >= std::chrono::seconds(5)) {
+    // (another file, and the physical pool still has no room after 5 s: the virtual heap rather than no load at all -
+    // the CPU reads it right; a texture in it would draw wrong (the GPU reads physical addresses), never crash)
+    r.virtual_tried = true;
+    p = FallbackBlock(want, true, 0x1000);
+    REXLOG_ERROR("[svr2011] file cache: {} ({} bytes) - the physical memory has had no room for 5 s, {}", r.name, size,
+                 p ? fmt::format("given from the virtual heap instead, at {:08X} (if it holds textures they may draw "
+                                 "wrong)", p)
+                   : std::string("nor the virtual heap"));
+    if (p) r.refused_at = {};
+  }
+  // (truly out of memory - no block anywhere for 60 s, nothing idle the cache could free: the game would wait for
+  // ever, a hang the player can only close. Ended with a reason in the log and the crash report instead)
+  if (!p && r.refused_at != std::chrono::steady_clock::time_point{} && now - r.refused_at >= std::chrono::seconds(60)) {
+    REXLOG_ERROR("[svr2011] file cache: out of memory - {} ({} bytes) found no room in 60 s (fallback in use {:.1f} MB); "
+                 "the load can't go on - the game is ended rather than left hanging",
+                 r.name, size, FallbackBytesInUse() / 1048576.0);
+    std::abort();
+  }
   // (no room: the cache's retry loop asks again at once, over a million times a second - SVR2011_TEST_FALLBACK_NO_ROOM;
   // report bd538a, a phone with no 22 MB left: the frame rate down for good. A short wait between its asks)
   if (!p && r.given) std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -569,7 +646,9 @@ uint32_t LoaderCacheFallback(uint32_t size) {
   if (!r.given) {
     r.given = true;
     REXLOG_WARN("[svr2011] file cache: {} bytes {}", size,
-                p ? fmt::format("from the fallback memory instead, at {:08X}", p) : std::string("- no fallback memory either"));
+                p ? fmt::format("from the fallback memory instead, at {:08X}{}", p,
+                                p < 0x40000000u ? " (the virtual heap: a motion file, only the CPU reads it)" : "")
+                  : std::string("- no fallback memory either"));
   }
   return p;
 }
@@ -671,8 +750,13 @@ REX_HOOK_RAW(sub_826A2D78) {
 // too: the game's walk then compares it with that heap's list as if it were inside - past the list's end it never
 // stops (report fc182b, 2.2.1: heap 1, a block freed by sub_826E5328 from its +188 - the net let it through, as it
 // passed any block it couldn't place to the game).
-// Test aids: SVR2011_TEST_FREE_LIST=<heap>,<n>[,loop|double|junk|byte] - the <n>th free on that heap (99: on any) meets that
-// damage (byte: its heap byte names another heap);
+// The free also joins the block to a free neighbour by address, reading that block's header: when something has run
+// over it (reports 8cf6e9: leaving CREATE A MOVE-SET, heap 42, the freed block's next one; 73f97e: after a match in an
+// arena mod on Android, sub_826E5328's free), the game's join wrote through the bad link and crashed. Such a neighbour
+// is taken off the free list and left as used (its room is lost, nothing else is), the free then goes on, and the log
+// shows the damaged header with the words before it - the end of whatever overran it.
+// Test aids: SVR2011_TEST_FREE_LIST=<heap>,<n>[,loop|double|junk|byte|next] - the <n>th free on that heap (99: on any) meets
+// that damage (byte: its heap byte names another heap; next: the free block after it gets a junk link);
 // SVR2011_TEST_FREE_GUARD_OFF=1 - the game's walk alone.
 namespace {
 constexpr uint32_t kHeapLocks = 0x82EC55B0, kHeapTable = 0x82EC5F48, kHeapEntrySize = 36, kHeapLockSize = 28;
@@ -688,13 +772,15 @@ std::string HeapWords(const uint8_t* base, uint32_t at, uint32_t count, uint32_t
   return s.empty() ? " (outside the heap)" : s;
 }
 
+// (the back chain from r1; each word read only from a readable page - a stack's top can be the end of its mapping:
+// the walk read past it, and the log line of a damaged heap crashed the game - 2.2.3 Android 73f97e, PC test)
 std::string HeapCallers(const uint8_t* base, const PPCContext& ctx) {
   std::string s = fmt::format("{:08X}", uint32_t(ctx.lr));
   uint32_t sp = ctx.r1.u32;
   const uint32_t top = sp + 0x40000;
-  for (int i = 0; i < 12 && sp >= 0x70000000 && sp < 0x80000000; ++i) {
+  for (int i = 0; i < 12 && sp >= 0x70000000 && sp < 0x80000000 && svr2011::GuestReadable(sp); ++i) {
     const uint32_t prev = Rd32(base, sp);
-    if (prev <= sp || prev >= top) break;
+    if (prev <= sp || prev >= top || !svr2011::GuestReadable(prev - 8)) break;
     s += fmt::format(" {:08X}", Rd32(base, prev - 8));
     sp = prev;
   }
@@ -826,13 +912,14 @@ REX_HOOK_RAW(sub_8269AAD8) {
     }
     return t;
   }();
-  bool test_double = false;
+  bool test_double = false, test_next = false;
   if ((test.heap == int(heap) || test.heap == 99) && test.kind != "byte") {  // (99: any heap)
     static int count = 0;
     if (++count == test.at) {
       const uint32_t first = Rd32(base, start + 8);
       REXLOG_WARN("[svr2011] heap free list: test - {} at free {} of heap {}", test.kind, count, heap);
       if (test.kind == "double") test_double = true;
+      else if (test.kind == "next") test_next = true;
       else if (test.kind == "junk") Wr32(base, block + 4, 0x03220B94);
       else if (first < size) Wr32(base, start + (first << 4) + 8, first);
     }
@@ -856,6 +943,83 @@ REX_HOOK_RAW(sub_8269AAD8) {
       if (to > cur && to <= size) d.free_units += to - cur;
       ++d.steps;
       cur = next;
+    }
+  }
+  {
+    static bool next_pending = false;  // (test: the first free after the count with a free block after it)
+    next_pending = next_pending || test_next;
+    const uint32_t next_at = start + (to_next << 4);
+    if (next_pending && !d.what && to_next < size && Rd32(base, next_at + 8) != 0) {
+      next_pending = false;
+      Wr32(base, next_at, 0x07FE5A04);
+      REXLOG_WARN("[svr2011] heap free list: test - a junk link in the free block after {:08X}", p);
+    }
+  }
+  if (!d.what && !off) {
+    // (the neighbours the game would join: a free one's header must link back to this block)
+    const uint32_t next_at = start + (to_next << 4);
+    const bool next_free = to_next < size && Rd32(base, next_at + 8) != 0;
+    uint32_t bad = 0;
+    if (next_free) {
+      const uint32_t nn = Rd32(base, next_at) & 0x0FFFFFFF;
+      if (nn <= to_next || nn > size || Rd32(base, next_at + 4) != self) bad = to_next;
+    }
+    if (!bad && self && Rd32(base, start + (to_before << 4) + 8) != 0 &&
+        (Rd32(base, start + (to_before << 4)) & 0x0FFFFFFF) != self)
+      bad = to_before;
+    if (bad) {
+      const uint32_t at = start + (bad << 4);
+      const std::string header = HeapWords(base, at, 4, start, end), before = HeapWords(base, at - 64, 16, start, end);
+      // Mended where the address links say how: a block before it gets this block as its next; a block after it gets
+      // this block as its before, and as its next the first block on whose own before link names it (none: the heap's
+      // end). Else it is taken off the free list (the link that leads to it takes its own, or ends the list) and left
+      // as used: the game's join and walk pass it by - its room is lost, and a heap left with too little fails later.
+      const char* done = nullptr;
+      const uint32_t link = Rd32(base, at + 8);
+      if (bad == to_before) {
+        Wr32(base, at, (Rd32(base, at) & 0xF0000000u) | self);
+        done = "mended (its next is this block again)";
+      } else if (link > bad && link <= size) {
+        uint32_t found = size;
+        for (uint32_t u = bad + 1; u < size; ++u) {
+          const uint32_t h = start + (u << 4), hn = Rd32(base, h) & 0x0FFFFFFF;
+          if (Rd32(base, h + 4) == bad && base[h + 15] == heap && hn > u && hn <= size) {
+            found = u;
+            break;
+          }
+        }
+        if (found <= link) {  // (a free block's next free one is past its end)
+          Wr32(base, at, (Rd32(base, at) & 0xF0000000u) | found);
+          Wr32(base, at + 4, self);
+          done = "mended from the block after it";
+        }
+      }
+      if (!done) {
+        uint32_t from = start + 8, steps = 0;
+        while (steps++ < 0x100000) {
+          const uint32_t cur = Rd32(base, from);
+          if (cur == bad) {
+            Wr32(base, from, link > bad && link <= size ? link : size);
+            break;
+          }
+          if (cur >= size || cur > bad) break;
+          from = start + (cur << 4) + 8;
+        }
+        Wr32(base, at + 8, 0);
+        done = "taken off the free list and left unused";
+      }
+      static std::atomic<int> told{0};
+      if (const int n = ++told; n <= 8) {
+        ctx = saved;
+        REXLOG_ERROR("[svr2011] heap free list: heap {}, freeing {:08X}: the free block {} it by address ({:08X}) had a "
+                     "damaged header - {}, the free goes on (callers {})", heap, p,
+                     bad == to_next ? "after" : "before", at, done, HeapCallers(base, ctx));
+        REXLOG_ERROR("[svr2011] heap free list:   its header was:{} - now:{}", header, HeapWords(base, at, 4, start, end));
+        REXLOG_ERROR("[svr2011] heap free list:   the 16 words before it (what ran over it):{}", before);
+        REXLOG_ERROR("[svr2011] heap free list:   the block being freed (its owner ran on?): {} bytes, starts:{}",
+                     (to_next - self - 1) * 16, HeapWords(base, p, 8, start, end));
+        if (n == 1) svr2011::MatchBoxLog("a heap block's neighbour was damaged");
+      }
     }
   }
   if (d.what) {

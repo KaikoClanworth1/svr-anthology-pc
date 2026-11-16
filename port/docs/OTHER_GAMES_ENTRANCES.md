@@ -169,7 +169,7 @@ PS2 textures (not portable). The 360 discs are the better source.
   lists (up to 32 keys, 2011 holds 8: resample 26 / 124 / 199 slots).
 - **Motion:** same records at 60 Hz, same Biped skeleton; 2K15 YANM v4, 2K16/2K17 v5 (`yanm_decode`
   reads it: same pose within 0-1.7 cm); mode-4 YANM blocks (boned props only) must be skipped; y1 is a
-  32-track face rig (dropped). Checked: 2K15 Austin vs 2011's own 0-2 cm on segments not re-cut.
+  32-track face rig (dropped; 2011's own face stands in: Faces). Checked: 2K15 Austin vs 2011's own 0-2 cm on segments not re-cut.
 - **One-take entrances (2K15):** ~61 put the whole entrance in segment 0 (2011 hides segment 0): use
   2K16's re-cut of the same take (37 of 61) or an HCTP-style split.
 - **Other:** lights object moved to `pac/evt/light/elNNNNN.pac` (2011 donor used anyway); the event
@@ -497,10 +497,47 @@ left / 15-29 right; docs/HAND_POSES.md), the first with the event block `40 05 0
 
 The Mod Maker's future entrance preview reads y2/y3 the same way (ModMakerUIRework).
 
+## Faces
+
+2011 animates the entrant's face with its own track, y1 (beside the body y0 and the fingers y2 / y3), in every
+segment of every stock entrance (1196 tracks): one face-rig pose a record, 288 bytes one a frame (the older
+entrances) or 393 bytes key-reduced (the newer ones), not decoded. Its events are copies of the body's cues
+(op 193 `c1 3x 23` voice / sound cues, 100-103, 162, 171 ...). 2011's face motions for moves (ids 1000-1099,
+1500) are in the hand-pose library (m.pac MVMT/STAT/99); no stock entrance face starts from one of them.
+
+**An entrance without y1 leaves the face as the last motion set it** - in Create An Entrance, a Diva's smile
+stays on through a converted entrance played after hers (report a1b6b1).
+
+| converter | face |
+|---|---|
+| SvR 2007-2010, LoW (and their PS2 discs) | the source's y1 is kept (2011's format) |
+| WWE '12 - 2K17 | the source's face is hashed bones inside the body record ('12: ~38 between `Bip Head` and the clavicles; 2K15+: a 32-track y1 rig), no map to 2011's rig: **2011's own face stands in** (`tools/face_tracks.py`) |
+| HCTP, SvR 2004, Shut Your Mouth, Just Bring It | none in the source (face cues by op 16 only): 2011's face stands in |
+| SvR 2006 | its y1 (`0x77` face joint-mask groups) is not 2011's face rig: dropped, 2011's face stands in |
+
+The stand-in (`face_tracks.py`, every character object with body tracks, `--game-pac` needed): the face of the
+same superstar's 2011 entrance when 2011 has the entrance under the same number and name (WWE '12 - 2K17
+only), else 522 "General Entrance" (2011's default for created superstars); per segment the stock face of the
+same slot, else the one closest in length, its poses only (its cues dropped), cut or looped to the segment's
+length, the first record with the standard event block. A team member takes the donor's same object's face,
+else its entrant's. The report's `face` note names the donor.
+
+## Props only the source has (report 08b661)
+
+- Props 2011's evtobj lacks come from the source: its DLC pacs (`pac/evt/evtobj_dlc<nn>.pac`, packages' own), then its disc
+  `evtobj.pac` (WWE '13's Gangrel fire 2726), as new evtobj entries (`svrmod wwe13prop`). EPK8 / EPAC group count fields are in
+  words: 12-byte entries count / 3 also in EPK8 (read as / 4, the last entries of a group were lost: Gangrel's goblet 2723 / 2724).
+- Pyro also from the disc's `prtcls_dlc<nn>.pac` when `prtcls.pac` has no set for the number (WWE '13 Attitude Era 50-57).
+- A prop with no 2011 track gets its own pose from the source's root channel (0x75 records, node 0): in a hand - the source's
+  events 166 / 167 / 164 -> 2011 bb / bc / b7, and 180 v -> 72 v (the holder), checked on the shared entrances' belts -
+  root = 10 x (x, z, -y), angles = zyx of M R13 (M the same axis change; fitted on 3009 in 800-824, 20 of 20 keys); not in a
+  hand: the vehicles' frame (root x 10, `_yxz`). Before, such a prop had events only and never showed (held in no hand).
+- Checked in game (Gangrel 53 as 120): the goblet in his right hand on the ramp and at the steps, set down on the steps.
+
 ## The global object (lights and effects)
 
 Tracks x 10..14 go with slot 0, 60..64 with slot 5, 110..114 with slot 10; y 52..59 are moving lights, y 50 holds op 137. WWE 2K14 conversions now
-use the entrance's own tracks (`wwe13_entrance.global_track`), not a stock donor's. A donor changes the look of the whole entrance: with Triple H 102's, Goldberg
+use the entrance's own tracks (`wwe13_entrance.global_track`), not a stock donor's; WWE '13 too since 14 Nov (report 08b661: Gangrel 53 goes red and dark as in the source, where 510's donor tracks left the arena lit). A donor changes the look of the whole entrance: with Triple H 102's, Goldberg
 361 goes nearly black. The other games keep the donor until they are played (`OWN_GLOBAL_GAMES`).
 
 Record: u8 hold (that many skipped frames follow; at most 0x5f), 3 f32 LE position, 3 s16 LE angles, 3 u16 LE colour. Position = source x 100, from y 50 x 10;
